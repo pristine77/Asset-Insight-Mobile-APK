@@ -1,0 +1,542 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/main"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    android:fitsSystemWindows="true"
+    >
+
+    <androidx.camera.view.PreviewView
+        android:id="@+id/previewView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/rightPanelScroll"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <expo.modules.auctioncamera.viewextensions.AEAFRegionOverlay
+        android:id="@+id/aeafOverlay"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        app:layout_constraintBottom_toBottomOf="@id/previewView"
+        app:layout_constraintEnd_toEndOf="@id/previewView"
+        app:layout_constraintStart_toStartOf="@id/previewView"
+        app:layout_constraintTop_toTopOf="@id/previewView" />
+
+    <androidx.appcompat.widget.AppCompatImageView
+        android:id="@+id/focusIndicator"
+        android:layout_width="72dp"
+        android:layout_height="72dp"
+        android:src="@drawable/ic_focus_camera"
+        android:tint="@color/orange"
+        android:visibility="gone"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <LinearLayout
+        android:id="@+id/linearLayoutLot"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="16dp"
+        android:gravity="center"
+        android:orientation="horizontal"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <androidx.appcompat.widget.AppCompatTextView
+            android:id="@+id/textViewLot"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_blue_pill"
+            android:paddingHorizontal="16dp"
+            android:paddingVertical="6dp"
+            android:text="Lot 1"
+            android:textColor="@color/white"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <androidx.appcompat.widget.AppCompatTextView
+        android:id="@+id/textViewSetViews"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="Not set"
+        android:textColor="@color/orange"
+        android:textSize="10sp"
+        app:layout_constraintEnd_toEndOf="@+id/linearLayoutLot"
+        app:layout_constraintStart_toStartOf="@+id/linearLayoutLot"
+        app:layout_constraintTop_toBottomOf="@id/linearLayoutLot" />
+
+    <include
+        android:id="@+id/includeMainExtra"
+        layout="@layout/item_main_extra_total_layout"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="12dp"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/textViewSetViews" />
+
+
+
+    <View
+        android:id="@+id/recordingDot"
+        android:layout_width="10dp"
+        android:layout_height="10dp"
+        android:layout_marginEnd="8dp"
+        android:background="@drawable/solid_circle_red"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="@id/recordingTimer"
+        app:layout_constraintEnd_toStartOf="@id/recordingTimer"
+        app:layout_constraintTop_toTopOf="@id/recordingTimer" />
+
+    <androidx.appcompat.widget.AppCompatTextView
+        android:id="@+id/recordingTimer"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:background="#80000000"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="4dp"
+        android:text="00:00"
+        android:textColor="@android:color/white"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:visibility="gone"
+        app:layout_constraintEnd_toStartOf="@id/rightPanelScroll"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <LinearLayout
+        android:id="@+id/topBar"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_zoom_pill"
+        android:elevation="4dp"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="8dp"
+        app:layout_constraintEnd_toStartOf="@id/rightPanelScroll"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <androidx.appcompat.widget.AppCompatTextView
+            android:id="@+id/btnProMode"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="16dp"
+            android:background="@drawable/bg_zoom_selected"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="5dp"
+            android:text="PRO"
+            android:textColor="@android:color/white"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <androidx.appcompat.widget.AppCompatTextView
+            android:id="@+id/resToggle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="16dp"
+            android:background="@drawable/bg_zoom_pill"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="5dp"
+            android:text="12M"
+            android:textColor="@android:color/white"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <androidx.appcompat.widget.AppCompatImageView
+            android:id="@+id/btnFlash"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:layout_marginEnd="16dp"
+            android:src="@drawable/ic_flash_off"
+            android:tint="@android:color/white" />
+
+        <androidx.appcompat.widget.AppCompatImageView
+            android:id="@+id/btnFocus"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:src="@drawable/ic_focus"
+            android:tint="@color/white" />
+    </LinearLayout>
+
+    <include
+        android:id="@+id/includeItemMP"
+        layout="@layout/item_layout_mp"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="16dp"
+        android:elevation="10dp"
+        android:visibility="gone"
+        app:layout_constraintEnd_toStartOf="@id/rightPanelScroll"
+        app:layout_constraintTop_toBottomOf="@id/topBar" />
+
+    <androidx.appcompat.widget.AppCompatImageView
+        android:id="@+id/buttonFrontCamera"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginBottom="16dp"
+        android:background="@drawable/bg_zoom_pill"
+        android:clickable="true"
+        android:focusable="true"
+        android:padding="10dp"
+        android:scaleType="centerInside"
+        android:src="@drawable/ic_front_camera_load"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/rightPanelScroll" />
+
+    <LinearLayout
+        android:id="@+id/zoomPanel"
+        android:layout_width="wrap_content"
+        android:layout_height="36dp"
+        android:layout_marginBottom="16dp"
+        android:background="@drawable/bg_zoom_pill"
+        android:orientation="horizontal"
+        android:padding="4dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/rightPanelScroll"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <androidx.appcompat.widget.AppCompatTextView
+            android:id="@+id/zoom06"
+            android:layout_width="40dp"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:text="0.6"
+            android:textColor="@android:color/white" />
+
+        <androidx.appcompat.widget.AppCompatTextView
+            android:id="@+id/zoom1"
+            android:layout_width="40dp"
+            android:layout_height="match_parent"
+            android:background="@drawable/bg_zoom_selected"
+            android:gravity="center"
+            android:text="1"
+            android:textColor="@color/orange" />
+
+        <androidx.appcompat.widget.AppCompatTextView
+            android:id="@+id/zoom2"
+            android:layout_width="40dp"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:text="2"
+            android:textColor="@android:color/white" />
+
+        <androidx.appcompat.widget.AppCompatTextView
+            android:id="@+id/zoom4"
+            android:layout_width="40dp"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:text="4"
+            android:textColor="@android:color/white" />
+    </LinearLayout>
+
+    <HorizontalScrollView
+        android:id="@+id/extensionModeBar"
+        android:layout_width="wrap_content"
+        android:layout_height="36dp"
+        android:layout_marginBottom="8dp"
+        android:fadingEdgeLength="0dp"
+        android:overScrollMode="never"
+        android:scrollbars="none"
+        app:layout_constraintBottom_toTopOf="@id/zoomPanel"
+        app:layout_constraintEnd_toStartOf="@id/rightPanelScroll"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <LinearLayout
+            android:id="@+id/extensionChipContainer"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:gravity="center_vertical"
+            android:orientation="horizontal" />
+    </HorizontalScrollView>
+
+    <LinearLayout
+        android:id="@+id/evContainer"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginBottom="16dp"
+        android:background="@drawable/bg_zoom_pill"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="6dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <androidx.appcompat.widget.AppCompatTextView
+            android:id="@+id/evLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="4dp"
+            android:text="EV +0.0"
+            android:textColor="@color/orange"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <SeekBar
+            android:id="@+id/evSeekBar"
+            android:layout_width="100dp"
+            android:layout_height="wrap_content"
+            android:max="40"
+            android:progress="20"
+            android:progressTint="@color/orange"
+            android:thumbTint="@color/orange" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/zoomSliderRow"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:visibility="gone"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <androidx.appcompat.widget.AppCompatImageView android:id="@+id/btnZoomOut" android:layout_width="0dp" android:layout_height="0dp" />
+        <expo.modules.auctioncamera.viewextensions.ZoomSliderView android:id="@+id/zoomSliderView" android:layout_width="0dp" android:layout_height="0dp" />
+        <androidx.appcompat.widget.AppCompatImageView android:id="@+id/btnZoomIn" android:layout_width="0dp" android:layout_height="0dp" />
+        <androidx.appcompat.widget.AppCompatTextView android:id="@+id/zoomRatioLabel" android:layout_width="0dp" android:layout_height="0dp" />
+    </LinearLayout>
+
+    <ScrollView
+        android:id="@+id/rightPanelScroll"
+        android:layout_width="@dimen/_95sdp"
+        android:layout_height="0dp"
+        android:background="@android:color/black"
+        android:fillViewport="true"
+        android:overScrollMode="never"
+        android:scrollbars="none"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <LinearLayout
+            android:id="@+id/rightPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_horizontal"
+            android:orientation="vertical"
+            android:paddingHorizontal="4dp"
+
+            android:paddingVertical="6dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="horizontal">
+
+                <FrameLayout
+                    android:id="@+id/galleryPreviewContainer"
+                    android:layout_width="52dp"
+                    android:layout_height="52dp"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:foreground="?attr/selectableItemBackground">
+
+                    <androidx.appcompat.widget.AppCompatImageView
+                        android:id="@+id/galleryPreview"
+                        android:layout_width="45dp"
+                        android:layout_height="45dp"
+                        android:layout_gravity="bottom|start"
+                        android:background="@drawable/square_shape"
+                        android:clickable="false"
+                        android:focusable="false"
+                        android:scaleType="centerCrop" />
+
+                    <androidx.appcompat.widget.AppCompatImageView
+                        android:id="@+id/galleryVideoBadge"
+                        android:layout_width="18dp"
+                        android:layout_height="18dp"
+                        android:layout_gravity="center"
+                        android:src="@drawable/ic_resume"
+                        android:tint="@color/white"
+                        android:visibility="gone" />
+
+                    <androidx.appcompat.widget.AppCompatTextView
+                        android:id="@+id/galleryCount"
+                        android:layout_width="20dp"
+                        android:layout_height="20dp"
+                        android:layout_gravity="top|end"
+                        android:background="@drawable/bg_count_circle"
+                        android:clickable="false"
+                        android:focusable="false"
+                        android:gravity="center"
+                        android:text="0"
+                        android:textColor="@color/white"
+                        android:textSize="10sp"
+                        android:textStyle="bold"
+                        android:visibility="gone" />
+                </FrameLayout>
+
+                <androidx.appcompat.widget.AppCompatImageView
+                    android:id="@+id/imageViewRecordVideo"
+                    android:layout_width="44dp"
+                    android:layout_height="44dp"
+                    android:scaleX="1.3"
+                    android:scaleY="1.3"
+                    android:layout_gravity="center"
+                    android:scaleType="centerInside"
+                    android:src="@drawable/ic_record_video" />
+            </LinearLayout>
+
+
+            <Space
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_marginTop="4dp"
+                android:layout_weight="1" />
+
+            <LinearLayout
+                android:id="@+id/bottomPanel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginHorizontal="4dp"
+                android:layout_marginBottom="4dp"
+                android:background="@drawable/bg_zoom_pill"
+                android:orientation="vertical"
+                android:padding="6dp">
+
+                <androidx.appcompat.widget.AppCompatTextView
+                    android:id="@+id/textViewBundle"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="6dp"
+                    android:background="@drawable/bg_focus_btn"
+                    android:gravity="center"
+                    android:paddingVertical="12dp"
+                    android:text="Bundle"
+                    android:textColor="@color/white"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <androidx.appcompat.widget.AppCompatTextView
+                    android:id="@+id/textViewItem"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="6dp"
+                    android:background="@drawable/bg_focus_btn"
+                    android:gravity="center"
+                    android:paddingVertical="12dp"
+                    android:text="Item"
+                    android:textColor="@color/white"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <androidx.appcompat.widget.AppCompatTextView
+                    android:id="@+id/textViewPhoto"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:background="@drawable/bg_focus_btn"
+                    android:gravity="center"
+                    android:paddingVertical="12dp"
+                    android:text="Photo"
+                    android:textColor="@color/white"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+
+            <androidx.appcompat.widget.AppCompatTextView
+                android:id="@+id/textViewBundleExtra"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginHorizontal="4dp"
+                android:layout_marginTop="2dp"
+                android:background="@drawable/bg_focus_btn"
+                android:backgroundTint="@color/blue"
+                android:gravity="center"
+                android:paddingVertical="12dp"
+                android:text="+ Extra"
+                android:textColor="@color/white"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <Space
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_marginTop="4dp"
+                android:layout_weight="1" />
+
+            <LinearLayout
+                android:id="@+id/linearLayoutLotLeftRight"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="8dp"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <androidx.appcompat.widget.AppCompatTextView
+                        android:id="@+id/imageLeftArrow"
+                        android:layout_width="0dp"
+                        android:layout_height="32dp"
+                        android:layout_marginEnd="2dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/bg_blue_pill"
+                        android:gravity="center"
+                        android:paddingHorizontal="4dp"
+                        android:text="◀ Prev"
+                        android:textColor="@color/white"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <androidx.appcompat.widget.AppCompatTextView
+                        android:id="@+id/imageRightArrow"
+                        android:layout_width="0dp"
+                        android:layout_height="32dp"
+                        android:layout_marginStart="2dp"
+                        android:layout_weight="1"
+                        android:background="@drawable/green_color_bg"
+                        android:gravity="center"
+                        android:paddingHorizontal="4dp"
+                        android:text="Next ▶"
+                        android:textColor="@color/white"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <androidx.appcompat.widget.AppCompatTextView
+                    android:id="@+id/textViewDone"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:background="@drawable/bg_blue_pill"
+                    android:backgroundTint="@color/red"
+                    android:gravity="center"
+                    android:paddingVertical="8dp"
+                    android:text="✔ Done"
+                    android:textColor="@color/white"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+        </LinearLayout>
+    </ScrollView>
+    <include
+        android:id="@+id/includePro"
+        layout="@layout/item_pro_layout"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:elevation="20dp"
+        android:visibility="gone"
+        app:layout_constraintEnd_toStartOf="@id/rightPanelScroll"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/includeMainExtra" />
+</androidx.constraintlayout.widget.ConstraintLayout>

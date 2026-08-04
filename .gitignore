@@ -1,0 +1,55 @@
+# Dependencies and Expo state
+node_modules/
+.expo/
+.expo-shared/
+dist/
+web-build/
+coverage/
+
+# Local configuration and secrets
+.env*
+!.env.example
+credentials/
+credentials.json
+google-services.json
+GoogleService-Info.plist
+*.jks
+*.keystore
+*.p8
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision
+
+# Native build products and caches
+**/.gradle/
+**/.kotlin/
+**/.cxx/
+**/.externalNativeBuild/
+**/build/
+android/local.properties
+local.properties
+*.apk
+*.aab
+*.ipa
+*.zip
+*.7z
+*.rar
+
+# Generated native project
+ios/
+
+# Logs and temporary files
+*.log
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.orig.*
+.metro-health-check*
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
