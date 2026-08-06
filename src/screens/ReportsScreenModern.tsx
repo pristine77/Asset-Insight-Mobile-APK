@@ -360,7 +360,14 @@ const ReportsScreenModern = ({
   }, []);
 
   const renderFileButton = useCallback(
-    (report: ReportItem, key: ReportFileKey, label: string, icon: keyof typeof Feather.glyphMap, extension: string) => {
+    (
+      report: ReportItem,
+      key: ReportFileKey,
+      label: string,
+      icon: keyof typeof Feather.glyphMap,
+      extension: string,
+      filenameLabel = label
+    ) => {
       const url = report.files[key];
       if (!url) return null;
       return (
@@ -369,7 +376,13 @@ const ReportsScreenModern = ({
           style={styles.fileButton}
           activeOpacity={0.72}
           disabled={downloadingId === report.id}
-          onPress={() => void download(url, `${report.contract || report.name}-${label}.${extension}`, report.id)}>
+          onPress={() =>
+            void download(
+              url,
+              `${report.contract || report.name}-${filenameLabel}.${extension}`,
+              report.id
+            )
+          }>
           {downloadingId === report.id ? (
             <ActivityIndicator size="small" color={colors.text} />
           ) : (
@@ -478,10 +491,26 @@ const ReportsScreenModern = ({
             <View style={styles.filesSection}>
               <Text style={styles.sectionLabel}>FILES</Text>
               <View style={styles.fileButtons}>
-                {renderFileButton(report, 'pdf', 'PDF', 'file-text', 'pdf')}
+                {renderFileButton(
+                  report,
+                  'pdf',
+                  report.type === 'Asset' ? 'Schedule A' : 'PDF',
+                  'file-text',
+                  'pdf',
+                  'PDF'
+                )}
                 {renderFileButton(report, 'conditionalReport', 'CR', 'file', 'pdf')}
                 {renderFileButton(report, 'crDocx', 'CR DOCX', 'file-plus', 'docx')}
-                {renderFileButton(report, 'docx', 'DOCX', 'file-text', 'docx')}
+                {renderFileButton(
+                  report,
+                  'docx',
+                  report.type === 'Asset' || report.type === 'RealEstate'
+                    ? 'Appraisal report'
+                    : 'DOCX',
+                  'file-text',
+                  'docx',
+                  'DOCX'
+                )}
                 {renderFileButton(report, 'excel', 'Excel', 'grid', 'xlsx')}
                 {renderFileButton(report, 'images', 'Images', 'image', 'zip')}
               </View>
