@@ -690,6 +690,9 @@ const LotListingFormSheet = ({
         progress_id: jobId,
         client_submission_id: jobId,
         force_new: options.forceNew === true,
+        ...(auctionManagementTask?.task.auctioneerWorkItemId
+          ? { auctioneer_work_item_id: auctionManagementTask.task.auctioneerWorkItemId }
+          : {}),
         auctionsoft: buildAuctionsoftMetadata(destination),
       };
 
@@ -1093,9 +1096,17 @@ const LotListingFormSheet = ({
                         style={[styles.serviceChip, selected && styles.serviceChipActive]}
                         onPress={() => toggleAuctionService(activeLotIdx, service.rowGuid)}
                         activeOpacity={0.86}>
-                        <Text style={[styles.serviceChipText, selected && styles.serviceChipTextActive]} numberOfLines={1}>
-                          {service.serviceName}
-                        </Text>
+                        <View style={styles.serviceChipCopy}>
+                          <Text style={[styles.serviceChipText, selected && styles.serviceChipTextActive]} numberOfLines={1}>
+                            {service.serviceName}
+                          </Text>
+                          <Text style={[styles.serviceChipPrice, selected && styles.serviceChipPriceActive]}>
+                            ${Number(String(service.defaultPrice ?? '0').replace(/[^0-9.-]/g, '')) || 0}
+                          </Text>
+                        </View>
+                        <View style={[styles.serviceChipCheck, selected && styles.serviceChipCheckActive]}>
+                          {selected ? <Feather name="check" size={12} color="#FFFFFF" /> : null}
+                        </View>
                       </TouchableOpacity>
                     );
                   })}
@@ -1516,12 +1527,16 @@ const styles = StyleSheet.create({
   },
   serviceChip: {
     maxWidth: '100%',
+    minWidth: '47%',
     paddingHorizontal: 10,
     paddingVertical: 8,
     borderRadius: 10,
     borderWidth: 1,
     borderColor: '#CBD5E1',
     backgroundColor: '#F8FAFC',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   serviceChipActive: {
     borderColor: '#2563EB',
@@ -1534,6 +1549,31 @@ const styles = StyleSheet.create({
   },
   serviceChipTextActive: {
     color: '#1D4ED8',
+  },
+  serviceChipCopy: {
+    flex: 1,
+  },
+  serviceChipPrice: {
+    color: '#64748B',
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  serviceChipPriceActive: {
+    color: '#1D4ED8',
+  },
+  serviceChipCheck: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: '#94A3B8',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  serviceChipCheckActive: {
+    backgroundColor: '#2563EB',
+    borderColor: '#2563EB',
   },
   datePickerSmall: {
     flexDirection: 'row',

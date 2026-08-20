@@ -8,6 +8,7 @@ export type LotListingMode = 'single_lot' | 'per_item' | 'per_photo';
 
 export interface LotListingDetails {
   client_submission_id?: string;
+  auctioneer_work_item_id?: string;
   force_new?: boolean;
   contract_no: string;
   sales_date: string;
