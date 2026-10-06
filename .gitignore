@@ -50,6 +50,7 @@ yarn-error.*
 
 # Editor and OS files
 .DS_Store
+*.DS_Store
 Thumbs.db
 .idea/
 *.iml
