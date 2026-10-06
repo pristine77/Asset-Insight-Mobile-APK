@@ -24,16 +24,23 @@ import AssignedReleasesScreen from './src/screens/AssignedReleasesScreen';
 import OfflineReportsScreen from './src/screens/OfflineReportsScreen';
 import PreviewsScreen from './src/screens/PreviewsScreen';
 import PreviewScreen from './src/screens/PreviewScreen';
+import SalvagePreviewScreen from './src/screens/SalvagePreviewScreen';
 import CrmEntryScreen from './src/screens/CrmEntryScreen';
 import CrmDashboardScreen from './src/screens/CrmDashboardScreen';
 import CrmTasksScreen from './src/screens/CrmTasksScreen';
 import CrmOutlookCalendarScreen from './src/screens/CrmOutlookCalendarScreen';
 import AuctionManagementScreen from './src/screens/AuctionManagementScreen';
-import AppUpdatePrompt from './src/components/AppUpdatePrompt';
+import SupportScreen from './src/screens/SupportScreen';
 import DrawerContent, { ScreenName as DrawerScreenName } from './src/components/DrawerContent';
 import NotificationCenterModal from './src/components/NotificationCenterModal';
+import PreviewReminderNotification from './src/components/PreviewReminderNotification';
+import UploadBar from './src/components/UploadBar';
+import { claimDraftForEditing } from './src/components/backgroundUploadDraftGuard';
+import { previewReminderDetails } from './src/utils/previewReminderNotification';
+import type { NotificationItem } from './src/services/notificationService';
 import offlineQueueService from './src/services/offlineQueueService';
 import draftSyncService from './src/services/draftSyncService';
+import OfflineCaptureSync from './src/services/offlineCaptureSync';
 import type { OfflineDraftType } from './src/services/autoSaveService';
 import type { CrmDashboardTaskFilter, CrmTaskStatus } from './src/services/crmService';
 import { getNotificationNavigationTarget } from './src/utils/notificationNavigation';
@@ -50,7 +57,7 @@ interface SavedInputForForm {
 }
 
 type CrmMode = 'listing' | 'crm';
-type ScreenName = DrawerScreenName | 'auctionManagement';
+type ScreenName = DrawerScreenName;
 type CrmTaskOpenTarget =
   | string
   | null
@@ -82,6 +89,7 @@ function MainApp() {
   } = useNotifications();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
+  const [previewReminder, setPreviewReminder] = useState<{ item: NotificationItem; ownerId: string } | null>(null);
   const [activeScreen, setActiveScreen] = useState<ScreenName>('dashboard');
   const [crmMode, setCrmMode] = useState<CrmMode>('listing');
   const [savedInputToLoad, setSavedInputToLoad] = useState<SavedInputForForm | null>(null);
@@ -94,7 +102,7 @@ function MainApp() {
   const [crmTaskStatusFilter, setCrmTaskStatusFilter] = useState<CrmTaskStatus | null>(null);
   const [previewTarget, setPreviewTarget] = useState<{
     reportId: string;
-    reportType: 'Asset' | 'RealEstate' | 'LotListing';
+    reportType: 'Asset' | 'RealEstate' | 'LotListing' | 'Salvage';
     mode: 'pending' | 'submitted';
     source?: 'owner' | 'assignedApproval';
     returnScreen: ScreenName;
@@ -138,7 +146,7 @@ function MainApp() {
 
   const openPreviewScreen = useCallback((
     reportId: string,
-    reportType: 'Asset' | 'RealEstate' | 'LotListing',
+    reportType: 'Asset' | 'RealEstate' | 'LotListing' | 'Salvage',
     mode: 'pending' | 'submitted'
   ) => {
     setCrmMode('listing');
@@ -159,6 +167,13 @@ function MainApp() {
       return;
     }
 
+    if (previewReminderDetails(lastOpenedNotification)) {
+      setNotificationCenterOpen(false);
+      setPreviewReminder({ item: lastOpenedNotification, ownerId: String(user?._id || '') });
+      clearLastOpenedNotification();
+      return;
+    }
+
     const target = getNotificationNavigationTarget(lastOpenedNotification.data);
     if (target?.kind === 'crmTasks' && user?.isCrmAgent) {
       openCrmTasksScreen(target.taskId);
@@ -176,6 +191,7 @@ function MainApp() {
     openPreviewScreen,
     openReportsScreen,
     user?.isCrmAgent,
+    user?._id,
   ]);
 
   const openDrawer = () => {
@@ -194,6 +210,7 @@ function MainApp() {
 
   const showGlobalNotificationCenter =
     activeScreen !== 'dashboard' &&
+    activeScreen !== 'support' &&
     activeScreen !== 'preview' &&
     activeScreen !== 'reports' &&
     activeScreen !== 'savedInputs' &&
@@ -265,6 +282,10 @@ function MainApp() {
   }, []);
 
   const handleContinueOfflineDraft = useCallback((draftId: string, type: OfflineDraftType) => {
+    // Every way into a saved draft passes here (Drafts, Offline captures, the
+    // upload bar). A draft uploading in the background stays closed until it
+    // is paused or finished; a paused one is handed back to its form.
+    if (!claimDraftForEditing(draftId)) return;
     setCrmMode('listing');
     setDrawerOpen(false);
     setPreviewTarget(null);
@@ -387,10 +408,11 @@ function MainApp() {
             onClearSavedInput={clearSavedInput}
             offlineDraftToLoad={offlineDraftToLoad}
             onClearOfflineDraft={clearOfflineDraft}
+            onOpenSalvagePreview={(reportId) => openPreviewScreen(reportId, 'Salvage', 'pending')}
           />
         );
       case 'auctionManagement':
-        return <AuctionManagementScreen onOpenDrawer={openDrawer} />;
+        return <AuctionManagementScreen onOpenDrawer={openDrawer} onOpenReport={(reportId, reportType) => openPreviewScreen(reportId, reportType === 'asset' ? 'Asset' : 'LotListing', 'pending')} />;
       case 'savedInputs':
         return (
           <OfflineReportsScreen
@@ -418,6 +440,10 @@ function MainApp() {
       case 'profile':
         return (
           <ProfileScreen onOpenDrawer={openDrawer} onBack={() => setActiveScreen('dashboard')} />
+        );
+      case 'support':
+        return (
+          <SupportScreen onOpenDrawer={openDrawer} onBack={() => setActiveScreen('dashboard')} />
         );
       case 'reports':
         return (
@@ -482,6 +508,7 @@ function MainApp() {
               initialMode={previewListMode}
               unreadCount={unreadCount}
               onOpenNotifications={() => setNotificationCenterOpen(true)}
+              onOpenDrafts={() => setActiveScreen('offlineReports')}
               onOpenPreview={(reportId, reportType, mode) => {
                 setPreviewListMode(mode);
                 setPreviewTarget({ reportId, reportType, mode, source: 'owner', returnScreen: 'preview' });
@@ -491,6 +518,12 @@ function MainApp() {
           );
         }
 
+        if (previewTarget.reportType === 'Salvage') {
+          return <SalvagePreviewScreen key={previewTarget.reportId} reportId={previewTarget.reportId} readOnly={previewTarget.source === 'assignedApproval'} onBack={() => {
+            setPreviewTarget(null);
+            setActiveScreen(previewTarget.returnScreen);
+          }} />;
+        }
         return (
           <PreviewScreen
             reportId={previewTarget.reportId}
@@ -528,8 +561,16 @@ function MainApp() {
       {/* Main Content */}
       {renderScreen()}
 
+      {/* Background uploads: rendered here, not in a screen, so it stays
+          while the person moves between screens. It follows the screen in
+          this column, so the screen ends above it and keeps its own bottom
+          controls in view. */}
+      <UploadBar onOpenDraft={handleContinueOfflineDraft} />
+
       {showGlobalNotificationCenter ? (
         <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="Open notifications"
           style={[
             styles.notificationBell,
             {
@@ -564,6 +605,14 @@ function MainApp() {
         />
       ) : null}
 
+      {previewReminder && previewReminder.ownerId === String(user?._id || '') ? <PreviewReminderNotification
+        key={previewReminder.item.id}
+        item={previewReminder.item}
+        onClose={() => setPreviewReminder(null)}
+        onOpenPreview={openPreviewScreen}
+        onOpenDrafts={() => { setCrmMode('listing'); setDrawerOpen(false); setPreviewTarget(null); setActiveScreen('offlineReports'); }}
+      /> : null}
+
       {/* Drawer Modal */}
       {activeScreen !== 'crmEntry' ? (
         <Modal
@@ -594,24 +643,33 @@ function MainApp() {
 function AuthGate() {
   const { colors } = useAppTheme();
   const { user, loading, deviceAccess } = useAuth();
+  // Keyed by the signed-in account, not the user object (2026-10-02). A
+  // profile save refreshes the user and hands over a new object for the same
+  // account; re-running the cleanup then paused every upload, including the
+  // background upload line.
+  const accountKey = user ? `account:${String(user._id || (user as any).id || '')}` : null;
 
   useEffect(() => {
-    if (user) {
+    if (accountKey) {
       offlineQueueService.init();
       draftSyncService.init();
+      OfflineCaptureSync.init();
       return () => {
         offlineQueueService.cleanup();
         draftSyncService.cleanup();
+        OfflineCaptureSync.cleanup();
       };
     }
 
     offlineQueueService.cleanup();
     draftSyncService.cleanup();
+    OfflineCaptureSync.cleanup();
     return () => {
       offlineQueueService.cleanup();
       draftSyncService.cleanup();
+      OfflineCaptureSync.cleanup();
     };
-  }, [user]);
+  }, [accountKey]);
 
   if (loading) {
     return (
@@ -643,7 +701,6 @@ export default function App() {
         <ThemeProvider>
           <AuthProvider>
             <AuthGate />
-            <AppUpdatePrompt />
           </AuthProvider>
         </ThemeProvider>
       </SafeAreaProvider>

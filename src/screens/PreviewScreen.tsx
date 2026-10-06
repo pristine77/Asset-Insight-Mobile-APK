@@ -8,16 +8,18 @@ import {
   RefreshControl,
   ActivityIndicator,
   Alert,
-  TextInput,
   Image,
   Modal,
   Dimensions,
+  useWindowDimensions,
   KeyboardAvoidingView,
   Keyboard,
   Platform,
   PanResponder,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import TextInput from "../components/forms/ListingTextInput";
+import KeyboardSafeViewport from "../components/KeyboardSafeViewport";
 import { Feather } from "@expo/vector-icons";
 import * as Sharing from "expo-sharing";
 import * as ImagePicker from "expo-image-picker";
@@ -35,10 +37,7 @@ import assetService from "../services/assetService";
 import lotListingService from "../services/lotListingService";
 import assignedApprovalService from "../services/assignedApprovalService";
 import {
-  CONDITION_SELECTION_GROUPS,
   ConditionSelectionKey,
-  getMissingConditionSelectionMessage,
-  normalizeConditionSelection,
 } from "../utils/conditionSelections";
 import {
   applyDamageAnalysisLotPolicy,
@@ -49,15 +48,28 @@ import {
   removeGalleryPhotoEntry,
   removeLotPhotoReference,
 } from "../utils/previewPhotoDeletion";
+import {
+  applyPrimarySerialEdit,
+  isPrimarySerialField,
+} from "../utils/previewSerialNumber";
+import { getPreviewLotPhotoEntries } from "../utils/previewLotPhotos";
+import FarmlandValuationSummary from "../components/FarmlandValuationSummary";
+import { realEstateSubmissionPath, shouldResubmitRealEstate } from "../utils/realEstateSubmission";
+import {
+  applyLotConditionSelection,
+  applyRunningConditionSelectionToLot,
+  applySelectedLotCondition,
+  toggleAssetLotSelection,
+} from "../utils/assetConditionSelection";
+import {
+  AssetBulkConditionControls,
+  AssetLotConditionEditor,
+} from "../components/reports/AssetConditionControls";
 
 const FileSystem = require("expo-file-system/legacy");
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
 const SIGNATURE_OUTPUT_WIDTH = 900;
 const SIGNATURE_OUTPUT_HEIGHT = 260;
-const RUNNING_CONDITION_GROUP = CONDITION_SELECTION_GROUPS.find(
-  (group) => group.key === "condition"
-)!;
-
 type SignaturePoint = { x: number; y: number };
 type SignatureStroke = SignaturePoint[];
 type SpecFieldEditorState = {
@@ -384,6 +396,8 @@ const PreviewScreen = ({
   unreadCount = 0,
   onOpenNotifications,
 }: PreviewScreenProps) => {
+  const { width, fontScale } = useWindowDimensions();
+  const compactFields = width < 480 || fontScale > 1.3;
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -394,6 +408,9 @@ const PreviewScreen = ({
   const [status, setStatus] = useState<string>("");
   const [declineReason, setDeclineReason] = useState<string>("");
   const [previewData, setPreviewData] = useState<any>(null);
+  const previewDataRef = useRef(previewData);
+  previewDataRef.current = previewData;
+  const [filesGenerating, setFilesGenerating] = useState(false);
   const [imageUrls, setImageUrls] = useState<string[]>([]);
   const [imageCount, setImageCount] = useState(0);
   const [categorySpecs, setCategorySpecs] = useState<AssetCategorySpec[]>([]);
@@ -402,6 +419,22 @@ const PreviewScreen = ({
 
   // Asset specific
   const [groupingMode, setGroupingMode] = useState<string>("");
+  const [selectedAssetLots, setSelectedAssetLots] = useState<Set<number>>(
+    () => new Set()
+  );
+  const selectedAssetLotsRef = useRef<Set<number>>(new Set());
+  const [assetSelectionEpoch, setAssetSelectionEpoch] = useState(0);
+  const previewRequestRevisionRef = useRef(0);
+  const reportContextKey = `${reportType}:${reportId}:${mode}:${source}`;
+  const reportContextRef = useRef(reportContextKey);
+  reportContextRef.current = reportContextKey;
+  const selectionContextRef = useRef(reportContextKey);
+  const resetAssetLotSelection = useCallback(() => {
+    selectedAssetLotsRef.current = new Set();
+    selectionContextRef.current = reportContextRef.current;
+    setSelectedAssetLots(new Set());
+    setAssetSelectionEpoch((value) => value + 1);
+  }, []);
 
   // Real Estate specific
   const [propertyType, setPropertyType] = useState<string>("");
@@ -415,10 +448,19 @@ const PreviewScreen = ({
   const [specFieldEditor, setSpecFieldEditor] = useState<SpecFieldEditorState | null>(null);
   const [uploadingLotKey, setUploadingLotKey] = useState<string | null>(null);
   const lastSpecTapRef = useRef<{ key: string; time: number } | null>(null);
+  const previewBusyRef = useRef(false);
+  previewBusyRef.current =
+    loading || refreshing || saving || submitting || filesGenerating || uploadingLotKey !== null;
 
   const isAsset = reportType === "Asset";
   const isLotListing = reportType === "LotListing";
   const isAssignedApproval = source === "assignedApproval";
+  const resubmitMode = isAssignedApproval || (reportType === "RealEstate"
+    ? shouldResubmitRealEstate(status, mode)
+    : status ? ["pending_approval", "approved", "error"].includes(status) : mode === "submitted");
+  const generationLabel = isAssignedApproval
+    ? "Save, Regenerate & Approve"
+    : resubmitMode ? "Save & Regenerate" : "Save & Generate";
   const themeColor = isAsset ? "#F43F5E" : isLotListing ? "#8B5CF6" : "#10B981";
 
   const getLotDisplayNumber = (lot: any, index: number) => {
@@ -460,30 +502,8 @@ const PreviewScreen = ({
   const getLotUploadKey = (lot: any, index: number) =>
     String(lot?.lot_id || lot?.id || lot?.lot_number || index);
 
-  const getLotPhotoEntries = (lot: any) => {
-    const indexes = [
-      ...(Array.isArray(lot?.image_indexes) ? lot.image_indexes : (typeof lot?.image_index === "number" ? [lot.image_index] : [])),
-      ...(Array.isArray(lot?.extra_image_indexes) ? lot.extra_image_indexes : []),
-    ]
-      .map((value) => Number(value))
-      .filter((value, index, arr) => Number.isInteger(value) && value >= 0 && arr.indexOf(value) === index);
-    const entries: Array<{ globalIndex: number | null; url: string }> = indexes.flatMap((globalIndex) => {
-      const url = imageUrls[globalIndex];
-      return url ? [{ globalIndex, url }] : [];
-    });
-    const fallbackUrls = [
-      ...(Array.isArray(lot?.image_urls) ? lot.image_urls : []),
-      ...(Array.isArray(lot?.extra_image_urls) ? lot.extra_image_urls : []),
-      lot?.image_url,
-    ]
-      .filter((url): url is string => typeof url === "string" && Boolean(url));
-    fallbackUrls.forEach((url) => {
-      if (entries.some((entry) => entry.url === url)) return;
-      const rootIndex = imageUrls.indexOf(url);
-      entries.push({ globalIndex: rootIndex >= 0 ? rootIndex : null, url });
-    });
-    return entries;
-  };
+  const getLotPhotoEntries = (lot: any) =>
+    getPreviewLotPhotoEntries(lot, imageUrls);
 
   const mergeSavedPreviewWithLocalLotNumbers = React.useCallback((savedPreview: any, localPreview: any) => {
     if (!savedPreview || !Array.isArray(savedPreview.lots) || !Array.isArray(localPreview?.lots)) {
@@ -523,8 +543,16 @@ const PreviewScreen = ({
   }, []);
 
   const loadPreviewData = useCallback(async () => {
+    const requestRevision = ++previewRequestRevisionRef.current;
+    const isCurrent = () =>
+      reportContextRef.current === reportContextKey &&
+      previewRequestRevisionRef.current === requestRevision;
+    resetAssetLotSelection();
     try {
       setLoading(true);
+      setSaving(false);
+      setSubmitting(false);
+      setUploadingLotKey(null);
 
       let endpoint = "";
       if (!isAssignedApproval) {
@@ -547,10 +575,12 @@ const PreviewScreen = ({
           ? api.get("/asset/category-specs").catch(() => ({ data: { data: { specs: [] } } }))
           : Promise.resolve({ data: { data: { specs: [] } } }),
       ]);
+      if (!isCurrent()) return;
       const data = previewResponse;
       setCategorySpecs(categorySpecResponse.data?.data?.specs || []);
 
       setStatus(data.status || "");
+      setFilesGenerating(Boolean(data.files_generating || data.files_regenerating));
       setDeclineReason(data.decline_reason || "");
       const nextPreviewData = data.preview_data || {};
       setPreviewData(applyDamageAnalysisLotPolicy(
@@ -564,9 +594,12 @@ const PreviewScreen = ({
             }
           : nextPreviewData
       ));
-      setImageUrls(data.imageUrls || []);
-      setImageCount(data.image_count || 0);
+      const loadedImages = data.imageUrls || [];
+      const reportOnlyImages = !isAsset && !isLotListing ? data.extraImageUrls || [] : [];
+      setImageUrls([...loadedImages, ...reportOnlyImages]);
+      setImageCount((data.image_count || loadedImages.length) + reportOnlyImages.length);
       setPreviewFiles(data.preview_files || data.files || {});
+      setHasChanges(false);
 
       if (isAsset) {
         setGroupingMode(data.grouping_mode || "mixed");
@@ -575,17 +608,22 @@ const PreviewScreen = ({
         setLanguage(data.language || "en");
       }
     } catch (error: any) {
+      if (!isCurrent()) return;
       console.error("Error loading preview:", error);
       Alert.alert("Error", error.response?.data?.message || "Failed to load preview data");
       onBack();
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (isCurrent()) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  }, [isAsset, isAssignedApproval, isLotListing, mode, onBack, reportId, reportType]);
+  }, [isAsset, isAssignedApproval, isLotListing, mode, onBack, reportId, reportType,
+    reportContextKey, resetAssetLotSelection]);
 
   useEffect(() => {
     loadPreviewData();
+    return () => { previewRequestRevisionRef.current += 1; };
   }, [loadPreviewData]);
 
   useEffect(() => {
@@ -603,11 +641,13 @@ const PreviewScreen = ({
   }, []);
 
   const onRefresh = useCallback(() => {
+    if (saving || submitting || uploadingLotKey !== null) return;
     setRefreshing(true);
     loadPreviewData();
-  }, [loadPreviewData]);
+  }, [loadPreviewData, saving, submitting, uploadingLotKey]);
 
   const updateField = (field: string, value: any) => {
+    if ((isAsset || isLotListing) && previewBusyRef.current) return;
     setPreviewData((prev: any) => ({ ...prev, [field]: value }));
     setHasChanges(true);
   };
@@ -628,6 +668,7 @@ const PreviewScreen = ({
   };
 
   const updateNestedField = (path: string, value: any) => {
+    if ((isAsset || isLotListing) && previewBusyRef.current) return;
     setPreviewData((prev: any) => {
       const parts = path.split(".");
       const newData = { ...prev };
@@ -650,13 +691,17 @@ const PreviewScreen = ({
       if (!current) return "";
       current = current[part];
     }
-    return current || "";
+    return current ?? "";
   };
 
   const updateLot = (index: number, field: string, value: any) => {
+    if ((isAsset || isLotListing) && previewBusyRef.current) return;
     setPreviewData((prev: any) => {
       const newLots = [...(prev.lots || [])];
-      const nextLot = { ...newLots[index], [field]: value };
+      const nextLot =
+        field === "serial_number"
+          ? applyPrimarySerialEdit(newLots[index] || {}, value)
+          : { ...newLots[index], [field]: value };
       if (
         field === "lot_number" &&
         !isDamageAnalysisEligibleForLot(getLotNumberForDamagePolicy(nextLot))
@@ -675,71 +720,14 @@ const PreviewScreen = ({
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "");
 
-  const getSharedRunningConditionSelection = (lots: any[] = []) => {
-    if (!lots.length) return "";
-    const first = normalizeConditionSelection(
-      lots[0]?.condition_report_selections?.condition
-    );
-    if (
-      !first ||
-      !RUNNING_CONDITION_GROUP.options.some(
-        (option) => normalizeConditionSelection(option) === first
-      )
-    ) {
-      return "";
-    }
-    return lots.every(
-      (lot) =>
-        normalizeConditionSelection(lot?.condition_report_selections?.condition) ===
-        first
-    )
-      ? first
-      : "";
-  };
-
-  const applyRunningConditionSelectionToLot = (lot: any, value: string) => {
-    const nextLot: any = {
-      ...(lot || {}),
-      condition_report_selections: {
-        ...(lot?.condition_report_selections || {}),
-        condition: value,
-      },
-    };
-    const existing = nextLot.condition_report_specs || {};
-    const specs: Record<string, string> = Array.isArray(existing)
-      ? Object.fromEntries(
-          existing
-            .map((entry: any) => [String(entry?.field || "").trim(), String(entry?.value ?? "")])
-            .filter((entry: string[]) => entry[0])
-        )
-      : { ...existing };
-    const runningConditionKey = normalizeSpecKey("Running Condition");
-    const existingKey = Object.keys(specs).find(
-      (candidate) => normalizeSpecKey(candidate) === runningConditionKey
-    );
-    if (normalizeConditionSelection(value) === "n/a") {
-      if (existingKey) delete specs[existingKey];
-    } else {
-      specs[existingKey || "Running Condition"] = value;
-    }
-    const deletedSpecs = Array.isArray(nextLot.condition_report_specs_deleted)
-      ? nextLot.condition_report_specs_deleted
-          .map((item: any) => String(item || "").trim())
-          .filter(Boolean)
-          .filter((item: string) => normalizeSpecKey(item) !== runningConditionKey)
-      : [];
-    nextLot.condition_report_specs = specs;
-    nextLot.condition_report_specs_deleted = deletedSpecs;
-    return nextLot;
-  };
-
   const normalizeVisiblePresenceValue = (value: unknown) => {
     const text = String(value ?? "").trim();
     if (!text) return "";
-    if (/\b(?:not|no)\s+visible\b|\bvisible\s*[:=-]?\s*(?:no|false)\b/i.test(text)) {
+    // Only normalize standalone presence labels, never narrative inspection notes.
+    if (/^(?:(?:not|no)\s+visible|visible\s*[:=-]?\s*(?:no|false))$/i.test(text)) {
       return "No";
     }
-    if (/\bvisible\b/i.test(text)) {
+    if (/^visible(?:\s*[:=-]?\s*(?:yes|true))?$/i.test(text)) {
       return "Yes";
     }
     return "";
@@ -769,6 +757,10 @@ const PreviewScreen = ({
             .filter(Boolean)
         : [];
       const fieldKey = normalizeSpecKey(fieldName);
+      if (isPrimarySerialField(fieldName)) {
+        newLots[index] = applyPrimarySerialEdit(lot, value);
+        return { ...prev, lots: newLots };
+      }
       specs[fieldName] = value;
       lot.condition_report_specs_deleted = deletedSpecs.filter(
         (field: string) => normalizeSpecKey(field) !== fieldKey
@@ -798,6 +790,10 @@ const PreviewScreen = ({
             .filter(Boolean)
         : [];
       const fieldKey = normalizeSpecKey(fieldName);
+      if (isPrimarySerialField(fieldName)) {
+        newLots[index] = applyPrimarySerialEdit(lot, "");
+        return { ...prev, lots: newLots };
+      }
       const existingKey = Object.keys(specs).find(
         (field) => normalizeSpecKey(field) === fieldKey
       );
@@ -891,7 +887,14 @@ const PreviewScreen = ({
   };
 
   const addPhotosToLot = async (lot: any, lotIndex: number) => {
+    if ((isAsset || isLotListing) && previewBusyRef.current) return;
+    const contextAtStart = reportContextKey;
+    const requestRevision = previewRequestRevisionRef.current;
+    const isCurrent = () =>
+      reportContextRef.current === contextAtStart &&
+      previewRequestRevisionRef.current === requestRevision;
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!isCurrent()) return;
     if (!permission.granted) {
       Alert.alert("Photos permission needed", "Please allow photo access to add images to this lot.");
       return;
@@ -905,7 +908,7 @@ const PreviewScreen = ({
       exif: false,
     });
 
-    if (result.canceled || !result.assets?.length) return;
+    if (!isCurrent() || result.canceled || !result.assets?.length) return;
 
     const lotKey = getLotUploadKey(lot, lotIndex);
     const selectedImages = result.assets.map((asset, index) => ({
@@ -915,12 +918,14 @@ const PreviewScreen = ({
     }));
 
     setUploadingLotKey(lotKey);
+    resetAssetLotSelection();
     try {
       const response = isLotListing
         ? await lotListingService.uploadPreviewLotImages(reportId, lotKey, selectedImages, previewData)
         : isAssignedApproval
           ? await assignedApprovalService.uploadPreviewLotImages(reportId, lotKey, selectedImages, previewData)
           : await assetService.uploadPreviewLotImages(reportId, lotKey, selectedImages, previewData);
+      if (!isCurrent()) return;
       const payload = response?.data || {};
       if (payload.preview_data) {
         setPreviewData(applyDamageAnalysisLotPolicy(payload.preview_data));
@@ -935,9 +940,10 @@ const PreviewScreen = ({
       setHasChanges(false);
       Alert.alert("Images added", response?.files_regeneration_queued ? "Files are regenerating with the added photos." : "Photos were added to this lot.");
     } catch (error: any) {
+      if (!isCurrent()) return;
       Alert.alert("Upload failed", error?.response?.data?.message || "Could not upload photos for this lot.");
     } finally {
-      setUploadingLotKey(null);
+      if (isCurrent()) setUploadingLotKey(null);
     }
   };
 
@@ -946,39 +952,56 @@ const PreviewScreen = ({
     field: ConditionSelectionKey,
     value: string
   ) => {
+    if (isAsset && (previewBusyRef.current || reportContextRef.current !== reportContextKey)) {
+      return;
+    }
     setPreviewData((prev: any) => {
       const newLots = [...(prev?.lots || [])];
-      const lot = newLots[index] || {};
-      const nextLot: any = {
-        ...lot,
-        condition_report_selections: {
-          ...(lot.condition_report_selections || {}),
-          [field]: value,
-        },
-      };
-      newLots[index] = {
-        ...(field === "condition"
-          ? applyRunningConditionSelectionToLot(nextLot, value)
-          : nextLot),
-      };
+      if (!newLots[index]) return prev;
+      newLots[index] = isAsset
+        ? applyLotConditionSelection(newLots[index], field, value)
+        : field === "condition"
+          ? applyRunningConditionSelectionToLot(newLots[index], value)
+          : {
+              ...newLots[index],
+              condition_report_selections: {
+                ...newLots[index].condition_report_selections,
+                [field]: value,
+              },
+            };
       return { ...prev, lots: newLots };
     });
     setHasChanges(true);
   };
 
-  const applyRunningConditionToAllLots = (value: string) => {
+  const selectAssetLots = (indexes: Set<number>) => {
+    if (previewBusyRef.current || reportContextRef.current !== reportContextKey) return;
+    selectedAssetLotsRef.current = indexes;
+    selectionContextRef.current = reportContextKey;
+    setSelectedAssetLots(indexes);
+  };
+
+  const applyAssetLotCondition = (field: ConditionSelectionKey, value: string) => {
+    if (previewBusyRef.current || selectionContextRef.current !== reportContextKey ||
+        reportContextRef.current !== reportContextKey) return;
+    const indexes = selectedAssetLotsRef.current;
+    if (!indexes.size) return;
+    const revision = previewRequestRevisionRef.current;
     setPreviewData((prev: any) => {
-      const lots = Array.isArray(prev?.lots) ? prev.lots : [];
-      const newLots = lots.map((lot: any) =>
-        applyRunningConditionSelectionToLot(lot, value)
-      );
-      return { ...prev, lots: newLots };
+      if (previewRequestRevisionRef.current !== revision ||
+          reportContextRef.current !== reportContextKey) return prev;
+      return {
+        ...prev,
+        lots: applySelectedLotCondition(prev?.lots || [], indexes, field, value),
+      };
     });
     setHasChanges(true);
-    Alert.alert("Running Condition applied", `${value} was applied to all lots.`);
   };
 
   const deleteLot = (index: number) => {
+    if (isAsset && previewBusyRef.current) return;
+    const contextAtOpen = reportContextKey;
+    const revisionAtOpen = previewRequestRevisionRef.current;
     Alert.alert(
       "Delete Lot",
       "Are you sure you want to delete this lot?",
@@ -988,6 +1011,11 @@ const PreviewScreen = ({
           text: "Delete",
           style: "destructive",
           onPress: () => {
+            if (reportContextRef.current !== contextAtOpen ||
+                previewRequestRevisionRef.current !== revisionAtOpen ||
+                (isAsset && previewBusyRef.current)) return;
+            previewRequestRevisionRef.current += 1;
+            resetAssetLotSelection();
             setPreviewData((prev: any) => {
               const lots = Array.isArray(prev?.lots) ? [...prev.lots] : [];
               lots.splice(index, 1);
@@ -1001,6 +1029,13 @@ const PreviewScreen = ({
   };
 
   const handleSave = async () => {
+    if (previewBusyRef.current) return;
+    previewBusyRef.current = true;
+    const requestRevision = ++previewRequestRevisionRef.current;
+    const isCurrent = () =>
+      reportContextRef.current === reportContextKey &&
+      previewRequestRevisionRef.current === requestRevision;
+    resetAssetLotSelection();
     try {
       setSaving(true);
 
@@ -1016,9 +1051,19 @@ const PreviewScreen = ({
                 : `${API_ENDPOINTS.UPDATE_REAL_ESTATE_PREVIEW}/${reportId}`,
             { preview_data: localPreviewBeforeSave }
           );
+      if (!isCurrent()) return;
       const saveBody = isAssignedApproval ? saveResponse : saveResponse?.data;
       const savedData = saveBody?.data;
       const regenerationQueued = saveBody?.files_regeneration_queued === true;
+      const savedImageUrls = Array.isArray(saveBody?.imageUrls)
+        ? saveBody.imageUrls
+        : Array.isArray(savedData?.imageUrls)
+          ? savedData.imageUrls
+          : null;
+      if (savedImageUrls) {
+        setImageUrls(savedImageUrls);
+        setImageCount(savedImageUrls.length);
+      }
       if (isAsset && savedData) {
         setPreviewData(
           applyDamageAnalysisLotPolicy(
@@ -1045,6 +1090,7 @@ const PreviewScreen = ({
             : `/lot-listing/${reportId}/preview/spec-pdf`;
         try {
           const pdfResponse = await api.post(pdfEndpoint, {});
+          if (!isCurrent()) return;
           const pdfData = pdfResponse?.data?.data || {};
           const refreshedPreview = pdfData.preview_data;
           if (refreshedPreview) {
@@ -1057,6 +1103,10 @@ const PreviewScreen = ({
               )
             );
           }
+          if (Array.isArray(pdfData.imageUrls)) {
+            setImageUrls(pdfData.imageUrls);
+            setImageCount(pdfData.imageUrls.length);
+          }
           setPreviewFiles((prev) => ({
             ...(prev || {}),
             ...(pdfData.preview_files || {}),
@@ -1064,6 +1114,7 @@ const PreviewScreen = ({
             cr_docx: pdfData.cr_docx || pdfData.preview_files?.cr_docx || prev?.cr_docx,
           }));
         } catch (pdfError: any) {
+          if (!isCurrent()) return;
           console.warn("CR refresh failed after save:", pdfError?.message || pdfError);
         }
       }
@@ -1092,50 +1143,52 @@ const PreviewScreen = ({
           : undefined
       );
     } catch (error: any) {
+      if (!isCurrent()) return;
       console.error("Error saving:", error);
       Alert.alert("Error", error.response?.data?.message || "Failed to save changes");
     } finally {
-      setSaving(false);
+      if (isCurrent()) setSaving(false);
     }
   };
 
   const handleSubmit = async () => {
-    const isSubmittedMode = mode === "submitted" || isAssignedApproval;
-    if (isLotListing) {
-      const validationMessage = getMissingConditionSelectionMessage(previewData?.lots || []);
-      if (validationMessage) {
-        Alert.alert("Required selections", validationMessage);
-        return;
-      }
-    }
-
+    if (previewBusyRef.current) return;
+    const submissionContext = reportContextKey;
+    const confirmationRevision = previewRequestRevisionRef.current;
+    let confirmed = false;
+    const isSubmittedMode = resubmitMode;
     Alert.alert(
-      isLotListing
-        ? (isSubmittedMode ? "Regenerate Approved Files" : "Generate Approved Files")
-        : isAssignedApproval
-          ? "Submit and Approve"
-          : (isSubmittedMode ? "Regenerate Files" : "Submit Report"),
+      isAsset || isLotListing
+        ? generationLabel
+        : isAssignedApproval ? "Submit and Approve" : (isSubmittedMode ? "Regenerate Files" : "Submit Report"),
       isAssignedApproval
-        ? "This will regenerate the report files and approve the report after generation succeeds."
+        ? "This will save your latest edits, regenerate the report files, and approve the report after generation succeeds."
         : isSubmittedMode
         ? isLotListing
-          ? "This will regenerate the approved Excel and image files."
-          : "This will regenerate the report files and continue the approval and release workflow."
+          ? "This will save your latest edits and regenerate all lot listing files. They will be released automatically after generation succeeds."
+          : "This will save your latest edits, regenerate all report files, and continue the approval and release workflow."
         : isLotListing
-          ? "This will generate and automatically release the approved lot listing files."
+          ? "This will save your latest edits, generate all lot listing files, and release them automatically after generation succeeds."
           : "This will save your latest edits, generate files, and continue through any assigned approval and release steps.",
       [
         { text: "Cancel", style: "cancel" },
         {
-          text: isLotListing
-            ? (isSubmittedMode ? "Regenerate" : "Generate")
-            : isAssignedApproval
-              ? "Submit"
-              : (isSubmittedMode ? "Resubmit" : "Submit"),
+          text: isAsset || isLotListing
+            ? generationLabel
+            : isAssignedApproval ? "Submit" : (isSubmittedMode ? "Resubmit" : "Submit"),
           onPress: async () => {
+            if (confirmed || reportContextRef.current !== submissionContext || previewBusyRef.current ||
+                previewRequestRevisionRef.current !== confirmationRevision) return;
+            confirmed = true;
+            previewBusyRef.current = true;
+            const requestRevision = ++previewRequestRevisionRef.current;
+            const isCurrent = () =>
+              reportContextRef.current === submissionContext &&
+              previewRequestRevisionRef.current === requestRevision;
+            resetAssetLotSelection();
             try {
               setSubmitting(true);
-              const previewForRequest = applyDamageAnalysisLotPolicy(previewData);
+              const previewForRequest = applyDamageAnalysisLotPolicy(previewDataRef.current);
               setPreviewData(previewForRequest);
 
               if (isSubmittedMode) {
@@ -1145,9 +1198,11 @@ const PreviewScreen = ({
                   let endpoint: string;
                   if (isAsset) endpoint = `/asset/${reportId}/resubmit`;
                   else if (isLotListing) endpoint = `/lot-listing/${reportId}/resubmit`;
-                  else endpoint = `/real-estate/${reportId}/resubmit`;
+                  else endpoint = realEstateSubmissionPath(reportId, status, mode);
                   await api.post(endpoint, { preview_data: previewForRequest });
                 }
+                if (!isCurrent()) return;
+                if (isAsset || isLotListing) setFilesGenerating(true);
                 setHasChanges(false);
                 Alert.alert(
                   "Success",
@@ -1161,7 +1216,7 @@ const PreviewScreen = ({
                 let endpoint: string;
                 if (isAsset) endpoint = `${API_ENDPOINTS.SUBMIT_PREVIEW}/${reportId}/submit-approval`;
                 else if (isLotListing) endpoint = `/lot-listing/${reportId}/submit-approval`;
-                else endpoint = `${API_ENDPOINTS.SUBMIT_REAL_ESTATE_PREVIEW}/${reportId}/submit`;
+                else endpoint = realEstateSubmissionPath(reportId, status, mode);
 
                 // Lot Listing submit accepts the complete edited preview. A
                 // separate save request raced this request with stale state.
@@ -1171,6 +1226,8 @@ const PreviewScreen = ({
                     ? { preview_data: previewForRequest }
                     : undefined
                 );
+                if (!isCurrent()) return;
+                if (isAsset || isLotListing) setFilesGenerating(true);
                 setHasChanges(false);
                 Alert.alert(
                   "Success",
@@ -1182,10 +1239,14 @@ const PreviewScreen = ({
               if (onSuccess) onSuccess();
               onBack();
             } catch (error: any) {
+              if (!isCurrent()) return;
               console.error("Error submitting:", error);
               Alert.alert("Error", error.response?.data?.message || "Failed to submit report");
             } finally {
-              setSubmitting(false);
+              if (isCurrent()) {
+                previewBusyRef.current = false;
+                setSubmitting(false);
+              }
             }
           },
         },
@@ -1227,8 +1288,9 @@ const PreviewScreen = ({
     <View style={styles.fieldContainer}>
       <Text style={styles.fieldLabel}>{label}</Text>
       <TextInput
+        accessibilityLabel={label}
         style={[styles.input, multiline && styles.textArea]}
-        value={String(getValue(field) || "")}
+        value={String(getValue(field) ?? "")}
         onChangeText={(text) => updateNestedField(field, text)}
         placeholder={placeholder}
         placeholderTextColor="#9CA3AF"
@@ -1242,6 +1304,8 @@ const PreviewScreen = ({
     <View style={styles.fieldContainer}>
       <Text style={styles.fieldLabel}>{label}</Text>
       <TextInput
+        accessibilityLabel={label}
+        accessibilityHint="Enter the date as year, month, day"
         style={styles.input}
         value={formatDate(getValue(field))}
         onChangeText={(text) => updateNestedField(field, text)}
@@ -1250,117 +1314,6 @@ const PreviewScreen = ({
       />
     </View>
   );
-
-  const renderConditionSelections = (lot: AssetLot | LotListingLot, index: number) => {
-    const selections = lot.condition_report_selections || {};
-
-    return (
-      <View style={styles.selectionCard}>
-        <View style={styles.selectionHeader}>
-          <View style={styles.selectionHeaderText}>
-            <Text style={styles.selectionTitle}>Required selections</Text>
-            <Text style={styles.selectionSubtitle}>N/A is allowed when a group does not apply.</Text>
-          </View>
-          <View style={[styles.selectionBadge, { borderColor: themeColor }]}>
-            <Text style={[styles.selectionBadgeText, { color: themeColor }]}>N/A allowed</Text>
-          </View>
-        </View>
-
-        {CONDITION_SELECTION_GROUPS.map((group) => (
-          <View key={group.key} style={styles.selectionGroup}>
-            <Text style={styles.selectionGroupLabel}>{group.label}</Text>
-            <View style={styles.selectionOptions}>
-              {group.options.map((option) => {
-                const selected =
-                  normalizeConditionSelection(selections[group.key]) ===
-                  normalizeConditionSelection(option);
-                return (
-                  <TouchableOpacity
-                    key={option}
-                    activeOpacity={0.85}
-                    onPress={() => updateLotConditionSelection(index, group.key, option)}
-                    style={[
-                      styles.selectionChip,
-                      selected && {
-                        borderColor: themeColor,
-                        backgroundColor: `${themeColor}12`,
-                      },
-                    ]}
-                  >
-                    <Feather
-                      name={selected ? "check-circle" : "circle"}
-                      size={16}
-                      color={selected ? themeColor : "#94A3B8"}
-                    />
-                    <Text style={[styles.selectionChipText, selected && { color: themeColor }]}>
-                      {option}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </View>
-          </View>
-        ))}
-      </View>
-    );
-  };
-
-  const renderBulkRunningConditionControl = (lots: Array<AssetLot | LotListingLot>) => {
-    if (!Array.isArray(lots) || lots.length < 2) return null;
-    const sharedSelection = getSharedRunningConditionSelection(lots);
-
-    return (
-      <View style={styles.bulkConditionCard}>
-        <View style={styles.bulkConditionHeader}>
-          <View style={styles.bulkConditionHeaderText}>
-            <Text style={styles.bulkConditionTitle}>Set Running Condition for all lots</Text>
-            <Text style={styles.bulkConditionSubtitle}>
-              Optional shortcut for large reports. You can still change individual lots after this.
-            </Text>
-          </View>
-          <View style={[styles.bulkConditionCountBadge, { borderColor: themeColor }]}>
-            <Text style={[styles.bulkConditionCountText, { color: themeColor }]}>
-              {lots.length} lots
-            </Text>
-          </View>
-        </View>
-        <View style={styles.bulkConditionOptions}>
-          {RUNNING_CONDITION_GROUP.options.map((option) => {
-            const selected =
-              sharedSelection === normalizeConditionSelection(option);
-            return (
-              <TouchableOpacity
-                key={option}
-                activeOpacity={0.85}
-                onPress={() => applyRunningConditionToAllLots(option)}
-                style={[
-                  styles.bulkConditionChip,
-                  selected && {
-                    borderColor: themeColor,
-                    backgroundColor: `${themeColor}12`,
-                  },
-                ]}
-              >
-                <Feather
-                  name={selected ? "check-circle" : "circle"}
-                  size={15}
-                  color={selected ? themeColor : "#B45309"}
-                />
-                <Text
-                  style={[
-                    styles.bulkConditionChipText,
-                    selected && { color: themeColor },
-                  ]}
-                >
-                  {option}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
-      </View>
-    );
-  };
 
   const getSpecRecord = (value: unknown): Record<string, string> => {
     const isUsefulSpecValue = (raw: unknown) => {
@@ -1676,6 +1629,8 @@ const PreviewScreen = ({
         ) : (
           <View>
             <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel={`Add condition report field to lot ${index + 1}`}
               style={styles.addSpecFieldBtn}
               onPress={() => openAddSpecFieldEditor(lot, index)}
               activeOpacity={0.85}
@@ -1732,6 +1687,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={styles.input}
                       value={getSpecValue(specRecord, fieldName)}
+                      accessibilityLabel={`Lot ${index + 1}, ${fieldName}`}
                       onPressIn={() => handleSpecFieldPress(lot, index, fieldName)}
                       onChangeText={(text) => updateLotSpec(index, fieldName, text)}
                       placeholder="Value found in uploaded images"
@@ -1864,6 +1820,15 @@ const PreviewScreen = ({
 
 
         {/* Lots */}
+        <AssetBulkConditionControls
+          lots={lots}
+          indexes={selectionContextRef.current === reportContextKey ? selectedAssetLots : new Set()}
+          accent={themeColor}
+          disabled={previewBusyRef.current}
+          onSelectAll={() => selectAssetLots(new Set(lots.map((_, index) => index)))}
+          onClear={() => selectAssetLots(new Set())}
+          onChange={applyAssetLotCondition}
+        />
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionIcon}>📦</Text>
@@ -1879,10 +1844,34 @@ const PreviewScreen = ({
             return (
               <View key={idx} style={styles.lotCard}>
                 <View style={[styles.lotHeader, { borderTopColor: themeColor }]}>
+                  {lots.length > 1 ? (
+                    <TouchableOpacity
+                      accessibilityRole="checkbox"
+                      accessibilityLabel={`Select lot ${getLotDisplayNumber(lot, idx)} for bulk update`}
+                      accessibilityState={{
+                        checked: selectionContextRef.current === reportContextKey && selectedAssetLots.has(idx),
+                        disabled: previewBusyRef.current,
+                      }}
+                      disabled={previewBusyRef.current}
+                      style={styles.assetLotCheckbox}
+                      onPress={() => selectAssetLots(
+                        toggleAssetLotSelection(selectedAssetLotsRef.current, idx, lots.length)
+                      )}
+                    >
+                      <Feather
+                        name={selectedAssetLots.has(idx) ? "check-square" : "square"}
+                        size={22}
+                        color={themeColor}
+                      />
+                    </TouchableOpacity>
+                  ) : null}
                   <Text style={styles.lotTitle}>Lot {getLotDisplayNumber(lot, idx)}</Text>
                   <TouchableOpacity
                     onPress={() => deleteLot(idx)}
                     style={styles.deleteLotBtn}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Delete lot ${getLotDisplayNumber(lot, idx)}`}
+                    disabled={previewBusyRef.current}
                   >
                     <Feather name="trash-2" size={16} color="#EF4444" />
                   </TouchableOpacity>
@@ -1949,6 +1938,7 @@ const PreviewScreen = ({
                     <Text style={styles.fieldLabel}>Lot #</Text>
                     <TextInput
                       style={[styles.input, isDuplicateLotNumber(lot, idx) && styles.duplicateLotInput]}
+                      accessibilityLabel={`Lot ${idx + 1} number`}
                       value={String(lot.lot_number ?? getLotDisplayNumber(lot, idx))}
                       onChangeText={(text) => updateLot(idx, "lot_number", text)}
                       placeholder={String(idx + 1)}
@@ -1960,6 +1950,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={styles.input}
                       value={lot.title || ""}
+                      accessibilityLabel={`Lot ${idx + 1} title`}
                       onChangeText={(text) => updateLot(idx, "title", text)}
                       placeholder="Title"
                       placeholderTextColor="#9CA3AF"
@@ -1970,6 +1961,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={styles.input}
                       value={lot.categories || ""}
+                      accessibilityLabel={`Lot ${idx + 1} category`}
                       onChangeText={(text) => updateLot(idx, "categories", text)}
                       placeholder="Auctioneer Import category"
                       placeholderTextColor="#9CA3AF"
@@ -1980,6 +1972,8 @@ const PreviewScreen = ({
                     <TextInput
                       style={styles.input}
                       value={lot.serial_number || ""}
+                      accessibilityLabel={`Lot ${idx + 1} serial number or VIN`}
+                      autoCorrect={false}
                       onChangeText={(text) => updateLot(idx, "serial_number", text)}
                       placeholder="Serial number or VIN"
                       placeholderTextColor="#9CA3AF"
@@ -1990,6 +1984,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={[styles.input, styles.textArea]}
                       value={lot.description || ""}
+                      accessibilityLabel={`Lot ${idx + 1} description`}
                       onChangeText={(text) => updateLot(idx, "description", text)}
                       placeholder="Description"
                       placeholderTextColor="#9CA3AF"
@@ -2002,6 +1997,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={[styles.input, styles.textArea]}
                       value={lot.details || ""}
+                      accessibilityLabel={`Lot ${idx + 1} details`}
                       onChangeText={(text) => updateLot(idx, "details", text)}
                       placeholder="Specs / notes"
                       placeholderTextColor="#9CA3AF"
@@ -2010,11 +2006,20 @@ const PreviewScreen = ({
                     />
                   </View>
                   {renderAuctioneerSpecs(lot, idx)}
+                  <AssetLotConditionEditor
+                    key={`${assetSelectionEpoch}:${idx}`}
+                    lotNumber={getLotDisplayNumber(lot, idx)}
+                    selections={lot.condition_report_selections}
+                    accent={themeColor}
+                    disabled={previewBusyRef.current}
+                    onChange={(field, value) => updateLotConditionSelection(idx, field, value)}
+                  />
                   <View style={styles.fieldContainer}>
                     <Text style={styles.fieldLabel}>Estimated Value</Text>
                     <TextInput
                       style={styles.input}
                       value={lot.estimated_value || ""}
+                      accessibilityLabel={`Lot ${idx + 1} estimated value`}
                       onChangeText={(text) => updateLot(idx, "estimated_value", text)}
                       placeholder="$0.00"
                       placeholderTextColor="#9CA3AF"
@@ -2067,6 +2072,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={styles.input}
                       value={String(previewData.valuation_data?.baseFMV || "")}
+                      accessibilityLabel="Base fair market value"
                       onChangeText={(text) => {
                         const numVal = parseFloat(text) || 0;
                         setPreviewData((prev: any) => ({
@@ -2098,6 +2104,7 @@ const PreviewScreen = ({
                             <TextInput
                               style={styles.input}
                               value={String(method.value || "")}
+                              accessibilityLabel={`${method.method || idx + 1} valuation value`}
                               onChangeText={(text) => {
                                 const numVal = parseFloat(text) || 0;
                                 setPreviewData((prev: any) => {
@@ -2118,6 +2125,7 @@ const PreviewScreen = ({
                             <TextInput
                               style={[styles.input, styles.textArea]}
                               value={method.saleConditions || ""}
+                              accessibilityLabel={`${method.method || idx + 1} sale conditions`}
                               onChangeText={(text) => {
                                 setPreviewData((prev: any) => {
                                   const vd = { ...(prev?.valuation_data || {}) };
@@ -2138,6 +2146,7 @@ const PreviewScreen = ({
                             <TextInput
                               style={styles.input}
                               value={method.timeline || ""}
+                              accessibilityLabel={`${method.method || idx + 1} timeline`}
                               onChangeText={(text) => {
                                 setPreviewData((prev: any) => {
                                   const vd = { ...(prev?.valuation_data || {}) };
@@ -2156,6 +2165,7 @@ const PreviewScreen = ({
                             <TextInput
                               style={styles.input}
                               value={method.useCase || ""}
+                              accessibilityLabel={`${method.method || idx + 1} use case`}
                               onChangeText={(text) => {
                                 setPreviewData((prev: any) => {
                                   const vd = { ...(prev?.valuation_data || {}) };
@@ -2276,7 +2286,6 @@ const PreviewScreen = ({
           </View>
         </View>
 
-        {renderBulkRunningConditionControl(lots)}
 
         {/* Lots */}
         <View style={styles.section}>
@@ -2362,6 +2371,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={styles.input}
                       value={String(lot.lot_number ?? getLotDisplayNumber(lot, idx))}
+                      accessibilityLabel={`Lot ${idx + 1} number`}
                       onChangeText={(text) => updateLot(idx, "lot_number", text)}
                       placeholder={String(idx + 1)}
                       placeholderTextColor="#9CA3AF"
@@ -2373,6 +2383,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={styles.input}
                       value={lot.title || ""}
+                      accessibilityLabel={`Lot ${idx + 1} title`}
                       onChangeText={(text) => updateLot(idx, "title", text)}
                       placeholder={`Lot ${getLotDisplayNumber(lot, idx)}`}
                       placeholderTextColor="#9CA3AF"
@@ -2385,6 +2396,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={[styles.input, { minHeight: 60 }]}
                       value={lot.description || ""}
+                      accessibilityLabel={`Lot ${idx + 1} description`}
                       onChangeText={(text) => updateLot(idx, "description", text)}
                       placeholder="Description"
                       placeholderTextColor="#9CA3AF"
@@ -2398,6 +2410,7 @@ const PreviewScreen = ({
                     <TextInput
                       style={[styles.input, { minHeight: 50 }]}
                       value={lot.details || ""}
+                      accessibilityLabel={`Lot ${idx + 1} details`}
                       onChangeText={(text) => updateLot(idx, "details", text)}
                       placeholder="Technical specs, dimensions, hours, mileage..."
                       placeholderTextColor="#9CA3AF"
@@ -2405,15 +2418,15 @@ const PreviewScreen = ({
                     />
                   </View>
 
-                  {renderConditionSelections(lot, idx)}
 
                   {/* FMV & Quantity Row */}
-                  <View style={styles.fieldRow}>
+                  <View style={[styles.fieldRow, compactFields && styles.fieldRowStack]}>
                     <View style={[styles.fieldContainer, styles.fieldRowItem]}>
                       <Text style={styles.fieldLabel}>FMV ($)</Text>
                       <TextInput
                         style={styles.input}
                         value={lot.estimated_value || ""}
+                        accessibilityLabel={`Lot ${idx + 1} fair market value`}
                         onChangeText={(text) => updateLot(idx, "estimated_value", text)}
                         placeholder="0"
                         placeholderTextColor="#9CA3AF"
@@ -2425,6 +2438,7 @@ const PreviewScreen = ({
                       <TextInput
                         style={styles.input}
                         value={lot.quantity?.toString() || "1"}
+                        accessibilityLabel={`Lot ${idx + 1} quantity`}
                         onChangeText={(text) => updateLot(idx, "quantity", parseInt(text) || 1)}
                         placeholder="1"
                         placeholderTextColor="#9CA3AF"
@@ -2434,12 +2448,13 @@ const PreviewScreen = ({
                   </View>
 
                   {/* Categories & Item Condition Row */}
-                  <View style={styles.fieldRow}>
+                  <View style={[styles.fieldRow, compactFields && styles.fieldRowStack]}>
                     <View style={[styles.fieldContainer, styles.fieldRowItem]}>
                       <Text style={styles.fieldLabel}>Categories</Text>
                       <TextInput
                         style={styles.input}
                         value={lot.categories || ""}
+                        accessibilityLabel={`Lot ${idx + 1} category`}
                         onChangeText={(text) => updateLot(idx, "categories", text)}
                         placeholder="Category"
                         placeholderTextColor="#9CA3AF"
@@ -2450,6 +2465,7 @@ const PreviewScreen = ({
                       <TextInput
                         style={styles.input}
                         value={lot.item_condition || ""}
+                        accessibilityLabel={`Lot ${idx + 1} item condition`}
                         onChangeText={(text) => updateLot(idx, "item_condition", text)}
                         placeholder="Unverified Working Condition"
                         placeholderTextColor="#9CA3AF"
@@ -2463,6 +2479,8 @@ const PreviewScreen = ({
                     <TextInput
                       style={styles.input}
                       value={lot.serial_number || ""}
+                      accessibilityLabel={`Lot ${idx + 1} serial number or VIN`}
+                      autoCorrect={false}
                       onChangeText={(text) => updateLot(idx, "serial_number", text)}
                       placeholder="Serial number, VIN, model number"
                       placeholderTextColor="#9CA3AF"
@@ -2472,12 +2490,13 @@ const PreviewScreen = ({
                   {renderAuctioneerSpecs(lot, idx)}
 
                   {/* Opening Bid & Bid Increment Row */}
-                  <View style={styles.fieldRow}>
+                  <View style={[styles.fieldRow, compactFields && styles.fieldRowStack]}>
                     <View style={[styles.fieldContainer, styles.fieldRowItem]}>
                       <Text style={styles.fieldLabel}>Opening Bid ($)</Text>
                       <TextInput
                         style={styles.input}
                         value={lot.opening_bid?.toString() || ""}
+                        accessibilityLabel={`Lot ${idx + 1} opening bid`}
                         onChangeText={(text) => updateLot(idx, "opening_bid", text ? parseInt(text) : null)}
                         placeholder="0"
                         placeholderTextColor="#9CA3AF"
@@ -2489,6 +2508,7 @@ const PreviewScreen = ({
                       <TextInput
                         style={styles.input}
                         value={lot.bid_increment?.toString() || ""}
+                        accessibilityLabel={`Lot ${idx + 1} bid increment`}
                         onChangeText={(text) => updateLot(idx, "bid_increment", text ? parseInt(text) : null)}
                         placeholder="25"
                         placeholderTextColor="#9CA3AF"
@@ -2569,6 +2589,10 @@ const PreviewScreen = ({
           <Text style={styles.sectionTitle}>Valuation</Text>
         </View>
         <View style={styles.sectionContent}>
+          {previewData?.valuation_warning ? (
+            <Text accessibilityRole="alert" style={{ color: '#B45309', marginBottom: 12 }}>{String(previewData.valuation_warning)}</Text>
+          ) : null}
+          {(propertyType === "agricultural" || propertyType === "farmland") ? <FarmlandValuationSummary preview={previewData || {}} /> : null}
           {renderInput("Fair Market Value", "valuation.fair_market_value", "$500,000 CAD")}
           {renderInput("Value Source", "valuation.value_source", "Direct Comparison Approach")}
           {renderInput("Valuation Summary", "valuation.final_estimate_summary", "Summary...", true)}
@@ -2590,7 +2614,7 @@ const PreviewScreen = ({
       </View>
 
       {/* Farmland Details Section (only for farmland property type) */}
-      {propertyType === "farmland" && (
+      {(propertyType === "agricultural" || propertyType === "farmland") && (
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionIcon}>🌾</Text>
@@ -2776,12 +2800,15 @@ const PreviewScreen = ({
   };
 
   return (
-    <SafeAreaView style={styles.container} edges={["top"]}>
+    <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
       >
         <ScrollView
+          pointerEvents={submitting && (isAsset || isLotListing) ? "none" : "auto"}
+          accessibilityElementsHidden={submitting && (isAsset || isLotListing)}
+          importantForAccessibility={submitting && (isAsset || isLotListing) ? "no-hide-descendants" : "auto"}
           style={styles.scrollView}
           contentContainerStyle={[
             styles.scrollContent,
@@ -2789,9 +2816,10 @@ const PreviewScreen = ({
           ]}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
-          automaticallyAdjustKeyboardInsets={Platform.OS === "ios"}
+          keyboardDismissMode="on-drag"
           refreshControl={
             <RefreshControl
+              testID="preview-refresh"
               refreshing={refreshing}
               onRefresh={onRefresh}
               tintColor={themeColor}
@@ -2805,7 +2833,7 @@ const PreviewScreen = ({
             <View style={styles.heroContent}>
               <View style={styles.heroTop}>
                 <View style={styles.heroLeft}>
-                  <TouchableOpacity onPress={onBack} style={styles.backBtn}>
+                  <TouchableOpacity onPress={onBack} style={styles.backBtn} accessibilityRole="button" accessibilityLabel="Back from report preview">
                     <Feather name="arrow-left" size={20} color="#fff" />
                   </TouchableOpacity>
                   <View style={styles.heroTitleSection}>
@@ -2916,11 +2944,13 @@ const PreviewScreen = ({
         {/* Action Buttons */}
         {!keyboardVisible ? (
         <View style={styles.actionBar}>
-          {!isLotListing ? (
+          {!isLotListing && !isAsset ? (
             <TouchableOpacity
               style={[styles.saveBtn, !hasChanges && styles.saveBtnDisabled]}
               onPress={handleSave}
               disabled={saving || !hasChanges}
+              accessibilityRole="button"
+              accessibilityLabel="Save preview changes"
             >
               {saving ? (
                 <ActivityIndicator size="small" color="#374151" />
@@ -2935,26 +2965,25 @@ const PreviewScreen = ({
 
           {(() => {
             const submitDisabled =
-              submitting || (!isAssignedApproval && !isLotListing && mode === "pending" && hasChanges);
-            const submitText = isLotListing
-              ? mode === "submitted"
-                ? "Regenerate Files"
-                : "Generate Files"
-              : isAssignedApproval
-                ? "Submit & Approve"
-                : mode === "submitted"
-                ? "Resubmit"
-                : "Submit Report";
+              previewBusyRef.current || (!isAssignedApproval && !isLotListing && !isAsset &&
+                (reportType === "RealEstate" ? !shouldResubmitRealEstate(status, mode) : mode === "pending") && hasChanges);
+            const submitText = filesGenerating
+              ? "Generating files..."
+              : isAsset || isLotListing
+                ? generationLabel
+                : isAssignedApproval ? "Submit & Approve" : resubmitMode ? "Resubmit" : "Submit Report";
             return (
           <TouchableOpacity
             style={[
               styles.submitBtn,
-              isLotListing && styles.submitBtnFull,
+              (isLotListing || isAsset) && styles.submitBtnFull,
               { backgroundColor: themeColor },
               submitDisabled && styles.submitBtnDisabled,
             ]}
             onPress={handleSubmit}
             disabled={submitDisabled}
+            accessibilityRole="button"
+            accessibilityLabel={submitText}
           >
             {submitting ? (
               <ActivityIndicator size="small" color="#fff" />
@@ -2978,11 +3007,18 @@ const PreviewScreen = ({
         animationType="slide"
         onRequestClose={closeSpecFieldEditor}
       >
-        <KeyboardAvoidingView
+        <KeyboardSafeViewport
+          testID="listing-spec-keyboard-layout"
           style={styles.specModalOverlay}
-          behavior={Platform.OS === "ios" ? "padding" : "height"}
         >
-          <View style={styles.specModalCard}>
+          <SafeAreaView style={styles.specModalSafeArea} edges={["top", "bottom", "left", "right"]}>
+          <View style={styles.specModalCard} accessibilityViewIsModal onAccessibilityEscape={closeSpecFieldEditor}>
+            <ScrollView
+              testID="listing-spec-editor-scroll"
+              style={styles.specModalScroll}
+              contentContainerStyle={styles.specModalScrollContent}
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode="on-drag">
             <View style={styles.specModalHeader}>
               <View style={styles.specModalTitleWrap}>
                 <Text style={styles.specModalTitle} numberOfLines={2}>
@@ -3014,6 +3050,7 @@ const PreviewScreen = ({
               <View style={styles.specModalFieldNameWrap}>
                 <Text style={styles.specModalFieldNameLabel}>Field name</Text>
                 <TextInput
+                  accessibilityLabel="Condition report field name"
                   style={styles.specModalFieldNameInput}
                   value={specFieldEditor?.draftFieldName || ""}
                   onChangeText={(text) =>
@@ -3029,6 +3066,7 @@ const PreviewScreen = ({
             ) : null}
 
             <TextInput
+              accessibilityLabel={specFieldEditor?.isDamage ? "Damage details" : `${specFieldEditor?.fieldName || "Condition report field"} value`}
               style={styles.specModalInput}
               value={specFieldEditor?.value || ""}
               onChangeText={(text) =>
@@ -3041,7 +3079,6 @@ const PreviewScreen = ({
               placeholder="Edit the full field value"
               placeholderTextColor="#94A3B8"
               autoFocus={!specFieldEditor?.isNew}
-              blurOnSubmit={false}
             />
 
             {specFieldEditor?.error ? (
@@ -3052,22 +3089,24 @@ const PreviewScreen = ({
             ) : null}
 
             <View style={styles.specModalActions}>
+              {!specFieldEditor?.isNew ? (
               <TouchableOpacity
+                accessibilityRole="button"
                 style={styles.specModalDeleteBtn}
                 onPress={deleteSpecFieldFromEditor}
                 activeOpacity={0.85}
               >
                 <Feather name="trash-2" size={16} color="#DC2626" />
                 <Text style={styles.specModalDeleteText}>
-                  {specFieldEditor?.isNew
-                    ? "Cancel add"
-                    : specFieldEditor?.isDamage
+                  {specFieldEditor?.isDamage
                       ? "Clear damage"
                       : "Delete field"}
                 </Text>
               </TouchableOpacity>
+              ) : null}
               <View style={styles.specModalSaveActions}>
                 <TouchableOpacity
+                  accessibilityRole="button"
                   style={styles.specModalCancelBtn}
                   onPress={closeSpecFieldEditor}
                   activeOpacity={0.85}
@@ -3075,6 +3114,8 @@ const PreviewScreen = ({
                   <Text style={styles.specModalCancelText}>Cancel</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
+                  accessibilityRole="button"
+                  accessibilityLabel="Save condition report field"
                   style={[styles.specModalSaveBtn, { backgroundColor: themeColor }]}
                   onPress={saveSpecFieldEditor}
                   activeOpacity={0.9}
@@ -3083,8 +3124,10 @@ const PreviewScreen = ({
                 </TouchableOpacity>
               </View>
             </View>
+            </ScrollView>
           </View>
-        </KeyboardAvoidingView>
+          </SafeAreaView>
+        </KeyboardSafeViewport>
       </Modal>
 
       {/* Image Gallery Modal */}
@@ -3772,6 +3815,7 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   addSpecFieldBtn: {
+    minHeight: 44,
     alignSelf: "flex-start",
     flexDirection: "row",
     alignItems: "center",
@@ -3886,8 +3930,8 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   specDeleteBtn: {
-    width: 30,
-    height: 30,
+    width: 44,
+    height: 44,
     borderRadius: 999,
     backgroundColor: "#FEF2F2",
     borderWidth: 1,
@@ -3907,23 +3951,25 @@ const styles = StyleSheet.create({
   },
   specModalOverlay: {
     flex: 1,
-    justifyContent: "flex-end",
     backgroundColor: "rgba(15, 23, 42, 0.48)",
   },
   specModalCard: {
-    maxHeight: "86%",
+    maxHeight: "100%",
+    width: "100%",
+    maxWidth: 920,
+    alignSelf: "center",
     backgroundColor: "#FFFFFF",
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
-    paddingHorizontal: 18,
-    paddingTop: 16,
-    paddingBottom: Platform.OS === "ios" ? 28 : 18,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: -8 },
     shadowOpacity: 0.18,
     shadowRadius: 18,
     elevation: 18,
   },
+  specModalSafeArea: { flex: 1, minHeight: 0, justifyContent: "flex-end" },
+  specModalScroll: { flexShrink: 1 },
+  specModalScrollContent: { paddingHorizontal: 18, paddingTop: 16, paddingBottom: 18 },
   specModalHeader: {
     flexDirection: "row",
     alignItems: "flex-start",
@@ -3947,8 +3993,8 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   specModalCloseBtn: {
-    width: 42,
-    height: 42,
+    width: 44,
+    height: 44,
     borderRadius: 14,
     backgroundColor: "#F8FAFC",
     borderWidth: 1,
@@ -3978,8 +4024,8 @@ const styles = StyleSheet.create({
     backgroundColor: "#FFFFFF",
   },
   specModalInput: {
-    minHeight: 220,
-    maxHeight: 360,
+    minHeight: 88,
+    maxHeight: 240,
     borderWidth: 1,
     borderColor: "#CBD5E1",
     borderRadius: 16,
@@ -4451,6 +4497,12 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: "600",
   },
+  assetLotCheckbox: {
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   bulkConditionCard: {
     marginBottom: 16,
     borderRadius: 18,
@@ -4577,7 +4629,7 @@ const styles = StyleSheet.create({
     gap: 7,
   },
   selectionChip: {
-    minHeight: 36,
+    minHeight: 44,
     maxWidth: "100%",
     borderRadius: 12,
     borderWidth: 1,
@@ -4597,10 +4649,11 @@ const styles = StyleSheet.create({
   },
   // Field row for side-by-side inputs
   fieldRow: {
-    flexDirection: SCREEN_WIDTH < 390 ? "column" : "row",
-    gap: SCREEN_WIDTH < 390 ? 0 : 8,
+    flexDirection: "row",
+    gap: 8,
     marginBottom: 0,
   },
+  fieldRowStack: { flexDirection: "column", gap: 0 },
   fieldRowItem: {
     flex: 1,
   },

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -15,30 +15,32 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
-import * as Localization from 'expo-localization';
 import * as ImagePicker from 'expo-image-picker';
 import { useAuth } from '../../context/AuthContext';
-import salvageService, { SalvageDetails, ProgressData } from '../../services/salvageService';
-
-// Currency codes by region/locale
-const CURRENCY_MAP: Record<string, string> = {
-  'en-US': 'USD',
-  'en-CA': 'CAD',
-  'en-GB': 'GBP',
-  'en-AU': 'AUD',
-  'fr-CA': 'CAD',
-  'fr-FR': 'EUR',
-  'es-ES': 'EUR',
-  'es-MX': 'MXN',
-};
+import salvageService, { SalvageDetails, SalvageAssessmentInputs } from '../../services/salvageService';
+import { SALVAGE_IMAGE_LIMIT, remainingImageSlots } from '../../services/reportUploadPolicy';
+import { pollAcceptedReport } from '../../services/reportProgressPolling';
+import { salvageDisplayText } from '../../utils/salvageDisplayText';
 
 interface SalvageFormSheetProps {
   visible: boolean;
   onClose: () => void;
-  onSuccess?: () => void;
+  onSuccess?: (reportId?: string) => void;
 }
 
 const isoDate = (d: Date) => d.toISOString().slice(0, 10);
+const PROVINCES = ['AB', 'BC', 'MB', 'NB', 'NL', 'NS', 'NT', 'NU', 'ON', 'PE', 'QC', 'SK', 'YT'];
+const ASSESSMENT_CONTEXT_FIELDS = [
+  { key: 'province', label: 'Market province / territory', placeholder: 'Province code, e.g. ON' },
+  { key: 'market', label: 'City / local market', placeholder: 'City / local market' },
+  { key: 'effectiveDate', label: 'Effective valuation date', placeholder: 'Valuation date YYYY-MM-DD' },
+  { key: 'lossType', label: 'Type / cause of loss', placeholder: 'Type / cause of loss (if known)' },
+  { key: 'documentedBrand', label: 'Documented vehicle brand', placeholder: 'Exact brand from documentation' },
+  { key: 'brandProvince', label: 'Brand document province / territory', placeholder: 'Brand province code, e.g. ON' },
+] as const;
+const initialAssessment = (): Partial<SalvageAssessmentInputs> => ({ province: null, market: null,
+  effectiveDate: isoDate(new Date()), lossType: null, documentedBrand: null, brandProvince: null,
+  condition: null, damageDescription: null, currency: 'CAD' });
 
 const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, onSuccess }) => {
   const { user } = useAuth();
@@ -59,8 +61,7 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
   const [appraiserComments, setAppraiserComments] = useState('');
   const [nextReportDue, setNextReportDue] = useState(isoDate(new Date()));
   const [language, setLanguage] = useState<'en' | 'fr' | 'es'>('en');
-  const [currency, setCurrency] = useState('');
-  const [currencyLoading, setCurrencyLoading] = useState(false);
+  const [assessmentInputs, setAssessmentInputs] = useState<Partial<SalvageAssessmentInputs>>(initialAssessment);
 
   // Images state
   const [images, setImages] = useState<Array<{ uri: string; name: string; type: string }>>([]);
@@ -70,15 +71,11 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [uploadProgress, setUploadProgress] = useState(0);
   const [progressPhase, setProgressPhase] = useState<'idle' | 'uploading' | 'processing' | 'done' | 'error'>('idle');
-  const [jobId, setJobId] = useState<string | null>(null);
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
-
-  // Auto-detect currency on mount
-  useEffect(() => {
-    if (!currency && visible) {
-      detectCurrency();
-    }
-  }, [visible]);
+  const submissionRef = useRef(false);
+  const stopPollingRef = useRef<(() => void) | null>(null);
+  const submissionIdRef = useRef<string | null>(null);
+  const acceptedReportIdRef = useRef<string | undefined>(undefined);
+  const uploadAbortRef = useRef<AbortController | null>(null);
 
   // Pre-fill user data
   useEffect(() => {
@@ -91,50 +88,27 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
     }
   }, [user, visible]);
 
-  // Cleanup polling on unmount
+  // Dispose polling when the sheet hides as well as on unmount.
   useEffect(() => {
+    if (!visible) stopPollingRef.current?.();
     return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-      }
+      stopPollingRef.current?.();
+      uploadAbortRef.current?.abort();
     };
-  }, []);
-
-  const detectCurrency = async () => {
-    setCurrencyLoading(true);
-    try {
-      const locales = Localization.getLocales();
-      const locale = locales[0];
-      const localeTag = locale?.languageTag || 'en-US';
-
-      let detectedCurrency = CURRENCY_MAP[localeTag];
-
-      if (!detectedCurrency && locale?.regionCode) {
-        const regionMap: Record<string, string> = {
-          US: 'USD',
-          CA: 'CAD',
-          GB: 'GBP',
-          AU: 'AUD',
-          NZ: 'NZD',
-          IN: 'INR',
-          EU: 'EUR',
-        };
-        detectedCurrency = regionMap[locale.regionCode];
-      }
-
-      setCurrency(detectedCurrency || 'CAD');
-    } catch (error) {
-      setCurrency('CAD');
-    } finally {
-      setCurrencyLoading(false);
-    }
-  };
+  }, [visible]);
 
   const clearError = (field: string) => {
     setErrors((prev) => {
       const { [field]: _, ...rest } = prev;
       return rest;
     });
+  };
+
+  const changeAssessment = (key: keyof SalvageAssessmentInputs, raw: string) => {
+    if (submissionRef.current) return;
+    const value = raw === '' ? null : raw;
+    setAssessmentInputs((previous) => ({ ...previous, [key]: value }));
+    clearError('assessment');
   };
 
   const validateForm = (): boolean => {
@@ -151,7 +125,8 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
     if (!companyName.trim()) newErrors.companyName = 'Required';
     if (!companyAddress.trim()) newErrors.companyAddress = 'Required';
     if (!appraiserComments.trim()) newErrors.appraiserComments = 'Required';
-    if (!currency || !/^[A-Z]{3}$/.test(currency)) newErrors.currency = 'Use 3-letter code';
+    if ([assessmentInputs.province, assessmentInputs.brandProvince].some((province) => province && !PROVINCES.includes(province))) newErrors.assessment = 'Use a valid Canadian province / territory code, or leave it blank.';
+    if (assessmentInputs.effectiveDate && (!/^\d{4}-\d{2}-\d{2}$/.test(assessmentInputs.effectiveDate) || !Number.isFinite(Date.parse(assessmentInputs.effectiveDate)) || isoDate(new Date(assessmentInputs.effectiveDate)) !== assessmentInputs.effectiveDate)) newErrors.assessment = 'Use YYYY-MM-DD for the valuation date, or leave it blank.';
     if (images.length === 0) newErrors.images = 'At least one image required';
 
     setErrors(newErrors);
@@ -159,12 +134,14 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
   };
 
   const pickImages = async () => {
+    const remaining = remainingImageSlots(images.length, SALVAGE_IMAGE_LIMIT);
+    if (!remaining) return;
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         allowsMultipleSelection: true,
         quality: 0.8,
-        selectionLimit: 30 - images.length,
+        selectionLimit: remaining,
       });
 
       if (!result.canceled && result.assets) {
@@ -173,7 +150,7 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
           name: asset.fileName || `image_${Date.now()}_${index}.jpg`,
           type: asset.mimeType || 'image/jpeg',
         }));
-        setImages((prev) => [...prev, ...newImages].slice(0, 30));
+        setImages((prev) => [...prev, ...newImages].slice(0, SALVAGE_IMAGE_LIMIT));
         clearError('images');
       }
     } catch (error) {
@@ -186,36 +163,46 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
   };
 
   const startPolling = (id: string) => {
-    pollIntervalRef.current = setInterval(async () => {
-      try {
+    stopPollingRef.current?.();
+    stopPollingRef.current = pollAcceptedReport({
+      load: async () => {
         const progress = await salvageService.getProgress(id);
-        if (progress.phase === 'done') {
-          clearInterval(pollIntervalRef.current!);
-          setProgressPhase('done');
-          Alert.alert('Success', 'Report created successfully!');
-          resetForm();
-          onSuccess?.();
-          onClose();
-        } else if (progress.phase === 'error') {
-          clearInterval(pollIntervalRef.current!);
-          setProgressPhase('error');
-          Alert.alert('Error', progress.message || 'Failed to create report');
+        if (progress.result?.reportId) acceptedReportIdRef.current = progress.result.reportId;
+        return progress;
+      },
+      onDone: () => {
+        Alert.alert('Preview ready', 'Review and edit your salvage preview before submitting it to generate report files.');
+        finishAcceptedReport();
+      },
+      onError: (message) => {
+        if (acceptedReportIdRef.current) {
+          Alert.alert('Preview needs attention', salvageDisplayText(message));
+          finishAcceptedReport();
+          return;
         }
-      } catch (error) {
-        console.error('Polling error:', error);
-      }
-    }, 3000);
+        submissionRef.current = false;
+        setSubmitting(false);
+        setProgressPhase('error');
+        Alert.alert('Generation failed', salvageDisplayText(message));
+      },
+      onPending: continueInBackground,
+    });
   };
 
   const handleSubmit = async () => {
+    if (submissionRef.current) return;
+    if (acceptedReportIdRef.current) { finishAcceptedReport(); return; }
     if (!validateForm()) {
       Alert.alert('Error', 'Please fill all required fields');
       return;
     }
 
+    submissionRef.current = true;
     setSubmitting(true);
     setProgressPhase('uploading');
     setUploadProgress(0);
+    submissionIdRef.current ||= `salvage-mobile-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    uploadAbortRef.current = new AbortController();
 
     try {
       const details: SalvageDetails = {
@@ -234,30 +221,52 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
         appraiser_comments: appraiserComments,
         next_report_due: nextReportDue,
         language,
-        currency,
+        currency: 'CAD',
+        assessment_inputs: assessmentInputs,
+        client_submission_id: submissionIdRef.current,
       };
 
       const response = await salvageService.create(details, images, (progress) => {
         setUploadProgress(progress);
-      });
+      }, uploadAbortRef.current.signal);
+      uploadAbortRef.current = null;
+      acceptedReportIdRef.current = response.reportId;
 
-      if (response.jobId) {
-        setJobId(response.jobId);
+      if (response.reportId) {
+        finishAcceptedReport();
+      } else if (response.jobId) {
         setProgressPhase('processing');
         startPolling(response.jobId);
       } else {
         setProgressPhase('done');
-        Alert.alert('Success', response.message || 'Report submitted successfully!');
-        resetForm();
-        onSuccess?.();
-        onClose();
+        Alert.alert('Submission accepted', salvageDisplayText(response.message || 'The server accepted your report. Check My Reports for progress.'));
+        finishAcceptedReport();
       }
     } catch (error: any) {
-      setProgressPhase('error');
-      Alert.alert('Error', error?.response?.data?.message || error?.message || 'Failed to submit report');
-    } finally {
+      submissionRef.current = false;
       setSubmitting(false);
+      setProgressPhase('error');
+      uploadAbortRef.current = null;
+      Alert.alert('Upload not confirmed', `${salvageDisplayText(error?.response?.data?.message || error?.message || 'Unable to confirm upload.')} Your inputs are retained. Check Previews before starting another report. Retrying here reuses the same submission identifier.`);
     }
+  };
+
+  const finishAcceptedReport = () => {
+    stopPollingRef.current?.();
+    const reportId = acceptedReportIdRef.current;
+    resetForm();
+    onClose();
+    onSuccess?.(reportId);
+  };
+
+  const continueInBackground = () => {
+    Alert.alert('Upload accepted', 'Your preview is being prepared. Find the same report in Previews or My Reports; do not submit another copy.');
+    finishAcceptedReport();
+  };
+
+  const requestClose = () => {
+    if (submissionRef.current) return;
+    onClose();
   };
 
   const resetForm = () => {
@@ -267,19 +276,23 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
     setAdjusterName('');
     setInsuredName('');
     setAppraiserComments('');
+    setAssessmentInputs(initialAssessment());
     setImages([]);
     setProgressPhase('idle');
     setUploadProgress(0);
-    setJobId(null);
+    submissionRef.current = false;
+    setSubmitting(false);
     setErrors({});
+    submissionIdRef.current = null;
+    acceptedReportIdRef.current = undefined;
   };
 
   return (
-    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} animationType="slide" onRequestClose={requestClose}>
       <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
         {/* Header */}
         <View style={styles.header}>
-          <TouchableOpacity onPress={onClose} style={styles.closeButton}>
+          <TouchableOpacity onPress={requestClose} disabled={submitting} style={styles.closeButton} accessibilityLabel="Close salvage form">
             <Feather name="x" size={24} color="#374151" />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Salvage Appraisal</Text>
@@ -304,10 +317,17 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
                     <View style={[styles.progressBar, { width: `${uploadProgress}%` }]} />
                   </View>
                   <Text style={styles.progressText}>{uploadProgress}%</Text>
+                  <Text style={styles.progressText}>Wait until the upload is accepted. Cancelling stops this device upload, but cannot undo work already accepted by the server.</Text>
+                  <TouchableOpacity onPress={() => uploadAbortRef.current?.abort()} style={styles.submitButton} accessibilityRole="button"><Text style={styles.submitButtonText}>Cancel upload</Text></TouchableOpacity>
                 </>
               )}
               {progressPhase === 'processing' && (
-                <Text style={styles.progressText}>Your report is being generated...</Text>
+                <>
+                  <Text style={styles.progressText}>Upload accepted. Your editable preview is being prepared. Review it before generating report files.</Text>
+                  <TouchableOpacity onPress={continueInBackground} style={styles.submitButton} accessibilityRole="button">
+                    <Text style={styles.submitButtonText}>Continue in background</Text>
+                  </TouchableOpacity>
+                </>
               )}
             </View>
           </View>
@@ -402,6 +422,31 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
                   placeholderTextColor="#9CA3AF"
                 />
               </View>
+            </View>
+
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>Canadian assessment context</Text>
+              <Text style={[styles.fieldLabel, { fontWeight: '400', marginBottom: 12 }]}>Vehicle details are read from your uploaded photos. Include clear VIN / serial, engine-label and odometer photos. Review the results and add anything marked “Cannot find from image” in the preview.</Text>
+              <Text style={[styles.fieldLabel, { fontWeight: '400', marginBottom: 12 }]}>Enter known market and loss details below. A documented brand must match registration or inspection evidence, not a guess from photos.</Text>
+              {ASSESSMENT_CONTEXT_FIELDS.map((field) => (
+                <View key={field.key} style={styles.fieldContainer}>
+                  <Text style={styles.fieldLabel}>{field.label}</Text>
+                  <TextInput style={styles.input} accessibilityLabel={field.label} placeholder={field.placeholder} placeholderTextColor="#9CA3AF"
+                    value={assessmentInputs[field.key] == null ? '' : String(assessmentInputs[field.key])}
+                    autoCapitalize={field.key === 'province' || field.key === 'brandProvince' ? 'characters' : 'sentences'}
+                    maxLength={field.key === 'province' || field.key === 'brandProvince' ? 2 : field.key === 'effectiveDate' ? 10 : 300}
+                    onChangeText={(value) => changeAssessment(field.key, field.key === 'province' || field.key === 'brandProvince' ? value.toUpperCase() : value)} />
+                </View>
+              ))}
+              {([['condition', 'Pre-loss condition (if known)'], ['damageDescription', 'Observed damage']] as const).map(([key, label]) => (
+                <View key={key} style={styles.fieldContainer}>
+                  <Text style={styles.fieldLabel}>{label}</Text>
+                  <TextInput style={[styles.input, styles.textArea]} accessibilityLabel={label} placeholder={label} placeholderTextColor="#9CA3AF"
+                    multiline numberOfLines={2} maxLength={key === 'condition' ? 4000 : 8000}
+                    value={assessmentInputs[key] || ''} onChangeText={(value) => changeAssessment(key, value)} />
+                </View>
+              ))}
+              {errors.assessment ? <Text style={styles.errorText}>{errors.assessment}</Text> : null}
             </View>
 
             {/* Parties Section */}
@@ -524,23 +569,14 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
 
               <View style={styles.row}>
                 <View style={[styles.fieldContainer, { flex: 1, marginRight: 8 }]}>
-                  <Text style={styles.fieldLabel}>Currency *</Text>
+                  <Text style={styles.fieldLabel}>Assessment currency</Text>
                   <View style={styles.currencyContainer}>
                     <TextInput
-                      style={[styles.input, styles.currencyInput, errors.currency && styles.inputError]}
-                      value={currency}
-                      onChangeText={(t) => {
-                        setCurrency(t.toUpperCase());
-                        clearError('currency');
-                      }}
-                      placeholder="CAD"
-                      placeholderTextColor="#9CA3AF"
-                      maxLength={3}
-                      autoCapitalize="characters"
+                      style={[styles.input, styles.currencyInput]}
+                      value="CAD"
+                      accessibilityLabel="Assessment currency"
+                      editable={false}
                     />
-                    {currencyLoading && (
-                      <ActivityIndicator size="small" color="#DC2626" style={styles.currencyLoader} />
-                    )}
                   </View>
                 </View>
                 <View style={[styles.fieldContainer, { flex: 1, marginLeft: 8 }]}>
@@ -588,9 +624,10 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
 
               <TouchableOpacity
                 style={[styles.addImageButton, errors.images && styles.addImageButtonError]}
+                disabled={images.length >= SALVAGE_IMAGE_LIMIT}
                 onPress={pickImages}>
                 <Feather name="image" size={24} color="#DC2626" />
-                <Text style={styles.addImageText}>Add Images ({images.length}/30)</Text>
+                <Text style={styles.addImageText}>Add Images ({images.length}/{SALVAGE_IMAGE_LIMIT})</Text>
               </TouchableOpacity>
               {errors.images && <Text style={styles.errorText}>{errors.images}</Text>}
 
@@ -619,7 +656,7 @@ const SalvageFormSheet: React.FC<SalvageFormSheetProps> = ({ visible, onClose, o
                 <ActivityIndicator size="small" color="#fff" />
               ) : (
                 <>
-                  <Text style={styles.submitButtonText}>Submit Report</Text>
+                  <Text style={styles.submitButtonText}>Upload & prepare preview</Text>
                   <Feather name="send" size={18} color="#fff" />
                 </>
               )}

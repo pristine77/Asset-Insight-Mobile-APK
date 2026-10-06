@@ -32,7 +32,7 @@ const CrmEntryScreen = ({ onSelectListings, onSelectCrm }: CrmEntryScreenProps) 
   );
 
   return (
-    <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+    <SafeAreaView style={styles.container} edges={['top', 'right', 'bottom', 'left']}>
       <ScrollView
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
@@ -42,7 +42,7 @@ const CrmEntryScreen = ({ onSelectListings, onSelectCrm }: CrmEntryScreenProps) 
             <View style={styles.logoPlate}>
               <Image source={BrandIcon} style={styles.logo} resizeMode="contain" />
             </View>
-            <TouchableOpacity onPress={toggleTheme} style={styles.themeButton} activeOpacity={0.75}>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={isDark ? 'Use light theme' : 'Use dark theme'} onPress={toggleTheme} style={styles.themeButton} activeOpacity={0.75}>
               <Feather name={isDark ? 'sun' : 'moon'} size={18} color="#FFFFFF" />
             </TouchableOpacity>
           </View>
@@ -57,7 +57,7 @@ const CrmEntryScreen = ({ onSelectListings, onSelectCrm }: CrmEntryScreenProps) 
           <Text style={styles.sectionSubtitle}>Your selection can be changed later from the side menu.</Text>
 
           <View style={styles.workspaceGrid}>
-            <TouchableOpacity style={styles.workspaceCard} onPress={onSelectListings} activeOpacity={0.76}>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel="Open Listings workspace" style={styles.workspaceCard} onPress={onSelectListings} activeOpacity={0.76}>
               <View style={[styles.workspaceIcon, { backgroundColor: colors.accentSoft }]}>
                 <Feather name="briefcase" size={24} color={colors.accent} />
               </View>
@@ -76,7 +76,7 @@ const CrmEntryScreen = ({ onSelectListings, onSelectCrm }: CrmEntryScreenProps) 
               </View>
             </TouchableOpacity>
 
-            <TouchableOpacity style={styles.workspaceCard} onPress={onSelectCrm} activeOpacity={0.76}>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel="Open CRM workspace" style={styles.workspaceCard} onPress={onSelectCrm} activeOpacity={0.76}>
               <View style={[styles.workspaceIcon, { backgroundColor: colors.infoSoft }]}>
                 <Feather name="headphones" size={24} color={colors.info} />
               </View>
@@ -116,7 +116,7 @@ const createStyles = (colors: AppThemeColors, isTablet: boolean, compactHeight: 
     heroTopRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
     logoPlate: { width: 142, height: 50, borderRadius: 9, paddingHorizontal: 8, backgroundColor: 'rgba(255,255,255,0.92)', alignItems: 'center', justifyContent: 'center' },
     logo: { width: 124, height: 38 },
-    themeButton: { width: 40, height: 40, borderRadius: 9, backgroundColor: 'rgba(9,12,18,0.72)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.22)', alignItems: 'center', justifyContent: 'center' },
+    themeButton: { width: 44, height: 44, borderRadius: 9, backgroundColor: 'rgba(9,12,18,0.72)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.22)', alignItems: 'center', justifyContent: 'center' },
     heroCopy: { maxWidth: 560, backgroundColor: 'rgba(9,12,18,0.82)', borderLeftWidth: 4, borderLeftColor: colors.accent, padding: 14, borderRadius: 8 },
     heroTitle: { color: '#FFFFFF', fontSize: isTablet ? 30 : 25, fontWeight: '900' },
     heroSubtitle: { color: '#D5DAE3', fontSize: 12.5, lineHeight: 18, marginTop: 5 },
@@ -130,7 +130,7 @@ const createStyles = (colors: AppThemeColors, isTablet: boolean, compactHeight: 
     workspaceTitle: { color: colors.text, fontSize: 17, fontWeight: '900' },
     workspaceDescription: { color: colors.textSecondary, fontSize: 11.5, lineHeight: 16, marginTop: 4 },
     featureRow: { flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 9 },
-    featureText: { color: colors.textMuted, fontSize: 10.5, fontWeight: '700' },
+    featureText: { color: colors.textMuted, fontSize: 10.5, fontWeight: '700', flexShrink: 1 },
     workspaceArrow: { width: 32, height: 32, borderRadius: 8, alignItems: 'center', justifyContent: 'center', marginLeft: 8 },
   });
 

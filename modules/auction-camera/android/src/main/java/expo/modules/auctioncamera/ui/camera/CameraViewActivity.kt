@@ -32,6 +32,7 @@ import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.viewModels
+import androidx.activity.OnBackPressedCallback
 import androidx.annotation.OptIn
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -44,6 +45,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import expo.modules.auctioncamera.CameraMode
 import expo.modules.auctioncamera.CaptureMode
@@ -59,6 +61,7 @@ import expo.modules.auctioncamera.viewextensions.AEAFRegionOverlay
 import expo.modules.auctioncamera.viewextensions.CameraViewEngine
 import expo.modules.auctioncamera.viewextensions.CameraViewExtensionMode
 import expo.modules.auctioncamera.viewextensions.CameraViewModel
+import expo.modules.auctioncamera.viewextensions.CaptureTicket
 import expo.modules.auctioncamera.viewextensions.ExtensionViewConflictResolver
 import expo.modules.auctioncamera.viewextensions.HapticCaptureHelper
 import expo.modules.auctioncamera.viewextensions.ImageFormatStore
@@ -151,7 +154,27 @@ class CameraViewActivity : BaseActivity() {
     private var hasProcessedLotRestore = false
     private var isDualRecording = false
     private var flashPopup: PopupWindow? = null
+    /*
+     * One shot in flight at a time, from the tap until the frame is on disk —
+     * no longer until the photo is fully processed (2026-10-03: "the shutter
+     * locks after each shot"). captureWatchdog is the last resort: a tap that
+     * nothing answers within captureWatchdogMs (no saved frame, no error) frees
+     * the shutter and says so, rather than leaving it locked for good.
+     */
     private val captureInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val captureWatchdogMs = 12_000L
+    private val captureWatchdog = Runnable {
+        if (captureInFlight.compareAndSet(true, false)) {
+            clearPreviewFreeze()
+            toast("The camera did not return a photo. Try again.")
+        }
+    }
+
+    /** The shot has been answered: free the shutter and stand the watchdog down. */
+    private fun releaseCapture() {
+        captureInFlight.set(false)
+        if (::binding.isInitialized) binding.previewView.removeCallbacks(captureWatchdog)
+    }
     private var isBoxModeActive = false
     private var selectedWbIndex = 0
     private var previousLotNumber = 1
@@ -198,13 +221,21 @@ class CameraViewActivity : BaseActivity() {
         "1/6", "1/4", "1/2", "1s", "2s", "4s"
     )
 
-    private val requiredPerms
+    private val requestedPerms
         get() = mutableListOf(
             Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO
         ).apply {
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P)
                 add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         }.toTypedArray()
+
+    // Microphone access adds sound to video; it must never block taking photos.
+    private val captureRequiredPerms
+        get() = requestedPerms.filterNot { it == Manifest.permission.RECORD_AUDIO }
+
+    private fun hasCapturePermissions(): Boolean = captureRequiredPerms.all {
+        checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+    }
 
     private fun getCurrentDisplayRotationSafe(): Int {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -249,9 +280,34 @@ class CameraViewActivity : BaseActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val initialPayload = try {
+            expo.modules.auctioncamera.CameraPayloadStore.input(this, intent).also {
+                viewModel.repository.configureCapture(it)
+            }
+        } catch (error: Exception) {
+            Log.e("AuctionCameraTiming", "Camera draft handoff could not be restored", error)
+            setResult(RESULT_CANCELED, Intent().putExtra(expo.modules.auctioncamera.CameraPayloadStore.EXTRA_ERROR_CODE, "E_CAMERA_INPUT"))
+            finish()
+            return
+        }
+        // Restore before observers can initialize an empty builder and checkpoint it.
+        val restoredLifecycleSession = (savedInstanceState != null || viewModel.repository.hasPendingJournal()) && viewModel.restoreSessionIfAvailable()
+        if (!restoredLifecycleSession && initialPayload != null && initialPayload.isNotEmpty() && initialPayload != "[]") {
+            viewModel.loadFromPayload(initialPayload)
+        } else if (!restoredLifecycleSession) {
+            if (viewModel.captureMode.value == null) viewModel.setCaptureMode(CaptureMode.BUNDLE)
+            viewModel.setInitialLotNumber(viewModel.currentLotNumber.value ?: 1)
+        }
         binding = ActivityCameraViewBinding.inflate(layoutInflater)
         setContentView(binding.root)
         setupEdgeToEdge()
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (waitForCapture()) return
+                isEnabled = false
+                onBackPressedDispatcher.onBackPressed()
+            }
+        })
 
         lastDisplayRotation = getCurrentDisplayRotationSafe()
         isBoxModeActive = savedInstanceState?.getBoolean(KEY_BOX_MODE_ACTIVE, false) ?: false
@@ -267,31 +323,22 @@ class CameraViewActivity : BaseActivity() {
         applyBoxFocusUi()
         setupEffectSliders()
         setupImageFormatPicker()
-        if (requiredPerms.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED })
-            startCamera()
-        else
-            requestPermissions(requiredPerms, 1001)
+        if (hasCapturePermissions()) startCamera()
+        if (requestedPerms.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED })
+            requestPermissions(requestedPerms, 1001)
 
-        val initialPayload = intent.getStringExtra(expo.modules.auctioncamera.AuctionCameraModule.EXTRA_LOT_PAYLOAD_JSON)
-        val restoredLifecycleSession = savedInstanceState != null && viewModel.restoreSessionIfAvailable()
         if (restoredLifecycleSession) {
             Log.d("AuctionCameraTiming", "restored lifecycle camera session")
-        } else if (initialPayload != null && initialPayload.isNotEmpty() && initialPayload != "[]") {
-            viewModel.loadFromPayload(initialPayload)
-        } else {
-            if (viewModel.captureMode.value == null) {
-                viewModel.setCaptureMode(CaptureMode.BUNDLE)
-            }
-            viewModel.setInitialLotNumber(viewModel.currentLotNumber.value ?: 1)
         }
     }
 
     private fun setupEdgeToEdge() {
         val isPortrait = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode =
+                android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
         if (isPortrait) {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-                window.attributes.layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-            }
             WindowCompat.setDecorFitsSystemWindows(window, false)
             window.statusBarColor = android.graphics.Color.TRANSPARENT
             window.navigationBarColor = android.graphics.Color.TRANSPARENT
@@ -313,17 +360,71 @@ class CameraViewActivity : BaseActivity() {
             }
             window.decorView.requestApplyInsets()
         } else {
-            WindowCompat.setDecorFitsSystemWindows(window, true)
+            // Keep the preview edge-to-edge, but never place camera actions beneath a
+            // landscape navigation/gesture bar. Hidden transient bars report a zero
+            // visible inset on some Samsung devices, so we also use the stable inset
+            // and a conservative fallback sized for a standard navigation rail.
+            WindowCompat.setDecorFitsSystemWindows(window, false)
             window.statusBarColor = android.graphics.Color.TRANSPARENT
-            window.navigationBarColor = android.graphics.Color.TRANSPARENT
-            ViewCompat.setOnApplyWindowInsetsListener(binding.main, null)
+            window.navigationBarColor = android.graphics.Color.BLACK
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+            }
+            hideLandscapeNavigationBar()
+
+            val minimumEndSafeArea = (48 * resources.displayMetrics.density).toInt()
+            ViewCompat.setOnApplyWindowInsetsListener(binding.main) { view, insets ->
+                val visibleBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+                val stableNavigation = insets.getInsetsIgnoringVisibility(
+                    WindowInsetsCompat.Type.navigationBars()
+                )
+                val cutout = insets.getInsets(WindowInsetsCompat.Type.displayCutout())
+                val gestures = insets.getInsets(WindowInsetsCompat.Type.systemGestures())
+                val mandatoryGestures = insets.getInsets(
+                    WindowInsetsCompat.Type.mandatorySystemGestures()
+                )
+                val tappableElements = insets.getInsets(WindowInsetsCompat.Type.tappableElement())
+                val safeEnd = maxOf(
+                    visibleBars.right,
+                    stableNavigation.right,
+                    cutout.right,
+                    gestures.right,
+                    mandatoryGestures.right,
+                    tappableElements.right,
+                    minimumEndSafeArea
+                )
+
+                view.setPadding(
+                    maxOf(visibleBars.left, cutout.left),
+                    maxOf(visibleBars.top, cutout.top),
+                    0,
+                    maxOf(visibleBars.bottom, cutout.bottom)
+                )
+                binding.safeRight?.setGuidelineEnd(safeEnd)
+                insets
+            }
+            window.decorView.requestApplyInsets()
         }
+    }
+
+    private fun hideLandscapeNavigationBar() {
+        if (resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) return
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.navigationBars())
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideLandscapeNavigationBar()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(KEY_BOX_MODE_ACTIVE, isBoxModeActive)
-        viewModel.persistSessionForBackground()
+        if (::binding.isInitialized) viewModel.persistSessionForBackground()
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -343,6 +444,7 @@ class CameraViewActivity : BaseActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (!::binding.isInitialized) return
         viewModel.refresh()
         if (!::engine.isInitialized) return
 
@@ -365,7 +467,7 @@ class CameraViewActivity : BaseActivity() {
 
     override fun onPause() {
         super.onPause()
-        viewModel.persistSessionForBackground()
+        if (::binding.isInitialized) viewModel.persistSessionForBackground()
         clearPreviewFreeze()
         if (!::engine.isInitialized) return
         cameraBound = false
@@ -382,14 +484,27 @@ class CameraViewActivity : BaseActivity() {
 
     override fun onDestroy() {
         clearPreviewFreeze()
+        if (::binding.isInitialized) binding.previewView.removeCallbacks(captureWatchdog)
         super.onDestroy()
         if (::engine.isInitialized) engine.shutdown()
     }
 
     override fun onRequestPermissionsResult(rc: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(rc, perms, results)
-        if (rc == 1001 && results.all { it == PackageManager.PERMISSION_GRANTED }) startCamera()
-        else toast("Camera permission required")
+        if (rc != 1001) return
+        if (results.isEmpty()) {
+            if (!::engine.isInitialized || !hasCapturePermissions()) {
+                toast("Camera permission request was cancelled")
+                finish()
+            }
+            return
+        }
+        if (hasCapturePermissions()) {
+            startCamera()
+        } else {
+            toast("Camera access and permission to save photos are required")
+            finish()
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -669,6 +784,7 @@ class CameraViewActivity : BaseActivity() {
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun startCamera() {
+        if (::engine.isInitialized || !hasCapturePermissions() || isFinishing || isDestroyed) return
         engine = CameraViewEngine(this, this)
         binding.previewView.scaleType = androidx.camera.view.PreviewView.ScaleType.FILL_CENTER
         binding.previewView.implementationMode =
@@ -771,31 +887,46 @@ class CameraViewActivity : BaseActivity() {
 //            }
 //        }
 
-        // 1. THIS FIRES INSTANTLY
-        engine.onPhotoCaptured = { tempUri ->
-            lastPhotoUri = tempUri
-            lastVideoUri = null
+        // 1. THE FRAME IS ON DISK — the shutter is free again, the shot is being processed.
+        // The lock used to be held until the photo was decoded, cropped, resized and
+        // compressed, so every shot locked the shutter for a second or more (2026-10-03).
+        engine.onCaptureSaved = { _ ->
+            runOnUiThread {
+                releaseCapture()
+                schedulePreviewFreezeClear()
+                // ── START PROCESSING ANIMATION ──
+                processingCount++
+                startThumbnailPulse()
+            }
+        }
 
-            // Release the lock instantly so the user can tap the button again!
-            captureInFlight.set(false)
+        // 2. THE PHOTO IS READY — filed under the mode its own tap asked for (CaptureTicket).
+        engine.onPhotoCaptured = { uri, ticket ->
+            lastPhotoUri = uri
+            lastVideoUri = null
 
             runOnUiThread {
                 val uiStartMs = SystemClock.elapsedRealtime()
-                schedulePreviewFreezeClear()
-
-                // Show the raw thumbnail instantly
-                viewModel.onPhotoCaptured(tempUri)
+                viewModel.onPhotoCaptured(uri, ticketMode = ticket?.mode, ticketExtra = ticket?.isExtra)
                 binding.galleryCount.visibility = View.VISIBLE
-                val tapDeltaMs =
-                    if (lastShutterTapAtMs > 0L) SystemClock.elapsedRealtime() - lastShutterTapAtMs else -1L
+                val tapDeltaMs = ticket?.let { SystemClock.elapsedRealtime() - it.tapAtMs } ?: -1L
                 Log.d(
                     "AuctionCameraTiming",
                     "thumbnail_update deltaFromTapMs=$tapDeltaMs uiMs=${SystemClock.elapsedRealtime() - uiStartMs}"
                 )
+            }
+        }
 
-                // ── START PROCESSING ANIMATION ──
-                processingCount++
-                startThumbnailPulse()
+        // A saved shot that could not be processed: nothing was filed, so say so.
+        engine.onPhotoProcessingFailed = { message, _ ->
+            runOnUiThread {
+                processingCount--
+                if (processingCount <= 0) {
+                    processingCount = 0
+                    stopThumbnailPulse()
+                }
+                clearPreviewFreeze()
+                toast(message)
             }
         }
 
@@ -837,20 +968,12 @@ class CameraViewActivity : BaseActivity() {
                 }
             }
         }
-        engine.onVideoRecorded = { uri -> runOnUiThread { onRecordingSaved(uri) } }
-        engine.onRecordingError = { err ->
-            runOnUiThread {
-                clearPreviewFreeze()
-                stopRecordingUI()
-                // Safety catch to stop pulsing if capture fails
-                processingCount--
-                if (processingCount <= 0) {
-                    processingCount = 0
-                    stopThumbnailPulse()
-                }
-                toast(err)
-            }
-        }
+        engine.onVideoFinalizing = { uri -> viewModel.onVideoRecorded(uri) }
+        engine.onVideoRecorded = { uri -> onRecordingSaved(uri) }
+        // onRecordingError is set once, below, with the camera setup. It used to be
+        // set here as well and overwritten there, and the surviving copy treated
+        // every "Capture failed" as transient — so a failed shot vanished with no
+        // message (2026-10-03).
 
 //        engine.onEVChanged = { ev ->
 //            runOnUiThread { viewModel.setCurrentEV(ev); updateEVLabel(ev); syncEVSeekBar(ev) }
@@ -937,11 +1060,10 @@ class CameraViewActivity : BaseActivity() {
             }
         }
 
-        engine.onNightModeUriReady = { uri ->
-            captureInFlight.set(false)
+        engine.onNightModeUriReady = { uri, ticket ->
+            // The shutter was freed when the frame was saved (onCaptureSaved).
             runOnUiThread {
-                schedulePreviewFreezeClear()
-                viewModel.onPhotoCaptured(uri)
+                viewModel.onPhotoCaptured(uri, ticketMode = ticket?.mode, ticketExtra = ticket?.isExtra)
             }
         }
 
@@ -991,17 +1113,22 @@ class CameraViewActivity : BaseActivity() {
         }
         engine.onRecordingError = { err ->
             runOnUiThread {
-                captureInFlight.set(false)
+                releaseCapture()
+                clearPreviewFreeze()
                 stopRecordingUI()
-                val isTransient = err.lowercase().let {
-                    it.contains("camera is closed") || it.contains("camera closed") ||
-                            it.contains("camera disconnected") || it.contains("capture failed")
+                // Only a shot cut off by the camera closing — a lens or mode switch
+                // mid-capture — is expected and stays silent. Everything else is
+                // shown: "Capture failed" used to count as transient too, so a
+                // failed shot vanished with no message (2026-10-03).
+                val expected = err.lowercase().let {
+                    it.contains("camera is closed") || it.contains("camera closed") || it.contains("camera disconnected")
                 }
-                if (!isTransient) toast(err)
+                if (!expected) toast(err)
             }
         }
         engine.onNightModeError = { err ->
             runOnUiThread {
+                releaseCapture()
                 clearPreviewFreeze()
                 toast("Night failed: $err")
             }
@@ -1183,7 +1310,7 @@ class CameraViewActivity : BaseActivity() {
         if (::engine.isInitialized) showEV(engine.isEVSupported())
 
         // Restore Pro Mode UI
-        val proAllowed = !engine.isFrontCamera() &&
+        val proAllowed = ::engine.isInitialized && !engine.isFrontCamera() &&
                 deviceLimits?.supportsManualSensor == true &&
                 currentCameraMode != CameraMode.VIDEO
         binding.btnProMode.visibility = if (proAllowed) View.VISIBLE else View.GONE
@@ -1365,6 +1492,7 @@ class CameraViewActivity : BaseActivity() {
     }
 
     private fun clearPreviewFreeze() {
+        if (!::binding.isInitialized) return
         binding.previewView.removeCallbacks(clearPreviewFreezeRunnable)
         binding.previewView.removeCallbacks(delayedClearPreviewFreezeRunnable)
         val drawable = previewFreezeDrawable ?: return
@@ -1506,26 +1634,50 @@ class CameraViewActivity : BaseActivity() {
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun setupLotNavigation() {
-        binding.imageLeftArrow.setOnClickListener { viewModel.goToPrevLot() }
-        binding.imageRightArrow.setOnClickListener { viewModel.goToNextLot() }
+        binding.imageLeftArrow.setOnClickListener {
+            if (!waitForCapture()) viewModel.goToPrevLot()
+        }
+        binding.imageRightArrow.setOnClickListener {
+            if (!waitForCapture()) viewModel.goToNextLot()
+        }
 
         binding.textViewDone.setOnClickListener {
+            if (waitForCapture()) return@setOnClickListener
             val returnStartMs = SystemClock.elapsedRealtime()
             viewModel.repository.finaliseCurrentLot(viewModel.currentLotNumber.value ?: 1)
             viewModel.finalisePendingExtraPhotos()
             val allLots = viewModel.repository.getAllLots()
 
-            val json = LotJsonSerializer.serialize(allLots)
+            val json = try { viewModel.repository.exportCapture() } catch (_: Exception) {
+                toast("Draft could not be saved. Free device storage and tap Done again. Your photos are still in the camera.")
+                return@setOnClickListener
+            }
             Log.d(
                 "AuctionCameraTiming",
                 "return_payload lots=${allLots.size} bytes=${json.length} buildMs=${SystemClock.elapsedRealtime() - returnStartMs}"
             )
 
-            val resultIntent = Intent().apply { putExtra(expo.modules.auctioncamera.AuctionCameraModule.EXTRA_LOT_PAYLOAD_JSON, json) }
+            val resultIntent = try {
+                expo.modules.auctioncamera.CameraPayloadStore.resultIntent(this, intent, json)
+            } catch (error: Exception) {
+                Log.e("AuctionCameraTiming", "Camera result handoff could not be saved", error)
+                toast("Draft could not be handed back. Free device storage and tap Done again. Your photos are still saved.")
+                return@setOnClickListener
+            }
             setResult(RESULT_OK, resultIntent)
             viewModel.clearSession()
             finish()
         }
+    }
+
+    private fun waitForCapture(): Boolean {
+        if (pendingStartRecording || isRecordButtonLocked || (::engine.isInitialized && engine.isRecording())) {
+            toast(if (::engine.isInitialized && engine.isStopping()) "Please wait for the video to finish saving." else "Stop recording before leaving this lot.")
+            return true
+        }
+        if (!captureInFlight.get() && processingCount == 0) return false
+        toast("Please wait for the photo to finish saving.")
+        return true
     }
 
     private fun setupCaptureModeButtons() {
@@ -1603,7 +1755,7 @@ class CameraViewActivity : BaseActivity() {
 
         val allowed = viewModel.requestCapture(mode, isExtra)
         if (!allowed) {
-            captureInFlight.set(false)
+            releaseCapture()
             return
         }
         lastShutterTapAtMs = SystemClock.elapsedRealtime()
@@ -1616,7 +1768,11 @@ class CameraViewActivity : BaseActivity() {
 
         engine.previewViewWidth = binding.previewView.width
         engine.previewViewHeight = binding.previewView.height
-        engine.capturePhoto()
+        // The tap's request rides with the shot, so the photo is filed under this
+        // mode even if the next tap lands before it is processed (CaptureTicket).
+        engine.capturePhoto(CaptureTicket(mode, isExtra, lastShutterTapAtMs))
+        binding.previewView.removeCallbacks(captureWatchdog)
+        binding.previewView.postDelayed(captureWatchdog, captureWatchdogMs)
         binding.previewView.post { freezePreviewFrame() }
     }
 
@@ -1653,6 +1809,10 @@ class CameraViewActivity : BaseActivity() {
 
         binding.imageViewRecordVideo.setOnClickListener {
             if (!::engine.isInitialized) return@setOnClickListener
+            if (captureInFlight.get() || processingCount > 0) {
+                toast("Please wait for the photo to finish saving.")
+                return@setOnClickListener
+            }
             if (isRecordButtonLocked) return@setOnClickListener
             if (engine.isStopping()) return@setOnClickListener
 
@@ -1772,7 +1932,7 @@ class CameraViewActivity : BaseActivity() {
         if (currentCameraMode == CameraMode.VIDEO) {
             toast("Switch off video mode first"); return
         }
-        captureInFlight.set(false)
+        releaseCapture()
         val currentKey = currentActiveChipKey()
         // Keep current mode on repeated taps; avoid accidental fallback to Normal.
         if (currentKey == key) return
@@ -1925,6 +2085,7 @@ class CameraViewActivity : BaseActivity() {
 
     private fun setupGalleryClick() {
         val openGallery: () -> Unit = open@{
+            if (waitForCapture()) return@open
             val uris = viewModel.getDisplayedLotUris()
             if (uris.isEmpty()) return@open
 
@@ -2264,7 +2425,7 @@ class CameraViewActivity : BaseActivity() {
     }
 
     private fun syncEVSeekBar(ev: Float) {
-        if (isUserDraggingEV) return
+        if (!::engine.isInitialized || isUserDraggingEV) return
         val (lo, hi) = engine.getExposureRange() ?: return
         if (hi - lo > 0f)
             binding.evSeekBar.progress = ((ev - lo) / (hi - lo) * 40).toInt().coerceIn(0, 40)
@@ -3112,17 +3273,21 @@ class CameraViewActivity : BaseActivity() {
         binding.previewView.postDelayed(recordingTimer!!, 1000)
     }
 
-    private fun onRecordingSaved(uri: Uri) {
+    private fun onRecordingSaved(uri: Uri): Boolean {
         lastVideoUri = uri
-        stopRecordingUI()
         viewModel.onVideoRecorded(uri)
-        toast("Video saved!")
+        val journalSaved = viewModel.repository.isCapturePersisted()
+        stopRecordingUI()
+        if (journalSaved) toast("720p video saved")
+        else toast("Video retained. Tap Done to save its lot details.")
+        return journalSaved
     }
 
     private fun stopRecordingUI() {
         // Unlock screen orientation
         requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
         isRecording = false; pendingStartRecording = false
+        isRecordButtonLocked = false
         binding.recordingTimer.visibility = View.GONE
         binding.recordingDot.visibility = View.GONE
         recordingTimer?.let { binding.previewView.removeCallbacks(it) }

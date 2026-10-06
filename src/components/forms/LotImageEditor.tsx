@@ -284,7 +284,7 @@ const LotImageEditor: React.FC<LotImageEditorProps> = ({
       }
 
       const base64 = rendered.encodeToBase64(ImageFormat.JPEG, 100);
-      const editedUri = await ImageEditService.saveEditedImageBase64(base64, lotId, photo.name);
+      const editedUri = await ImageEditService.saveEditedImageBase64(base64, lotId, photo.name, getPhotoOriginalUri(photo));
 
       await onSave({
         adjustments: draftAdjustments,

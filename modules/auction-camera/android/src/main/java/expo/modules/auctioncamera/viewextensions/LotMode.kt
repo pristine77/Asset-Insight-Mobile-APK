@@ -41,7 +41,9 @@ data class CapturedFile(
     @SerializedName("sourceUri")  val sourceUri: String?   = null,
     @SerializedName("cacheUri")   val cacheUri:  String?   = null,
     @SerializedName("originalUri") val originalUri: String? = null,
-    @SerializedName("displayUri") val displayUri: String?  = null
+    @SerializedName("displayUri") val displayUri: String?  = null,
+    @SerializedName("mediaId") val mediaId: String = java.util.UUID.randomUUID().toString(),
+    @SerializedName("captureOrigin") val captureOrigin: String? = null
 )
 
 data class VideoFile(

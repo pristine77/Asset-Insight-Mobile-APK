@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import { ImageAdjustments, MixedLot, CaptureMode, PhotoFile } from './CameraCapture';
 import LotImageEditor from './LotImageEditor';
 import { ImageEditService } from '../../services/imageEditService';
@@ -40,6 +40,9 @@ interface LotManagerProps {
   onOpenCamera: (lotIdx: number) => void;
   onCreateLot: () => number;
   hideSummary?: boolean; // Hide the internal summary bar (when parent has its own)
+  embedded?: boolean; // The listing form already owns the vertical scroll/keyboard viewport.
+  lockedStructure?: boolean; // Schedule A preserves its upstream lot order and grouping.
+  sourceLabels?: string[];
 }
 
 const MAX_ASSET_LOT_PHOTOS = 200;
@@ -73,6 +76,9 @@ const LotManager = ({
   onOpenCamera,
   onCreateLot,
   hideSummary = false,
+  embedded = false,
+  lockedStructure = false,
+  sourceLabels,
 }: LotManagerProps) => {
   const [expandedLot, setExpandedLot] = useState<number | null>(
     activeLotIdx >= 0 ? activeLotIdx : null
@@ -134,25 +140,16 @@ const LotManager = ({
       });
 
       let fileSize = 0;
-      // Try multiple URI formats to get file size
-      const urisToTry = [
-        uri,
-        uri.startsWith('file://') ? uri : `file://${uri}`,
-        uri.replace('file://', ''),
-      ];
-
-      for (const tryUri of urisToTry) {
-        try {
-          const fileInfo = await FileSystem.getInfoAsync(tryUri);
-          console.log('[LotManager] FileSystem.getInfoAsync for', tryUri.slice(-30), ':', fileInfo);
-          if (fileInfo.exists && 'size' in fileInfo && fileInfo.size) {
-            fileSize = fileInfo.size;
-            console.log('[LotManager] Got file size:', fileSize);
-            break;
-          }
-        } catch {
-          // Continue to next URI format
+      // Keep Android MediaStore content:// references intact. Only bare paths
+      // need a file:// scheme; prepending it to a content URI makes it invalid.
+      const fileInfoUri = uri.startsWith('/') ? `file://${uri}` : uri;
+      try {
+        const fileInfo = await FileSystem.getInfoAsync(fileInfoUri);
+        if (fileInfo.exists && 'size' in fileInfo && fileInfo.size) {
+          fileSize = fileInfo.size;
         }
+      } catch {
+        // Some providers do not expose a size; the photo can still be displayed.
       }
 
       if (fileSize === 0) {
@@ -233,6 +230,7 @@ const LotManager = ({
   };
 
   const setLotMode = (idx: number, mode: LotMode) => {
+    if (lockedStructure) return;
     setLots((prev) => {
       const updated = [...prev];
       const lot = updated[idx];
@@ -317,6 +315,23 @@ const LotManager = ({
       updated[lotIdx] = { ...updated[lotIdx], coverIndex: imgIdx };
       return updated;
     });
+  };
+
+  const removeVideo = (lot: MixedLot, label: string) => {
+    const uri = lot.videoFile?.uri;
+    if (!uri) return;
+    Alert.alert('Remove video?', `Remove this video from ${label}? The original stays on this device.`, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Remove', style: 'destructive', onPress: () => {
+        // Resolve the stable lot after confirmation: reordering or replacing a
+        // clip while the dialog is open must not remove a different attachment.
+        setLots(previous => previous.map(candidate =>
+          candidate.id === lot.id && candidate.videoFile?.uri === uri
+            ? { ...candidate, videoFile: undefined }
+            : candidate
+        ));
+      } },
+    ]);
   };
 
   const pickImages = async (lotIdx: number) => {
@@ -428,6 +443,7 @@ const LotManager = ({
     const isExpanded = expandedLot === idx;
     const isActive = activeLotIdx === idx;
     const modeInfo = lot.mode ? MODE_INFO[lot.mode] : null;
+    const lotLabel = sourceLabels?.[idx] || `Lot ${lot.lotNumber || idx + 1}`;
 
     return (
       <View key={lot.id} style={[styles.lotCard, isActive && styles.lotCardActive]}>
@@ -445,17 +461,18 @@ const LotManager = ({
               </Text>
             </View>
             <View>
-              <Text style={styles.lotTitle}>Lot {idx + 1}</Text>
+              <Text style={styles.lotTitle}>{lotLabel}</Text>
               <Text style={styles.lotSubtitle}>
                 {lot.files.length} image{lot.files.length !== 1 ? 's' : ''}
+                {lot.videoFile ? ' • 1 video' : ''}
                 {modeInfo && ` • ${modeInfo.label}`}
               </Text>
             </View>
           </View>
           <View style={styles.lotHeaderRight}>
-            <TouchableOpacity onPress={() => removeLot(idx)} style={styles.deleteBtn}>
+            {!lockedStructure ? <TouchableOpacity onPress={() => removeLot(idx)} style={styles.deleteBtn}>
               <Feather name="trash-2" size={18} color="#EF4444" />
-            </TouchableOpacity>
+            </TouchableOpacity> : null}
             <Feather name={isExpanded ? 'chevron-up' : 'chevron-down'} size={24} color="#6B7280" />
           </View>
         </TouchableOpacity>
@@ -464,7 +481,7 @@ const LotManager = ({
         {isExpanded && (
           <View style={styles.lotContent}>
             {/* Mode Selection */}
-            <Text style={styles.modeLabel}>Select Mode:</Text>
+            <Text style={styles.modeLabel}>{lockedStructure ? 'Schedule A · Bundle grouping is locked' : 'Select Mode:'}</Text>
             <View style={styles.modeGrid}>
               {(Object.keys(MODE_INFO) as LotMode[]).map((mode) => {
                 const info = MODE_INFO[mode];
@@ -472,6 +489,7 @@ const LotManager = ({
                 return (
                   <TouchableOpacity
                     key={mode}
+                    disabled={lockedStructure}
                     style={[
                       styles.modeBtn,
                       isSelected && { backgroundColor: info.color + '20', borderColor: info.color },
@@ -491,6 +509,16 @@ const LotManager = ({
               })}
             </View>
 
+            {lot.mode === 'single_lot' && (
+              <View style={styles.bundleGuidance} accessibilityRole="text">
+                <Feather name="info" size={16} color="#075985" />
+                <Text style={styles.bundleGuidanceText}>
+                  Make the lot-number card the first main photo. Bundle lots numbered 1000 or
+                  higher analyze only the first 5 photos. All photos remain included.
+                </Text>
+              </View>
+            )}
+
             {/* Image Actions */}
             <View style={styles.imageActions}>
               <TouchableOpacity
@@ -506,6 +534,25 @@ const LotManager = ({
                 <Text style={styles.actionBtnText}>Gallery</Text>
               </TouchableOpacity>
             </View>
+
+            {lot.videoFile ? (
+              <View style={styles.videoAttachment} accessibilityRole="summary" accessibilityLabel={`${lotLabel}, 1 video attached: ${lot.videoFile.name}`}>
+                <Feather name="video" size={20} color="#374151" />
+                <View style={styles.videoDetails}>
+                  <Text style={styles.videoName} numberOfLines={2}>{lot.videoFile.name}</Text>
+                  <Text style={styles.videoNote}>
+                    {lot.videoFile.size ? `${formatFileSize(lot.videoFile.size)} · ` : ''}Included in media ZIP
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  accessibilityLabel={`Remove video from ${lotLabel}`}
+                  style={styles.videoRemove}
+                  onPress={() => removeVideo(lot, lotLabel)}>
+                  <Feather name="trash-2" size={20} color="#DC2626" />
+                </TouchableOpacity>
+              </View>
+            ) : null}
 
             {/* Image Grid */}
             {lot.files.length > 0 && (
@@ -565,7 +612,7 @@ const LotManager = ({
   };
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, embedded && styles.embeddedContainer]}>
       {/* Open Camera Button - Main Action */}
       <TouchableOpacity style={styles.openCameraBtn} onPress={openCameraDirectly}>
         <Feather name="camera" size={24} color="#fff" />
@@ -576,7 +623,7 @@ const LotManager = ({
       {/* Header */}
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Image Lots</Text>
-        <TouchableOpacity
+        {!lockedStructure ? <TouchableOpacity
           style={styles.addLotBtn}
           onPress={() => {
             const newIdx = onCreateLot();
@@ -585,13 +632,17 @@ const LotManager = ({
           }}>
           <Feather name="plus" size={20} color="#fff" />
           <Text style={styles.addLotBtnText}>Add Lot</Text>
-        </TouchableOpacity>
+        </TouchableOpacity> : null}
       </View>
 
       {/* Lots List */}
       <ScrollView
-        style={styles.lotsList}
-        contentContainerStyle={styles.lotsListContent}
+        scrollEnabled={!embedded}
+        nestedScrollEnabled={!embedded}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+        style={[styles.lotsList, embedded && styles.embeddedContainer]}
+        contentContainerStyle={[styles.lotsListContent, embedded && styles.embeddedContent]}
         showsVerticalScrollIndicator={false}>
         {lots.length === 0 ? (
           <View style={styles.noLotsState}>
@@ -687,7 +738,10 @@ const LotManager = ({
 
           {/* Image */}
           {selectedImage && (
-            <TouchableOpacity activeOpacity={1} onPress={(e) => e.stopPropagation()}>
+            <TouchableOpacity
+              style={styles.viewerImageFrame}
+              activeOpacity={1}
+              onPress={(e) => e.stopPropagation()}>
               <Image
                 source={{ uri: selectedImage.uri }}
                 style={styles.viewerImage}
@@ -746,7 +800,7 @@ const LotManager = ({
                 <Text style={styles.viewerInfoValue}>
                   {selectedImage.width > 0
                     ? `${selectedImage.width} × ${selectedImage.height}`
-                    : 'Loading...'}
+                    : 'Unavailable'}
                 </Text>
               </View>
               <View style={styles.viewerInfoDivider} />
@@ -754,7 +808,7 @@ const LotManager = ({
                 <Feather name="hard-drive" size={14} color="rgba(255,255,255,0.7)" />
                 <Text style={styles.viewerInfoLabel}>Size</Text>
                 <Text style={styles.viewerInfoValue}>
-                  {selectedImage.size > 0 ? formatFileSize(selectedImage.size) : 'Loading...'}
+                  {selectedImage.size > 0 ? formatFileSize(selectedImage.size) : 'Unavailable'}
                 </Text>
               </View>
             </TouchableOpacity>
@@ -781,6 +835,8 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#F3F4F6',
   },
+  embeddedContainer: { flex: 0 },
+  embeddedContent: { paddingBottom: 24 },
   openCameraBtn: {
     backgroundColor: '#F43F5E',
     margin: 12,
@@ -970,6 +1026,25 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     fontWeight: '500',
   },
+  bundleGuidance: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+    marginTop: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: '#BAE6FD',
+    borderRadius: 10,
+    backgroundColor: '#F0F9FF',
+  },
+  bundleGuidanceText: {
+    flex: 1,
+    color: '#0C4A6E',
+    fontSize: 12,
+    lineHeight: 18,
+    fontWeight: '500',
+  },
   imageActions: {
     flexDirection: 'row',
     marginTop: 16,
@@ -1000,6 +1075,23 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginLeft: 8,
   },
+  videoAttachment: {
+    marginTop: 12,
+    paddingLeft: 12,
+    paddingVertical: 8,
+    paddingRight: 4,
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    borderRadius: 8,
+    backgroundColor: '#F9FAFB',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  videoDetails: { flex: 1, minWidth: 0 },
+  videoName: { color: '#111827', fontSize: 13, fontWeight: '600' },
+  videoNote: { color: '#4B5563', fontSize: 12, marginTop: 3 },
+  videoRemove: { minWidth: 44, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
   imageGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -1240,9 +1332,13 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     overflow: 'hidden',
   },
-  viewerImage: {
+  viewerImageFrame: {
     width: '100%',
     height: '70%',
+  },
+  viewerImage: {
+    width: '100%',
+    height: '100%',
   },
   viewerLoading: {
     position: 'absolute',

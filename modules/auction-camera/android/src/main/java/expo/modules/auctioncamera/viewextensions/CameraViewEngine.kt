@@ -34,10 +34,7 @@ import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
-import androidx.camera.video.Quality
-import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
 import androidx.camera.video.Recording
 import androidx.camera.video.VideoCapture
@@ -45,7 +42,6 @@ import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
-import expo.modules.auctioncamera.R
 import expo.modules.auctioncamera.WhiteBalance
 import expo.modules.auctioncamera.ZoomSlot
 import expo.modules.auctioncamera.controls.AeFpsController
@@ -55,12 +51,42 @@ import expo.modules.auctioncamera.model.ManualConfig
 import expo.modules.auctioncamera.utils.Camera2Helper
 import expo.modules.auctioncamera.utils.CameraProfiler
 import expo.modules.auctioncamera.utils.ManualControls
+import expo.modules.auctioncamera.utils.CameraPhotoWatermark
+import expo.modules.auctioncamera.utils.CameraVideoStorage
+import expo.modules.auctioncamera.utils.PhotoWatermarkReceipt
 import java.io.File
 import java.io.FileInputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.pow
+
+/*
+ * Standard photo size restored to the pre-2026-10-02 policy.
+ *
+ * Standard photos keep their aspect ratio, are never enlarged, and have at most
+ * 3000 pixels on the longest side. JPEG targets 700 KiB using the existing
+ * quality ladder; WebP/AVIF still target 300 KiB. These are encoding targets,
+ * not hard byte caps. The 12 MP option retains its separate 6000 px / 1 MiB policy.
+ *
+ * Pristine 9b1f739 reduced standard captures on 2026-10-02; 551205d restored
+ * them on 2026-10-04. Local restoration requested 2026-10-05. Keep the longest
+ * side in step with src/utils/cameraPhotoSize.ts; JS encodes at fixed quality 95.
+ */
+internal const val STANDARD_PHOTO_MAX_SIDE = 3000
+internal const val STANDARD_PHOTO_MAX_JPEG_BYTES = 700 * 1024
+internal const val STANDARD_PHOTO_MAX_OTHER_BYTES = 300 * 1024
+
+/** The size that fits width x height inside boxWidth x boxHeight, keeping the shape and never enlarging. */
+internal fun fitInsideBox(width: Int, height: Int, boxWidth: Int, boxHeight: Int): Pair<Int, Int> {
+    if (width <= 0 || height <= 0) return Pair(width, height)
+    val scale = minOf(1.0, boxWidth.toDouble() / width, boxHeight.toDouble() / height)
+    if (scale >= 1.0) return Pair(width, height)
+    return Pair(
+        Math.round(width * scale).toInt().coerceAtLeast(1),
+        Math.round(height * scale).toInt().coerceAtLeast(1)
+    )
+}
 
 class CameraViewEngine(private val context: Context, private val lifecycleOwner: LifecycleOwner) {
 
@@ -80,10 +106,18 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
     private var use12MPOutput: Boolean = false
     var onCameraRebound: (() -> Unit)? = null
     var onZoomChanged: ((Float, Float, Float) -> Unit)? = null
-    var onPhotoCaptured: ((Uri) -> Unit)? = null
+    /**
+     * The frame of a shot is on disk. The shutter may fire again now, while this
+     * shot is still being processed; its photo follows in onPhotoCaptured.
+     */
+    var onCaptureSaved: ((CaptureTicket?) -> Unit)? = null
+    var onPhotoCaptured: ((Uri, CaptureTicket?) -> Unit)? = null
     var onPhotoProcessed: ((Uri, Uri, Int, Int) -> Unit)? = null
+    /** A saved shot could not be processed. Nothing was added to any lot. */
+    var onPhotoProcessingFailed: ((String, CaptureTicket?) -> Unit)? = null
     var onVideoRecordingStarted: (() -> Unit)? = null
-    var onVideoRecorded: ((Uri) -> Unit)? = null
+    var onVideoFinalizing: ((Uri) -> Unit)? = null
+    var onVideoRecorded: ((Uri) -> Boolean)? = null
     var onRecordingError: ((String) -> Unit)? = null
     var onVideoReady: (() -> Unit)? = null
     var onEVChanged: ((Float) -> Unit)? = null
@@ -94,7 +128,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
     var onExtensionModeChanged: ((CameraViewExtensionMode) -> Unit)? = null
     var onManualConflictResolved: ((String) -> Unit)? = null
     var onNightModeComplete: (() -> Unit)? = null
-    var onNightModeUriReady: ((Uri) -> Unit)? = null
+    var onNightModeUriReady: ((Uri, CaptureTicket?) -> Unit)? = null
     var onNightModeError: ((String) -> Unit)? = null
     private var lensFacing = CameraSelector.LENS_FACING_BACK
     private lateinit var preview: Preview
@@ -119,6 +153,8 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
     private var currentCameraId: String? = null
     private var cachedProvider: ProcessCameraProvider? = null
     private var isVideoReady = false
+    private var isVideoMode = false
+    private var videoBindingRevision = 0L
     private var firstFrameConfirmed = false
     private var recordingStartMs = 0L
     private var currentZoomRatio = 1f
@@ -132,15 +168,16 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
     private val mainHandler = Handler(Looper.getMainLooper())
     private var cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
-    //  A multi-lane highway for heavy image processing
-    private var processingExecutor: ExecutorService = Executors.newFixedThreadPool(3)
+    // Photo processing runs on ONE thread so photos are filed in the order they
+    // were taken. The shutter is free while a shot is processed (onCaptureSaved),
+    // so with a pool a quick second shot could finish before a slow first one and
+    // be filed ahead of it. One thread was the real throughput before as well:
+    // the shutter lock allowed only one shot in flight (2026-10-03).
+    private var processingExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     var suppressGalleryCopy = false
     private var autoFlashEnabled = false
     private val lotPhotosDir: File by lazy {
         File(context.cacheDir, "lot_photos").apply { mkdirs() }
-    }
-    private val lotVideosDir: File by lazy {
-        File(context.cacheDir, "lot_videos").apply { mkdirs() }
     }
 
     @Volatile
@@ -233,7 +270,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
             }
 
             val builder = CaptureRequestOptions.Builder()
-            ManualControls.applyToBuilder(builder, manualConfig)
+            ManualControls.applyToBuilder(builder, effectiveManualConfig())
 
             val flashReq = when {
                 torchEnabled -> CameraMetadata.FLASH_MODE_TORCH
@@ -328,6 +365,9 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
     fun startPhoto(previewView: PreviewView) = startPhotoWithExtension(previewView)
 
     private fun startPhotoWithExtension(previewView: PreviewView) {
+        isVideoMode = false
+        isVideoReady = false
+        videoBindingRevision++
         ensureExecutorAlive()
         isCameraBinding = true
 
@@ -413,14 +453,14 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
 
     fun startVideo(previewView: PreviewView) {
         ensureExecutorAlive()
+        isVideoMode = true
         isVideoReady = false
         firstFrameConfirmed = false
+        val bindingRevision = ++videoBindingRevision
         withProvider { provider ->
+            if (bindingRevision != videoBindingRevision || !isVideoMode) return@withProvider
             preview = buildPreview(true).also { it.setSurfaceProvider(previewView.surfaceProvider) }
-
-            val vcb = VideoCapture.Builder(buildRecorder())
-                .setTargetRotation(currentRotation)
-            videoCapture = vcb.build()
+            videoCapture = ListingVideoProfile.buildCapture(currentRotation)
 
             rebindSafely(provider) {
                 try {
@@ -430,11 +470,13 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                         preview,
                         videoCapture,
                     )
+                    ListingVideoProfile.requireSupported(camera.cameraInfo)
+                    ListingVideoProfile.requireBoundProfile(videoCapture)
                     currentLensLabel = "Wide"
                     camera.cameraControl.setZoomRatio(1f)
                     observeCamera()
                     mainHandler.postDelayed({
-                        if (::videoCapture.isInitialized) {
+                        if (bindingRevision == videoBindingRevision && isVideoMode && ::videoCapture.isInitialized) {
                             isVideoReady = true
                             mainHandler.post { onVideoReady?.invoke() }
                         }
@@ -442,6 +484,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                 } catch (e: Exception) {
                     Log.e(TAG, "startVideo failed: ${e.message}")
                     isVideoReady = false
+                    mainHandler.post { onRecordingError?.invoke(ListingVideoProfile.UNSUPPORTED_MESSAGE) }
                 }
             }
         }
@@ -506,17 +549,31 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
     // Capture routing
     // ─────────────────────────────────────────────────────────────────────────
 
-    fun capturePhoto() {
-        if (!::imageCapture.isInitialized || !::camera.isInitialized) return
+    /**
+     * Every tap gets an answer: a saved frame, a processed photo, or an error.
+     * A tap that is answered by nothing leaves the screen's shutter locked for
+     * good, which is what happened when the camera was not bound yet, or when
+     * takePicture itself threw (2026-10-03).
+     */
+    fun capturePhoto(ticket: CaptureTicket? = null) {
+        if (!::imageCapture.isInitialized || !::camera.isInitialized) {
+            mainHandler.post { onRecordingError?.invoke("Camera is not ready yet. Try again.") }
+            return
+        }
         Log.d(
             "CAPTURE_ROUTE",
             "capturePhoto called — isNightMode=$isNightMode activeMode=${activeExtensionMode.label}"
         )
 
-        when {
-            isNightMode -> captureNight()
-            activeExtensionMode is CameraViewExtensionMode.Bokeh -> captureBokeh()
-            else -> captureToFile()
+        try {
+            when {
+                isNightMode -> captureNight(ticket)
+                activeExtensionMode is CameraViewExtensionMode.Bokeh -> captureBokeh(ticket)
+                else -> captureToFile(ticket)
+            }
+        } catch (error: Exception) {
+            Log.e(TAG, "takePicture threw: ${error.message}")
+            mainHandler.post { onRecordingError?.invoke("Capture failed: ${error.message}") }
         }
     }
 
@@ -524,9 +581,55 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
         outputFormat = format
     }
 
-    private fun processCapturedFile(file: File) {
+    private data class ProcessedCapture(val uri: Uri, val width: Int, val height: Int)
+
+    private fun publishCapturedFile(file: File, ticket: CaptureTicket?, night: Boolean = false) {
+        processingExecutor.execute {
+            // Everything is caught, OutOfMemoryError included. It is not an Exception,
+            // so it escaped the catch inside processCapturedFile, killed this thread,
+            // and answered nobody: the app crashed on a very large photo, or the
+            // shutter stayed locked and the thumbnail kept pulsing (2026-10-03).
+            val result = try {
+                processCapturedFile(file)
+            } catch (error: Throwable) {
+                Log.e(TAG, "Processing failed: ${error.message}")
+                null
+            }
+            // The raw frame is never shown to anyone; a shot that cannot be
+            // processed is retaken, so its frame is not kept.
+            if (result == null && file.exists()) file.delete()
+            mainHandler.post {
+                if (result == null) {
+                    onPhotoProcessingFailed?.invoke("Photo processing failed. Please take the photo again.", ticket)
+                } else {
+                    if (night) {
+                        onNightModeComplete?.invoke()
+                        onNightModeUriReady?.invoke(result.uri, ticket)
+                    } else onPhotoCaptured?.invoke(result.uri, ticket)
+                    onPhotoProcessed?.invoke(result.uri, result.uri, result.width, result.height)
+                }
+            }
+        }
+    }
+
+    /**
+     * The largest decode the output needs: twice the output box, so the crops and
+     * the resize have detail to work from, widened when a focus box keeps only
+     * part of the frame. The decoder also stays inside the memory available.
+     */
+    internal fun decodeBoundFor(use12MP: Boolean, crop: RectF?): Pair<Int, Int> {
+        val (outW, outH) = if (use12MP) 6000 to 6000 else STANDARD_PHOTO_MAX_SIDE to STANDARD_PHOTO_MAX_SIDE
+        val cropW = crop?.width()?.takeIf { it > 0f } ?: 1f
+        val cropH = crop?.height()?.takeIf { it > 0f } ?: 1f
+        val cap = 8192
+        return minOf(cap, (outW * 2 / cropW).toInt()) to minOf(cap, (outH * 2 / cropH).toInt())
+    }
+
+    private fun processCapturedFile(file: File): ProcessedCapture? {
         // ── Determine output format and derive file extension / MIME ─────────
-        val fmt = outputFormat   // snapshot so it can't change mid-process
+        val fmt = if (outputFormat == ImageFormatStore.Format.AVIF &&
+            runCatching { android.graphics.Bitmap.CompressFormat.valueOf("AVIF") }.getOrNull() == null
+        ) ImageFormatStore.Format.JPEG else outputFormat
         val extension = when (fmt) {
             ImageFormatStore.Format.WEBP -> "webp"
             ImageFormatStore.Format.AVIF -> "avif"
@@ -538,23 +641,16 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
             else -> "image/jpeg"
         }
 
-        val outputFile = File(lotPhotosDir, "photo_${System.currentTimeMillis()}.$extension")
+        val outputFile = File(File(context.filesDir, "camera-photos").apply { mkdirs() }, "photo_${java.util.UUID.randomUUID()}.$extension")
 
-        // ── Target file-size budget (kept identical to existing logic) ────────
-        //   JPEG: 700 KB  (existing)
-        //   WebP: 300 KB  (client target — lossy WebP achieves this easily)
-        //   AVIF: 300 KB  (AVIF is more efficient still)
-        // ── Determine file-size budget based on 12MP toggle ──────────────────────────
-
-//        var TARGET_SIZE_BYTES = when (fmt) {
-//            ImageFormatStore.Format.JPEG -> 700 * 1024
-//            else -> 300 * 1024
-//        }
-
+        // -- Target file-size budget ----------------------------------------------
+        //   12 MP option on: 1 MB.
+        //   Standard JPEG: 700 KiB. Standard WebP/AVIF: 300 KiB.
+        //   Restore the pre-reduction targets without changing the quality ladders.
         val TARGET_SIZE_BYTES = when {
             use12MPOutput -> 1 * 1024 * 1024             // 1 MB when 12MP is ON
-            fmt == ImageFormatStore.Format.JPEG -> 700 * 1024
-            else -> 300 * 1024                           // WebP / AVIF
+            fmt == ImageFormatStore.Format.JPEG -> STANDARD_PHOTO_MAX_JPEG_BYTES
+            else -> STANDARD_PHOTO_MAX_OTHER_BYTES
         }
 
         try {
@@ -570,7 +666,21 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                 androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
                 else -> 0f
             }
-            val raw = android.graphics.BitmapFactory.decodeFile(file.path) ?: return
+            // Decode only as large as the output needs (2026-10-03). A full-size
+            // decode of a 50 MP frame is 200 MB, and the upright copy below another
+            // 200 MB — more than the app may hold, so very large photos crashed it.
+            // The crops below work in fractions of the frame, so a smaller decode
+            // crops the same picture. See decodeBoundFor for the size chosen.
+            val (boundW, boundH) = decodeBoundFor(use12MPOutput, activeCropRect)
+            val decoded = expo.modules.auctioncamera.utils.SafeBitmapDecoder.decode(
+                file,
+                expo.modules.auctioncamera.model.ImageProcessingConfig(
+                    maxDecodedWidthPx = boundW,
+                    maxDecodedHeightPx = boundH,
+                    maxHeapFraction = 0.35f,
+                ),
+            ) ?: throw IllegalStateException("Unable to decode capture")
+            val raw = decoded.bitmap
 
             var bitmap = if (rotation != 0f) {
                 val matrix = android.graphics.Matrix().apply { postRotate(rotation) }
@@ -638,26 +748,22 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                 )
             }
 
-            // ── 5. Logo stamp (unchanged) ─────────────────────────────────────
-            bitmap = stampLogo(bitmap)
-
-            // ── 6. NEW — Option A resize: fit inside 1200 px on longest side ──
-            // "Do not enlarge if smaller" is honoured — we only ever scale down.
-            // Portrait images become e.g. 900 × 1200; landscape 1200 × 900.
-            // This is a simple proportional scale so the full subject is always
-            // visible with no cropping and no distortion.
-            // When 12MP is ON: target the long side at ~4000 px (≈12MP for 4:3)
-// When 12MP is OFF: keep existing 1200 px limit
-            val MAX_SIDE = if (use12MPOutput) 6000 else 3000
-            val longestSide = maxOf(bitmap.width, bitmap.height)
-            if (longestSide > MAX_SIDE) {
-                val scale  = MAX_SIDE.toFloat() / longestSide.toFloat()
-                val targetW = (bitmap.width  * scale).toInt().coerceAtLeast(1)
-                val targetH = (bitmap.height * scale).toInt().coerceAtLeast(1)
+            // -- 6. Resize -------------------------------------------------------------
+            // Preserve orientation and aspect ratio with a 3000 px longest side.
+            // The 12 MP option keeps its 6000 px longest side; neither is enlarged.
+            val (targetW, targetH) = if (use12MPOutput) {
+                fitInsideBox(bitmap.width, bitmap.height, 6000, 6000)
+            } else {
+                fitInsideBox(bitmap.width, bitmap.height, STANDARD_PHOTO_MAX_SIDE, STANDARD_PHOTO_MAX_SIDE)
+            }
+            if (targetW != bitmap.width || targetH != bitmap.height) {
                 val resized = android.graphics.Bitmap.createScaledBitmap(bitmap, targetW, targetH, true)
                 if (resized !== bitmap) { bitmap.recycle(); bitmap = resized }
-                Log.d(TAG, "Resized to ${targetW}×${targetH} (12MP=${use12MPOutput}, maxSide=$MAX_SIDE)")
+                Log.d(TAG, "Resized to ${targetW}x${targetH} (12MP=${use12MPOutput})")
             }
+
+            // Stamp once AFTER all capture crops/resizing, independent of upload opt-in.
+            bitmap = CameraPhotoWatermark.stamp(context, bitmap)
 
             // ── 7. Compress to RAM then flush to disk once ────────────────────
             val stream = java.io.ByteArrayOutputStream()
@@ -820,26 +926,20 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                 Log.e(TAG, "Failed to save EXIF: ${e.message}")
             }
 
-            // ── 9. Replace the raw temp file with the processed output ─────────
-            if (file.exists()) file.delete()
-            val renamed = outputFile.renameTo(file)
-            if (!renamed) {
-                outputFile.inputStream().use { input ->
-                    file.outputStream().use { output -> input.copyTo(output) }
-                }
-                outputFile.delete()
-            }
+            // Bind only the finished bytes, after EXIF, before any gallery/draft handoff.
+            outputFile.writeBytes(PhotoWatermarkReceipt.add(outputFile.readBytes()))
 
-            // ── 10. Save to user gallery with correct MIME type ────────────────
-            // We save 'file' (which now contains the compressed data) to the gallery
-            val finalGalleryUri = saveToUserGallery(file, mimeType)
-            if (finalGalleryUri != null) {
-                val oldTempUri = Uri.fromFile(file)
-                mainHandler.post { onPhotoProcessed?.invoke(oldTempUri, finalGalleryUri, finalWidth, finalHeight) }
-            }
+            // Keep the encoded extension/MIME aligned, including AVIF->JPEG fallback.
+            // No caller ever saw the raw capture URI, so only the finished file is published.
+            val galleryUri = saveToUserGallery(outputFile, mimeType)
+            val finalGalleryUri = galleryUri ?: Uri.fromFile(outputFile)
+            if (galleryUri != null) outputFile.delete() // The gallery is the one durable original.
+            file.delete()
+            return ProcessedCapture(finalGalleryUri, finalWidth, finalHeight)
 
         } catch (e: Exception) {
             Log.e(TAG, "Processing failed: ${e.message}")
+            return null
         }
     }
 
@@ -960,36 +1060,6 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
         }
     }
 
-    private fun stampLogo(src: android.graphics.Bitmap): android.graphics.Bitmap {
-        return try {
-            val logo = android.graphics.BitmapFactory.decodeResource(
-                context.resources, R.drawable.ic_app_img
-            ) ?: return src
-            val result = if (src.isMutable) src
-            else src.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
-            val canvas = android.graphics.Canvas(result)
-            val logoW = (src.width * 0.2f).toInt().coerceAtLeast(40)
-            val logoH = (logo.height.toFloat() / logo.width * logoW).toInt()
-            val scaled = android.graphics.Bitmap.createScaledBitmap(logo, logoW, logoH, true)
-            logo.recycle()
-
-            val padding = (src.width * 0.03f).toInt()
-            val left = src.width - scaled.width - padding
-            val top = src.height - scaled.height - padding
-
-            val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                alpha = 200
-            }
-            canvas.drawBitmap(scaled, left.toFloat(), top.toFloat(), paint)
-            scaled.recycle()
-            if (result !== src) src.recycle()
-            result
-        } catch (e: Exception) {
-            Log.w(TAG, "Logo stamp failed: ${e.message}")
-            src
-        }
-    }
-
     private fun saveToUserGallery(file: File, mimeType: String = "image/jpeg"): Uri? {
         return try {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
@@ -1067,7 +1137,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
         }
     }
 
-    private fun captureToFile() {
+    private fun captureToFile(ticket: CaptureTicket?) {
         val captureStartMs = SystemClock.elapsedRealtime()
         CameraProfiler.beginSection("capture_photo")
         // --- Determine extension based on outputFormat ---
@@ -1089,22 +1159,11 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                         "image_saved extension=${activeExtensionMode.label} ms=${SystemClock.elapsedRealtime() - captureStartMs} bytes=${tempFile.length()}"
                     )
 
-                    // 1. INSTANT UI UPDATE: Send the raw temp file to the UI immediately
-                    val tempUri = Uri.fromFile(tempFile)
-                    mainHandler.post { onPhotoCaptured?.invoke(tempUri) }
-
-                    // 2. BACKGROUND PROCESSING: Do the heavy lifting in a background thread
-                    processingExecutor.execute {
-                        val processingStartMs = SystemClock.elapsedRealtime()
-                        processCapturedFile(tempFile)
-                        Log.d(
-                            "AuctionCameraTiming",
-                            "processing_complete ms=${SystemClock.elapsedRealtime() - processingStartMs} bytes=${tempFile.length()}"
-                        )
-                    }
-//                    cameraExecutor.execute {
-//                        processCapturedFile(tempFile)
-//                    }
+                    // The frame is on disk: the shutter is free again from here, while
+                    // the shot is processed (see onCaptureSaved).
+                    mainHandler.post { onCaptureSaved?.invoke(ticket) }
+                    // Never expose an unprocessed/raw URI to drafts or upload.
+                    publishCapturedFile(tempFile, ticket)
                 }
 
                 override fun onError(exception: ImageCaptureException) {
@@ -1117,7 +1176,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
     }
 
     // ── Portrait / Bokeh capture ──────────────────────────────────────────────
-    private fun captureBokeh() {
+    private fun captureBokeh(ticket: CaptureTicket?) {
         Log.d("BOKEH_CAPTURE", "Starting Portrait capture")
         CameraProfiler.beginSection("capture_bokeh")
         // --- Determine extension based on outputFormat ---
@@ -1135,14 +1194,8 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                     CameraProfiler.endSection("capture_bokeh")
-                    // 1. INSTANT UI UPDATE: Send the raw temp file to the UI immediately
-                    val tempUri = Uri.fromFile(tempFile)
-                    mainHandler.post { onPhotoCaptured?.invoke(tempUri) }
-
-                    // 2. Use processingExecutor here instead of cameraExecutor
-                    processingExecutor.execute {
-                        processCapturedFile(tempFile)
-                    }
+                    mainHandler.post { onCaptureSaved?.invoke(ticket) }
+                    publishCapturedFile(tempFile, ticket)
 
 //                    // 2. BACKGROUND PROCESSING: Do the heavy lifting in a background thread
 //                    cameraExecutor.execute {
@@ -1162,7 +1215,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
 
     // ── Night capture ─────────────────────────────────────────────────────────
 
-    private fun captureNight() {
+    private fun captureNight(ticket: CaptureTicket?) {
         CameraProfiler.beginSection("capture_night")
         // --- Determine extension based on outputFormat ---
         val extension = when (outputFormat) {
@@ -1179,18 +1232,8 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                     CameraProfiler.endSection("capture_night")
-                    // 1. INSTANT UI UPDATE: Send the raw temp file to the UI immediately
-                    val tempUri = Uri.fromFile(tempFile)
-                    mainHandler.post {
-                        onNightModeComplete?.invoke(); onNightModeUriReady?.invoke(
-                        tempUri
-                    )
-                    }
-
-                    // 2. Use processingExecutor here instead of cameraExecutor
-                    processingExecutor.execute {
-                        processCapturedFile(tempFile)
-                    }
+                    mainHandler.post { onCaptureSaved?.invoke(ticket) }
+                    publishCapturedFile(tempFile, ticket, night = true)
 
 //                    // 2. BACKGROUND PROCESSING: Do the heavy lifting in a background thread
 //                    cameraExecutor.execute {
@@ -1209,7 +1252,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Video recording — saves to cache/lot_videos/, copies to gallery
+    // Video recording — durable original, journalled before gallery publication/handoff.
     // ─────────────────────────────────────────────────────────────────────────
 
     fun startRecording() {
@@ -1217,12 +1260,20 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
             onRecordingError?.invoke("Camera not ready")
             return
         }
-        if (isStopping) return
+        if (isRecording()) return
         CameraProfiler.beginSection("video_recording")
         CameraProfiler.logMemory("video_start")
-        val outputFile = File(lotVideosDir, "VID_${System.currentTimeMillis()}.mp4")
+        val outputFile = try {
+            ListingVideoProfile.requireSupported(camera.cameraInfo)
+            ListingVideoProfile.requireBoundProfile(videoCapture)
+            CameraVideoStorage.createOutputFile(context)
+        } catch (error: Exception) {
+            onRecordingError?.invoke(error.message ?: "Unable to prepare video recording.")
+            return
+        }
         recordingStartMs = System.currentTimeMillis()
-        recording = videoCapture.output
+        try {
+            recording = videoCapture.output
             .prepareRecording(context, FileOutputOptions.Builder(outputFile).build())
             .apply {
                 if (ContextCompat.checkSelfPermission(
@@ -1239,16 +1290,34 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                         firstFrameConfirmed = true
 
                     is VideoRecordEvent.Finalize -> {
-                        isStopping = false
+                        // Done/Next Lot stay locked until the durable original and final URI
+                        // have both been handed to the current lot's metadata journal.
+                        isStopping = true
                         recording = null
                         if (!event.hasError()) {
-                            val uri = event.outputResults.outputUri
-                            Log.d(TAG, "Video saved to cache: ${outputFile.absolutePath}")
+                            try {
+                                onVideoFinalizing?.invoke(Uri.fromFile(outputFile))
+                            } catch (error: Exception) {
+                                isStopping = false
+                                onRecordingError?.invoke("Video retained on this device. Tap Done again to save its lot details.")
+                                return@start
+                            }
+                            ensureExecutorAlive()
                             cameraExecutor.execute {
-                                copyVideoToGallery(outputFile)
-                                mainHandler.post { onVideoRecorded?.invoke(uri) }
+                                val uri = CameraVideoStorage.publish(context, outputFile)
+                                mainHandler.post {
+                                    try {
+                                        val journalSaved = onVideoRecorded?.invoke(uri) == true
+                                        CameraVideoStorage.acknowledgeGalleryHandoff(context, outputFile, uri, journalSaved)
+                                    } catch (error: Exception) {
+                                        onRecordingError?.invoke("Video retained on this device. Tap Done again to save its lot details.")
+                                    } finally {
+                                        isStopping = false
+                                    }
+                                }
                             }
                         } else {
+                            isStopping = false
                             suppressGalleryCopy = false
                             val reason = when (event.error) {
                                 VideoRecordEvent.Finalize.ERROR_NO_VALID_DATA -> "Recording stopped too quickly."
@@ -1262,6 +1331,12 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                     }
                 }
             }
+        } catch (error: Exception) {
+            isStopping = false
+            recording = null
+            outputFile.delete()
+            onRecordingError?.invoke("Unable to start video recording. Check camera and microphone permissions.")
+        }
     }
 
     fun stopRecording() {
@@ -1278,26 +1353,6 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
             return
         }
         pending.stop()
-    }
-
-    private fun copyVideoToGallery(file: File) {
-        try {
-            val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
-                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Auctioneer")
-            }
-            val uri = context.contentResolver.insert(
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
-            )
-            uri?.let {
-                context.contentResolver.openOutputStream(it)?.use { out ->
-                    file.inputStream().use { it.copyTo(out) }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "copyVideoToGallery failed: ${e.message}")
-        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1574,7 +1629,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
             return
         }
         manualConfig = result.safeConfig
-        if (::camera.isInitialized) ManualControls.applyDirect(camera, manualConfig)
+        if (::camera.isInitialized) ManualControls.applyDirect(camera, effectiveManualConfig())
     }
 
     fun setShutterSpeed(shutterNs: Long?, previewView: PreviewView, isPhotoMode: Boolean) {
@@ -1594,7 +1649,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
             return
         }
         manualConfig = result.safeConfig
-        if (::camera.isInitialized) ManualControls.applyDirect(camera, manualConfig)
+        if (::camera.isInitialized) ManualControls.applyDirect(camera, effectiveManualConfig())
     }
 
     fun setFPSRange(min: Int, max: Int, previewView: PreviewView, isPhotoMode: Boolean) {
@@ -1607,7 +1662,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
             return
         }
         manualConfig = result.safeConfig
-        if (::camera.isInitialized) ManualControls.applyDirect(camera, manualConfig)
+        if (::camera.isInitialized) ManualControls.applyDirect(camera, effectiveManualConfig())
     }
 
     @OptIn(ExperimentalCamera2Interop::class)
@@ -1707,7 +1762,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
         if (hasNonDefaultManualConfig()) {
             mainHandler.postDelayed({
                 if (::camera.isInitialized) {
-                    ManualControls.applyDirect(camera, manualConfig)
+                    ManualControls.applyDirect(camera, effectiveManualConfig())
                     applyWBDirect(manualConfig.whiteBalance)
                     Log.d(TAG, "Restored manualConfig after rebind: $manualConfig")
                 }
@@ -1743,19 +1798,31 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                 manualConfig.aeFpsMax != 30
     }
 
+    private fun effectiveManualConfig(): ManualConfig = if (isVideoMode) {
+        manualConfig.copy(
+            aeMode = CaptureRequest.CONTROL_AE_MODE_ON,
+            iso = null,
+            shutterSpeedNs = null,
+            aeFpsMin = ListingVideoProfile.FRAMES_PER_SECOND,
+            aeFpsMax = ListingVideoProfile.FRAMES_PER_SECOND,
+        )
+    } else manualConfig
+
     fun pause() {
+        videoBindingRevision++
+        isVideoReady = false
         isPreviewBound = false
         probeActive = false
         trueMinZoomReady = false
         currentCameraId = null
         currentLensLabel = "Wide"
-        isStopping = false
         cachedProvider?.let { runCatching { it.unbindAll() } }
     }
 
     fun shutdown() {
+        videoBindingRevision++
+        isVideoReady = false
         probeActive = false
-        isStopping = false
         if (::orientationListener.isInitialized) orientationListener.disable()
         recording?.stop()
         recording = null
@@ -1774,10 +1841,11 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
         val builder = Preview.Builder()
             .setTargetRotation(currentRotation)
             // REMOVED the hardcoded ManualControls from Preview as well
-            .also { pendingResSelector?.let { sel -> it.setResolutionSelector(sel) } }
+            .also { if (!isVideo) pendingResSelector?.let { sel -> it.setResolutionSelector(sel) } }
 
         // Only apply Video Stabilization if we are actually recording video!
         if (isVideo) {
+            builder.setTargetFrameRate(ListingVideoProfile.frameRate)
             try {
                 Camera2Interop.Extender(builder).setCaptureRequestOption(
                     CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
@@ -1906,17 +1974,6 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
 //        return builder.build()
 //    }
 
-    private fun buildRecorder() = Recorder.Builder()
-        .setQualitySelector(
-            QualitySelector.from(
-                Quality.FHD,
-                FallbackStrategy.higherQualityOrLowerThan(Quality.SD)
-            )
-        )
-        .setTargetVideoEncodingBitRate(10_000_000)
-        .build()
-
-
     private fun rebindSafely(provider: ProcessCameraProvider, block: () -> Unit) {
         provider.unbindAll()
         block()
@@ -1968,11 +2025,14 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
         zoom: Float,
         isPhotoMode: Boolean,
     ) {
+        if (isRecording()) return
+        isVideoMode = !isPhotoMode
         activeCropRect = null
         if (currentCameraId == targetId) {
             camera.cameraControl.setZoomRatio(zoom)
             return
         }
+        val bindingRevision = ++videoBindingRevision
         currentCameraId = targetId
         currentLensLabel = label
         ensureExecutorAlive()
@@ -1993,16 +2053,18 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                     reapplyTorch()
                     observeCamera()
                 } else {
-                    videoCapture = VideoCapture.withOutput(buildRecorder())
+                    videoCapture = ListingVideoProfile.buildCapture(currentRotation)
                     isVideoReady = false
                     firstFrameConfirmed = false
                     camera = provider.bindToLifecycle(
                         lifecycleOwner, selectorForId(targetId), preview, videoCapture
                     )
+                    ListingVideoProfile.requireSupported(camera.cameraInfo)
+                    ListingVideoProfile.requireBoundProfile(videoCapture)
                     camera.cameraControl.setZoomRatio(zoom)
                     observeCamera()
                     mainHandler.postDelayed({
-                        if (::videoCapture.isInitialized) {
+                        if (bindingRevision == videoBindingRevision && isVideoMode && ::videoCapture.isInitialized) {
                             isVideoReady = true
                             mainHandler.post { onVideoReady?.invoke() }
                         }
@@ -2017,14 +2079,18 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                             lifecycleOwner, backOrFrontSelector(), preview, imageCapture
                         )
                     } else {
-                        videoCapture = VideoCapture.withOutput(buildRecorder())
+                        videoCapture = ListingVideoProfile.buildCapture(currentRotation)
                         isVideoReady = false
                         camera = provider.bindToLifecycle(
                             lifecycleOwner, backOrFrontSelector(), preview, videoCapture
                         )
+                        ListingVideoProfile.requireSupported(camera.cameraInfo)
+                        ListingVideoProfile.requireBoundProfile(videoCapture)
                         mainHandler.postDelayed({
-                            isVideoReady = true
-                            onVideoReady?.invoke()
+                            if (bindingRevision == videoBindingRevision && isVideoMode) {
+                                isVideoReady = true
+                                onVideoReady?.invoke()
+                            }
                         }, SURFACE_WARMUP)
                     }
                     currentLensLabel = "Wide"
@@ -2033,6 +2099,10 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                     observeCamera()
                 } catch (ex: Exception) {
                     Log.e(TAG, "Fallback also failed: ${ex.message}")
+                    if (!isPhotoMode) {
+                        isVideoReady = false
+                        mainHandler.post { onRecordingError?.invoke(ListingVideoProfile.UNSUPPORTED_MESSAGE) }
+                    }
                 }
             }
         }
@@ -2174,7 +2244,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                     arrayOf(sensorRect)
                 )
 
-            ManualControls.applyToBuilder(builder, manualConfig)
+            ManualControls.applyToBuilder(builder, effectiveManualConfig())
             c2.captureRequestOptions = builder.build()
 
             activeCropRect = normalizedRect
@@ -2209,7 +2279,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
                     arrayOf<android.hardware.camera2.params.MeteringRectangle>()
                 )
 
-            ManualControls.applyToBuilder(builder, manualConfig)
+            ManualControls.applyToBuilder(builder, effectiveManualConfig())
             c2.captureRequestOptions = builder.build()
             activeCropRect = null
         } catch (e: Exception) {
@@ -2263,7 +2333,7 @@ class CameraViewEngine(private val context: Context, private val lifecycleOwner:
         manualConfig = result.safeConfig
 
         if (::camera.isInitialized) {
-            ManualControls.applyDirect(camera, manualConfig)
+            ManualControls.applyDirect(camera, effectiveManualConfig())
             applyWBDirect(wb)   // ← single clean call using awbMode from enum
             Log.d(
                 TAG, "applyProSettingsBatch: iso=$iso shutter=$shutterNs " +

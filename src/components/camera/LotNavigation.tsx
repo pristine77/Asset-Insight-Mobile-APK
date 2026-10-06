@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Vibration } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { MixedLot, getModeLabel } from './types';
@@ -10,6 +10,8 @@ interface LotNavigationProps {
   onNextLot: () => void;
   isLandscape?: boolean;
   compact?: boolean;
+  lockedStructure?: boolean;
+  sourceLabels?: string[];
 }
 
 export const LotNavigation: React.FC<LotNavigationProps> = ({
@@ -19,7 +21,14 @@ export const LotNavigation: React.FC<LotNavigationProps> = ({
   onNextLot,
   isLandscape = false,
   compact = false,
+  lockedStructure = false,
+  sourceLabels,
 }) => {
+  const policyRef = useRef({ lockedStructure, activeLotIdx, count: lots.length });
+  useEffect(() => {
+    policyRef.current = { lockedStructure, activeLotIdx, count: lots.length };
+  }, [lockedStructure, activeLotIdx, lots.length]);
+  const nextDisabled = lockedStructure && (activeLotIdx < 0 || activeLotIdx >= lots.length - 1);
   const currentLot = lots[activeLotIdx];
   const mainCount = currentLot?.files?.length ?? 0;
   const extraCount = currentLot?.extraFiles?.length ?? 0;
@@ -30,13 +39,15 @@ export const LotNavigation: React.FC<LotNavigationProps> = ({
   );
 
   const handlePrev = () => {
-    if (activeLotIdx > 0) {
+    if (policyRef.current.activeLotIdx > 0) {
       Vibration.vibrate(30);
       onPrevLot();
     }
   };
 
   const handleNext = () => {
+    const policy = policyRef.current;
+    if (policy.lockedStructure && (policy.activeLotIdx < 0 || policy.activeLotIdx >= policy.count - 1)) return;
     Vibration.vibrate(30);
     onNextLot();
   };
@@ -50,11 +61,15 @@ export const LotNavigation: React.FC<LotNavigationProps> = ({
       ]}>
       <View style={[styles.navRow, compact && styles.navRowCompact]}>
         <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="Previous lot"
+          accessibilityState={{ disabled: activeLotIdx <= 0 }}
           onPress={handlePrev}
           disabled={activeLotIdx <= 0}
           style={[
             styles.navBtn,
             compact && styles.navBtnCompact,
+            lockedStructure && styles.lockedNavBtn,
             activeLotIdx <= 0 && styles.navBtnDisabled,
           ]}>
           <Feather name="chevron-left" size={compact ? 20 : 22} color="#fff" />
@@ -62,14 +77,20 @@ export const LotNavigation: React.FC<LotNavigationProps> = ({
 
         <View style={[styles.lotInfo, compact && styles.lotInfoCompact]}>
           <Text style={[styles.lotBadge, compact && styles.lotBadgeCompact]}>
-            Lot {activeLotIdx + 1}
+            {sourceLabels?.[activeLotIdx] || `Lot ${activeLotIdx + 1}`}
           </Text>
           <Text style={[styles.modeText, compact && styles.modeTextCompact]}>
             {getModeLabel(currentLot?.mode)}
           </Text>
         </View>
 
-        <TouchableOpacity onPress={handleNext} style={[styles.navBtn, compact && styles.navBtnCompact]}>
+        <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="Next lot"
+          accessibilityState={{ disabled: nextDisabled }}
+          disabled={nextDisabled}
+          onPress={handleNext}
+          style={[styles.navBtn, compact && styles.navBtnCompact, lockedStructure && styles.lockedNavBtn, nextDisabled && styles.navBtnDisabled]}>
           <Feather name="chevron-right" size={compact ? 20 : 22} color="#fff" />
         </TouchableOpacity>
       </View>
@@ -78,6 +99,11 @@ export const LotNavigation: React.FC<LotNavigationProps> = ({
         Main: {mainCount} | Extra: {extraCount} | Total: {totalImages}
         {hasVideo && ' | 🎥'}
       </Text>
+      {lockedStructure ? (
+        <Text style={styles.lockedHint}>
+          {currentLot ? 'Fixed imported lots; capture mode is locked.' : 'No fixed lots available. Return to the imported form.'}
+        </Text>
+      ) : null}
     </View>
   );
 };
@@ -113,6 +139,20 @@ const styles = StyleSheet.create({
   },
   navBtnDisabled: {
     opacity: 0.4,
+  },
+  lockedNavBtn: {
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  lockedHint: {
+    color: '#fff',
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 4,
+    paddingHorizontal: 4,
   },
   lotInfo: {
     alignItems: 'center',

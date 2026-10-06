@@ -55,8 +55,8 @@ object LotJsonSerializer {
         val displayUri = f.displayUri ?: if (f.uri != importUri) f.uri else null
 
         val extension = when {
-            importUri.endsWith(".webp", ignoreCase = true) -> "webp"
-            importUri.endsWith(".avif", ignoreCase = true) -> "avif"
+            f.type == "image/webp" || importUri.endsWith(".webp", ignoreCase = true) -> "webp"
+            f.type == "image/avif" || importUri.endsWith(".avif", ignoreCase = true) -> "avif"
             else -> "jpg"
         }
         val mimeType = when (extension) {
@@ -68,6 +68,9 @@ object LotJsonSerializer {
         val humanName = "lot-$lotNumber-$modeShort$extraPart-$fileIndex.$extension"
 
         return JSONObject().apply {
+            put("mediaId", f.mediaId)
+            f.captureOrigin?.let { put("captureOrigin", it) }
+            put("ownership", if (importUri.startsWith("content://media/")) "gallery" else "camera")
             put("uri",        importUri)
             put("name",       humanName)
             put("type",       mimeType)

@@ -6,12 +6,42 @@ import android.util.Log
 import expo.modules.auctioncamera.ui.camera.AppGson
 import com.google.gson.reflect.TypeToken
 import java.io.File
+import expo.modules.auctioncamera.CaptureJournal
 
 class LotRepository private constructor(private val context: Context) {
 
     private val completedLots = mutableListOf<LotPayload>()
     private var activeBuilder: LotBuilder? = null
     private var activeLotNumberForSession: Int = 1
+    private var captureIdentity: org.json.JSONObject? = null
+    // Written on the journal thread, read on the main thread.
+    @Volatile private var journalFailure: Exception? = null
+    /** Journal writes queued on ioExecutor and not yet finished. */
+    private val pendingJournalWrites = java.util.concurrent.atomic.AtomicInteger(0)
+
+    fun configureCapture(payload: String?) {
+        val requested = try { org.json.JSONObject(payload ?: "{}").optJSONObject("captureContext") } catch (_: Exception) { null }
+        // Never inherit the singleton's photos from a different owner/form.
+        completedLots.clear()
+        activeBuilder = null
+        journalFailure = null
+        captureIdentity = requested?.let {
+            require(it.optString("ownerId").isNotBlank() && it.optString("draftId").isNotBlank() && it.optString("sessionId").isNotBlank())
+            val pending = CaptureJournal.read(context, it.getString("ownerId"), it.getString("draftId"))
+            pending ?: it
+        }
+    }
+
+    fun hasPendingJournal(): Boolean = captureIdentity?.let {
+        CaptureJournal.read(context, it.getString("ownerId"), it.getString("draftId")) != null
+    } ?: false
+
+    fun exportCapture(): String {
+        val identity = captureIdentity ?: return LotJsonSerializer.serialize(getAllLots())
+        saveSessionWithActiveSync(activeLotNumberForSession)
+        journalFailure?.let { throw it }
+        return CaptureJournal.read(context, identity.getString("ownerId"), identity.getString("draftId"))!!.toString()
+    }
 
     private val ioExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
 
@@ -21,6 +51,8 @@ class LotRepository private constructor(private val context: Context) {
     companion object {
         private const val TAG          = "LotRepository"
         private const val SESSION_FILE = "lot_session.json"
+        /** How long leaving the screen or Done waits for queued journal writes. */
+        private const val JOURNAL_FLUSH_TIMEOUT_MS = 10_000L
 
         @Volatile
         private var INSTANCE: LotRepository? = null
@@ -60,8 +92,14 @@ class LotRepository private constructor(private val context: Context) {
 
     fun setVideo(uri: Uri) {
         activeBuilder?.setVideo(uri)
-        saveAsync()
+        // Written before this returns: the screen reports "video saved" straight
+        // after, and a video is rare enough that the wait does not matter.
+        saveSessionWithActiveSync(activeLotNumberForSession)
     }
+
+    /** True once every queued journal write has landed and the last one succeeded. */
+    fun isCapturePersisted(): Boolean =
+        captureIdentity != null && journalFailure == null && pendingJournalWrites.get() == 0
 
     fun removeFileFromActiveLot(uri: Uri): Boolean {
         return activeBuilder?.removeFile(uri) ?: false
@@ -202,20 +240,89 @@ class LotRepository private constructor(private val context: Context) {
 
     fun toJson(): String = AppGson.instance.toJson(completedLots)
 
+    /*
+     * ── The journal is written off the main thread (2026-10-03) ──────────────
+     *
+     * Every photo used to write the recovery journal on the thread that filed it,
+     * which is the main thread. A write reads the journal back, works out what
+     * changed since the last one, and rewrites the whole session, so each shot
+     * cost more as the session grew — the camera slowed down over a long session.
+     *
+     * The state is snapshotted on the calling thread (the builder is mutable;
+     * the payloads it builds are not) and written on ioExecutor, a single thread,
+     * so writes land in the order they were queued. The two places that must
+     * know the journal is on disk before going on — leaving the screen and Done
+     * (exportCapture) — flush through saveSessionWithActiveSync, which queues a
+     * write behind the pending ones and waits for it.
+     */
     private fun saveAsync() {
-        val json = buildSessionJson(activeLotNumberForSession)
+        val identity = captureIdentity
+        if (identity == null) {
+            val json = buildSessionJson(activeLotNumberForSession)
+            ioExecutor.execute {
+                try {
+                    cacheFile.writeText(json)
+                    Log.d(TAG, "Session saved — ${completedLots.size} lots, ${cacheFile.length() / 1024}KB")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Session save failed: ${e.message}")
+                }
+            }
+            return
+        }
+        val snapshot = snapshotForJournal()
+        pendingJournalWrites.incrementAndGet()
         ioExecutor.execute {
-            try {
-                cacheFile.writeText(json)
-                Log.d(TAG, "Session saved — ${completedLots.size} lots, ${cacheFile.length() / 1024}KB")
-            } catch (e: Exception) {
-                Log.e(TAG, "Session save failed: ${e.message}")
+            try { writeJournal(identity, snapshot) } finally { pendingJournalWrites.decrementAndGet() }
+        }
+    }
+
+    /** The session as it is now, safe to hand to another thread. */
+    private data class JournalSnapshot(val activeLotNumber: Int, val lots: List<LotPayload>, val active: LotPayload?)
+
+    private fun snapshotForJournal(): JournalSnapshot {
+        val active = activeBuilder?.build()?.copy(lotNumber = activeLotNumberForSession)
+        return JournalSnapshot(activeLotNumberForSession, completedLots.toList(), active)
+    }
+
+    private fun writeJournal(identity: org.json.JSONObject, snapshot: JournalSnapshot) {
+        val current = snapshot.lots.toMutableList()
+        snapshot.active?.let { active ->
+            val index = current.indexOfFirst { it.id == active.id }
+            if (index >= 0) current[index] = active else current.add(active)
+        }
+        try {
+            CaptureJournal.save(context, identity, org.json.JSONObject(buildSessionJson(snapshot.activeLotNumber, snapshot.lots, snapshot.active)),
+                org.json.JSONArray(LotJsonSerializer.serialize(current)))
+            journalFailure = null
+        } catch (error: Exception) {
+            journalFailure = error
+            Log.e(TAG, "Camera draft metadata could not be saved", error)
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                android.widget.Toast.makeText(context, "Draft could not be saved. Keep the camera open, free storage, then tap Done again.", android.widget.Toast.LENGTH_LONG).show()
             }
         }
     }
 
+    /** Write the session now and return once it is on disk (or has failed). */
     fun saveSessionWithActiveSync(lotNumber: Int) {
         activeLotNumberForSession = lotNumber.coerceAtLeast(1)
+        captureIdentity?.let { identity ->
+            val snapshot = snapshotForJournal()
+            pendingJournalWrites.incrementAndGet()
+            val write = ioExecutor.submit {
+                try { writeJournal(identity, snapshot) } finally { pendingJournalWrites.decrementAndGet() }
+            }
+            try {
+                write.get(JOURNAL_FLUSH_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } catch (timeout: java.util.concurrent.TimeoutException) {
+                // Still writing: not persisted as far as this caller can tell.
+                journalFailure = java.util.concurrent.TimeoutException("The draft is still being saved. Wait a moment, then try again.")
+                Log.e(TAG, "Camera draft metadata flush timed out")
+            } catch (error: Exception) {
+                Log.e(TAG, "Camera draft metadata flush failed: ${error.message}")
+            }
+            return
+        }
         try {
             cacheFile.writeText(buildSessionJson(activeLotNumberForSession))
             Log.d(TAG, "Session saved sync: lots=${completedLots.size}, active=${activeBuilder != null}, kb=${cacheFile.length() / 1024}")
@@ -224,22 +331,26 @@ class LotRepository private constructor(private val context: Context) {
         }
     }
 
-    private fun buildSessionJson(activeLotNumber: Int): String {
+    private fun buildSessionJson(activeLotNumber: Int): String =
+        buildSessionJson(activeLotNumber, completedLots, activeBuilder?.build()?.copy(lotNumber = activeLotNumber.coerceAtLeast(1)))
+
+    /** The session file's shape, from a snapshot so it can be built on any thread. */
+    private fun buildSessionJson(activeLotNumber: Int, lots: List<LotPayload>, active: LotPayload?): String {
         val root = org.json.JSONObject()
         root.put("version", 2)
         root.put("activeLotNumber", activeLotNumber.coerceAtLeast(1))
-        root.put("completedLots", org.json.JSONArray(AppGson.instance.toJson(completedLots)))
-        activeBuilder?.build()?.copy(lotNumber = activeLotNumber.coerceAtLeast(1))?.let { activeLot ->
-            root.put("activeLot", org.json.JSONObject(AppGson.instance.toJson(activeLot)))
-        }
+        root.put("completedLots", org.json.JSONArray(AppGson.instance.toJson(lots)))
+        active?.let { root.put("activeLot", org.json.JSONObject(AppGson.instance.toJson(it))) }
         return root.toString()
     }
 
     fun restoreSessionFromCache(): Int? {
-        if (!cacheFile.exists()) return null
+        if (captureIdentity == null && !cacheFile.exists()) return null
 
         return try {
-            val raw = cacheFile.readText()
+            val identity = captureIdentity
+            val raw = if (identity != null) CaptureJournal.read(context, identity.getString("ownerId"), identity.getString("draftId"))
+                ?.getJSONObject("session")?.toString() ?: return null else cacheFile.readText()
             if (raw.isBlank()) return null
 
             val typeList = object : TypeToken<List<LotPayload>>() {}.type
@@ -287,6 +398,11 @@ class LotRepository private constructor(private val context: Context) {
     fun clearLotsOnly() {
         completedLots.clear()
         activeBuilder = null
+        if (captureIdentity != null) {
+            // JS acknowledges only after its SQLite draft transaction has committed.
+            captureIdentity = null
+            return
+        }
         try {
             if (cacheFile.exists()) cacheFile.delete()
         } catch (e: Exception) {

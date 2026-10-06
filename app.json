@@ -2,7 +2,7 @@
   "expo": {
     "name": "Asset Insight",
     "slug": "assetinsight",
-    "version": "1.0.0",
+    "version": "1.0.2",
     "scheme": "exp+clearvalue",
     "web": {
       "favicon": "./assets/favicon.png"
@@ -57,7 +57,9 @@
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
-    "assetBundlePatterns": ["**/*"],
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "ios": {
       "supportsTablet": true,
       "usesAppleSignIn": true,
@@ -73,13 +75,16 @@
       "bundleIdentifier": "com.assetinsight.app"
     },
     "android": {
-      "versionCode": 2,
+      "versionCode": 4,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
       "package": "com.assetinsight.app",
       "googleServicesFile": "./google-services.json",
+      "blockedPermissions": [
+        "android.permission.REQUEST_INSTALL_PACKAGES"
+      ],
       "permissions": [
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO",
@@ -91,13 +96,12 @@
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.READ_MEDIA_VIDEO",
-        "android.permission.READ_MEDIA_AUDIO",
-        "android.permission.REQUEST_INSTALL_PACKAGES"
+        "android.permission.READ_MEDIA_AUDIO"
       ]
     },
     "extra": {
       "eas": {
-        "projectId": "a7311e2d-0984-4903-a934-db0fa7a4b58c"
+        "projectId": "f85661e5-8dd2-4a00-94ca-7322e42ec5e1"
       }
     }
   }

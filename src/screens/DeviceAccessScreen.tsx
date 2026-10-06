@@ -23,6 +23,8 @@ import {
 } from "../services/deviceMetadataService";
 
 const BACKGROUND = require("../../assets/device-access-equipment-yard-v2.png");
+/** How often a waiting phone asks whether it has been approved (one light status read). */
+export const APPROVAL_CHECK_INTERVAL_MS = 5_000;
 
 const COLORS = {
   accent: "#E31B23",
@@ -158,10 +160,18 @@ export default function DeviceAccessScreen() {
     void buildNativeDeviceContext().then(setContext).catch(() => undefined);
   }, []);
 
+  // While this phone waits for approval, check straight away, again whenever
+  // the app comes back to the front, and then every few seconds. An approval
+  // found by any check signs in and opens the app (AuthContext
+  // refreshDeviceStatus -> exchangeApproval), so nobody has to tap "Check
+  // status" or sign in again (owner request 2026-10-03: "once permitted, it
+  // should just auto load"). Keyed on the waiting flag, not the deviceAccess
+  // object: each check stores a fresh object, which must not trigger another
+  // immediate check.
+  const waitingForApproval =
+    !!deviceAccess && ["pending", "rerequest_pending"].includes(deviceAccess.authState);
   useEffect(() => {
-    if (!deviceAccess || !["pending", "rerequest_pending"].includes(deviceAccess.authState)) {
-      return;
-    }
+    if (!waitingForApproval) return;
 
     let mounted = true;
     const poll = async () => {
@@ -175,12 +185,17 @@ export default function DeviceAccessScreen() {
         }
       }
     };
-    const interval = setInterval(poll, 10_000);
+    void poll();
+    const interval = setInterval(poll, APPROVAL_CHECK_INTERVAL_MS);
+    const foreground = AppState.addEventListener("change", (next) => {
+      if (next === "active") void poll();
+    });
     return () => {
       mounted = false;
       clearInterval(interval);
+      foreground.remove();
     };
-  }, [deviceAccess, refreshDeviceStatus]);
+  }, [waitingForApproval, refreshDeviceStatus]);
 
   const state = deviceAccess?.authState || "registration_required";
   const pending = state === "pending" || state === "rerequest_pending";
@@ -458,7 +473,7 @@ export default function DeviceAccessScreen() {
                     ? "Re-requests are limited to 5 per day."
                     : blocked
                       ? "This exact IP is blocked only for your account."
-                      : "We’ll check automatically every 10 seconds."}
+                      : "We check every few seconds and open the app as soon as this phone is approved."}
               </Text>
             </View>
           </View>

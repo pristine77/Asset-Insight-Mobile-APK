@@ -435,11 +435,20 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     // Photo / video captured
     // ─────────────────────────────────────────────────────────────────────────
 
-    fun onPhotoCaptured(uri: Uri, focusBox: FocusBox? = null) {
+    fun onPhotoCaptured(
+        uri: Uri,
+        focusBox: FocusBox? = null,
+        ticketMode: CaptureMode? = null,
+        ticketExtra: Boolean? = null,
+    ) {
         _lastCapturedUri.value = uri
-        val isExtra = pendingIsExtra
+        // What this shot asked for travels with it (CaptureTicket). The pending
+        // fields are the fallback for callers without one: with the shutter free
+        // during processing, a second tap would have overwritten them before the
+        // first photo was filed (2026-10-03).
+        val isExtra = ticketExtra ?: pendingIsExtra
         val viewingNum = viewingCompletedLotIndex
-        val requestedMode = pendingCaptureMode ?: _captureMode.value ?: CaptureMode.PHOTO
+        val requestedMode = ticketMode ?: pendingCaptureMode ?: _captureMode.value ?: CaptureMode.PHOTO
 
         pendingIsExtra = false
         pendingCaptureMode = null

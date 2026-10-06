@@ -4,10 +4,9 @@ import {
   Text,
   StyleSheet,
   ScrollView,
-  TextInput,
   TouchableOpacity,
   Modal,
-  Dimensions,
+  useWindowDimensions,
   Alert,
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -15,7 +14,24 @@ import {
   Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import TextInput from './ListingTextInput';
 import { Feather } from '@expo/vector-icons';
+import { randomUUID } from 'expo-crypto';
+import OfflineCapturePanel from './OfflineCapturePanel';
+import useDeviceDraftSave from './useDeviceDraftSave';
+import DraftStorageStatus from './DraftStorageStatus';
+import OfflineCaptureStore from '../../services/offlineCaptureStore';
+import { prepareOfflineSubmission } from '../../services/offlineSubmissionService';
+import { assertReportUploadAccepted, isExistingReportUploadReceipt } from '../../services/reportUploadReceipt';
+import { showUploadManifestRecovery, uploadConflictSource } from './uploadManifestRecovery';
+import { createUploadOperation, pauseUploadOperation, type UploadOperation } from '../../services/uploadCancellation';
+import backgroundUploadManager, {
+  ALREADY_UPLOADING_MESSAGE,
+  ALREADY_UPLOADING_TITLE,
+  BACKGROUND_UPLOAD_BUSY_MESSAGE,
+} from '../../services/backgroundUploadManager';
+import { CAMERA_NOT_OPENED_TITLE, cameraOpenFailureButtons, describeCameraOpenFailure } from '../../utils/cameraOpenFailure';
+import { needsExplicitUploadResume, setDraftCaptureMode } from '../../services/offlineDraftPolicy';
 import * as Localization from 'expo-localization';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { useAuth } from '../../context/AuthContext';
@@ -24,15 +40,24 @@ import LotManager from './LotManager';
 import assetService, { AssetCreateDetails, MixedLot as ServiceMixedLot, ProgressData } from '../../services/assetService';
 import AutoSaveService, { AutoSaveData, AutoSaveFormData } from '../../services/autoSaveService';
 import OfflineQueueService from '../../services/offlineQueueService';
+import { getSubmissionError } from '../../services/connectivityService';
+import type { DirectUploadProgress } from '../../services/directR2UploadService';
 import { getPhotoUploadUri, normalizePhotoFile } from '../../utils/photoFileUtils';
+import { DEFAULT_IMAGE_WATERMARK, restoreImageWatermarkPreference } from '../../utils/watermarkPreference';
 import savedInputService from '../../services/savedInputService';
+import reportDraftService, {
+  getDuplicateLotWarning,
+} from '../../services/reportDraftService';
 import {
   getHiddenCurrentLocation,
   normalizeHiddenLocation,
   type HiddenLocationSnapshot,
 } from '../../utils/mobileLocation';
+import AuctioneerFormBoundary, { type AuctioneerFormControl } from './AuctioneerFormBoundary';
+import AuctioneerFormHeader from './AuctioneerFormHeader';
+import type { AuctioneerWorkItemSetup } from '../../services/auctioneerService';
+import { auctioneerSeedLots, auctioneerLotSource, hasValidAuctioneerLotStructure } from './auctioneerFormPolicy';
 
-const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 const MAX_ASSET_LOT_PHOTOS = 200;
 
 // Currency codes by region/locale
@@ -71,9 +96,19 @@ export interface SavedInputData {
 interface AssetFormSheetProps {
   visible: boolean;
   onClose: () => void;
+  onSuccess?: () => void;
   savedInputData?: SavedInputData | null;
   draftIdToLoad?: string | null;
   onDraftLoaded?: () => void;
+  auctioneer?: AuctioneerWorkItemSetup;
+  onAuctioneerSetupChange?: (setup: AuctioneerWorkItemSetup) => void;
+  auctioneerControl?: AuctioneerFormControl;
+  /**
+   * Hand an ordinary Submit to the background upload line and close the form
+   * (services/backgroundUploadManager.ts). Off by default: only the Dashboard
+   * turns it on, so every other caller keeps the foreground upload.
+   */
+  backgroundUploads?: boolean;
 }
 
 // Calendar-only fields must use the device calendar date, not UTC. Using
@@ -84,32 +119,39 @@ const isoDate = (d: Date) =>
 const AssetFormSheet = ({
   visible,
   onClose,
+  onSuccess,
   savedInputData,
   draftIdToLoad,
   onDraftLoaded,
+  auctioneerControl,
+  backgroundUploads = false,
 }: AssetFormSheetProps) => {
+  const auctioneer = auctioneerControl?.setup;
   const { user } = useAuth();
+  const { width, fontScale } = useWindowDimensions();
+  const compactFields = width < 480 || fontScale > 1.3;
 
   // Form fields
-  const [clientName, setClientName] = useState('');
-  const [effectiveDate, setEffectiveDate] = useState(isoDate(new Date()));
-  const [appraisalPurpose, setAppraisalPurpose] = useState('');
-  const [ownerName, setOwnerName] = useState('');
+  const [clientName, setClientName] = useState(auctioneer?.contract.customerName || '');
+  const [effectiveDate, setEffectiveDate] = useState(auctioneer?.contract.eventDate?.slice(0, 10) || isoDate(new Date()));
+  const [appraisalPurpose, setAppraisalPurpose] = useState(auctioneer ? 'Auction listing and condition report' : '');
+  const [ownerName, setOwnerName] = useState(auctioneer?.contract.customerName || '');
   const [appraiser, setAppraiser] = useState((user as any)?.username || '');
   const [appraisalCompany, setAppraisalCompany] = useState((user as any)?.companyName || '');
-  const [industry, setIndustry] = useState('');
+  const [industry, setIndustry] = useState(auctioneer?.contract.categories || '');
   const [inspectionDate, setInspectionDate] = useState(isoDate(new Date()));
-  const [contractNo, setContractNo] = useState('');
+  const [contractNo, setContractNo] = useState(auctioneer?.contract.contractNo || '');
   const [language, setLanguage] = useState<'en' | 'fr' | 'es'>('en');
-  const [currency, setCurrency] = useState('');
+  const [currency, setCurrency] = useState(auctioneer ? 'CAD' : '');
   const [currencyLoading, setCurrencyLoading] = useState(false);
-  const [preparedFor, setPreparedFor] = useState('');
+  const [preparedFor, setPreparedFor] = useState(auctioneer?.contract.customerName || '');
   const [factorsAgeCondition, setFactorsAgeCondition] = useState('');
   const [factorsQuality, setFactorsQuality] = useState('');
   const [factorsAnalysis, setFactorsAnalysis] = useState('');
   const [includeDamageAnalysis, setIncludeDamageAnalysis] = useState(true);
   const [bankPhotosEnabled, setBankPhotosEnabled] = useState(false);
-  const [hiddenLocation, setHiddenLocation] = useState<HiddenLocationSnapshot | null>(null);
+  const [watermarkImages, setWatermarkImages] = useState(DEFAULT_IMAGE_WATERMARK);
+  const [hiddenLocation, setHiddenLocation] = useState<HiddenLocationSnapshot | null>(auctioneer ? normalizeHiddenLocation(auctioneer.contract.location) : null);
 
   // Valuation methods
   const [includeValuationTable, setIncludeValuationTable] = useState(false);
@@ -118,7 +160,13 @@ const AssetFormSheet = ({
   >(['FML']);
 
   // Lots state
-  const [lots, setLots] = useState<MixedLot[]>([]);
+  const [lots, setLotsRaw] = useState<MixedLot[]>(() => auctioneer ? auctioneerSeedLots(auctioneer) : []);
+  const setLots = useCallback<React.Dispatch<React.SetStateAction<MixedLot[]>>>((update) => {
+    setLotsRaw((previous) => {
+      const next = typeof update === 'function' ? update(previous) : update;
+      return hasValidAuctioneerLotStructure(auctioneer, next) ? next : previous;
+    });
+  }, [auctioneer]);
   const [activeStep, setActiveStep] = useState<'details' | 'images'>('details');
 
   // Camera state
@@ -128,8 +176,13 @@ const AssetFormSheet = ({
 
   // Submission state
   const [submitting, setSubmitting] = useState(false);
+  const [pausingUpload, setPausingUpload] = useState(false);
+  const pauseRequestedRef = useRef(false);
+  const uploadAcceptedRef = useRef(false);
+  const [savingDraftPreview, setSavingDraftPreview] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStatus, setUploadStatus] = useState<DirectUploadProgress | null>(null);
   const [progressPhase, setProgressPhase] = useState<
     'idle' | 'uploading' | 'processing' | 'done' | 'error'
   >('idle');
@@ -144,9 +197,48 @@ const AssetFormSheet = ({
     totalLots?: number;
   } | null>(null);
   const [currentDraftId, setCurrentDraftId] = useState<string | null>(null);
-  const submissionIdRef = useRef<string | null>(null);
+  const draftIdentityRef = useRef(randomUUID());
+  const [captureMode, setCaptureMode] = useState<'online' | 'offline'>('online');
+  const [manualSubmissionRequired, setManualSubmissionRequired] = useState(false);
+  const [reviewingSavedDraft, setReviewingSavedDraft] = useState(false);
+  const [draftLoadError, setDraftLoadError] = useState<string>();
+  const [draftLoadAttempt, setDraftLoadAttempt] = useState(0);
+  const reviewEventRef = useRef(randomUUID());
+  const saveOnly = captureMode === 'offline' && !reviewingSavedDraft;
+  const [localSavedAt, setLocalSavedAt] = useState<string>();
+  const [localSaveError, setLocalSaveError] = useState<string>();
+  const [uploadPaused, setUploadPaused] = useState(false);
+  const changeCaptureMode = (mode: 'online' | 'offline') => {
+    setDraftCaptureMode(currentDraftId || draftIdentityRef.current, mode);
+    if (mode === 'offline') setManualSubmissionRequired(true);
+    setCaptureMode(mode);
+  };
+  const submissionIdRef = useRef<string | null>(auctioneer?.clientSubmissionId || null);
+  const supersedesSubmissionIdRef = useRef<string | undefined>(undefined);
+  const recoveryScopeRef = useRef(0);
+  useEffect(() => {
+    recoveryScopeRef.current += 1;
+    return () => { recoveryScopeRef.current += 1; };
+  }, [visible, draftIdToLoad, auctioneer?.workItemId]);
+  const submissionLockRef = useRef(false);
+  // The operation of the upload this form is running, so Pause stops only it.
+  const activeOperationRef = useRef<UploadOperation | null>(null);
+  const handlePauseUpload = () => {
+    // Finalizing is when the server accepts the report; pausing then only loses
+    // the answer. See beginUploadFinalization in uploadCancellation.ts.
+    if (!submissionLockRef.current || pauseRequestedRef.current || uploadAcceptedRef.current || uploadStatus?.stage === 'complete'
+      || uploadStatus?.stage === 'finalizing') return;
+    pauseRequestedRef.current = true;
+    setPausingUpload(true);
+    // This form's upload only: a background upload of another report keeps
+    // going (2026-10-02). A global pause (Offline mode, sign-out) still stops
+    // this operation as well.
+    pauseUploadOperation(activeOperationRef.current);
+  };
+  // Interrupted uploads always require an explicit Resume, including after reconnect.
   const autoSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const loadedDraftIdRef = useRef<string | null>(null);
+  const awaitingDraft = Boolean(draftIdToLoad && loadedDraftIdRef.current !== draftIdToLoad);
   const draftSavePromiseRef = useRef<Promise<unknown> | null>(null);
   const inspectionDateEditedRef = useRef(false);
   const savedInputHydrationRef = useRef<string | null>(null);
@@ -262,6 +354,7 @@ const AssetFormSheet = ({
         if (typeof data.formData.bankPhotosEnabled === 'boolean') {
           setBankPhotosEnabled(data.formData.bankPhotosEnabled);
         }
+        setWatermarkImages(restoreImageWatermarkPreference(data.formData.watermarkImages));
         if (typeof data.formData.includeValuationTable === 'boolean')
           setIncludeValuationTable(data.formData.includeValuationTable);
         if (
@@ -316,6 +409,7 @@ const AssetFormSheet = ({
                     type: 'video/mp4' as const,
                   }
                 : {
+                    ...savedLot.videoFiles[0],
                     uri: savedLot.videoFiles[0].uri,
                     name: savedLot.videoFiles[0].name || 'restored-video.mp4',
                     type: savedLot.videoFiles[0].type || 'video/mp4',
@@ -352,10 +446,16 @@ const AssetFormSheet = ({
 
   const applyStoredDraftData = useCallback(
     (data: Pick<AutoSaveData, 'formData' | 'lots' | 'activeLotIdx'>) => {
+      setCaptureMode(((data as any).captureMode || data.formData.captureMode) === 'offline' ? 'offline' : 'online');
+      setManualSubmissionRequired(Boolean((data as any).manualSubmissionRequired || data.formData.manualSubmissionRequired || (data as any).captureMode === 'offline' || data.formData.captureMode === 'offline'));
+      setUploadPaused(needsExplicitUploadResume((data as any).submissionState));
+      if ((data as any).id) draftIdentityRef.current = (data as any).id;
+      setLocalSavedAt((data as any).updatedAt);
       if (data.formData.clientName) setClientName(data.formData.clientName);
       if (data.formData.clientSubmissionId) {
         submissionIdRef.current = data.formData.clientSubmissionId;
       }
+      supersedesSubmissionIdRef.current = data.formData.supersedesClientSubmissionId;
       if (data.formData.effectiveDate) setEffectiveDate(data.formData.effectiveDate);
       if (data.formData.appraisalPurpose) setAppraisalPurpose(data.formData.appraisalPurpose);
       if (data.formData.ownerName) setOwnerName(data.formData.ownerName);
@@ -387,9 +487,11 @@ const AssetFormSheet = ({
       if (typeof data.formData.includeDamageAnalysis === 'boolean') {
         setIncludeDamageAnalysis(data.formData.includeDamageAnalysis);
       }
+      setEnhanceImages(data.formData.enhanceImages === true);
       if (typeof data.formData.bankPhotosEnabled === 'boolean') {
         setBankPhotosEnabled(data.formData.bankPhotosEnabled);
       }
+      setWatermarkImages(restoreImageWatermarkPreference(data.formData.watermarkImages));
       if (typeof data.formData.includeValuationTable === 'boolean')
         setIncludeValuationTable(data.formData.includeValuationTable);
       if (
@@ -401,6 +503,8 @@ const AssetFormSheet = ({
 
       const restoredLots: MixedLot[] = data.lots.map((savedLot) => ({
         id: savedLot.id,
+        lotNumber: savedLot.lotNumber,
+        title: savedLot.title,
         mode: savedLot.mode,
         files: savedLot.mainImages.map((file, i) =>
           normalizePhotoFile(
@@ -443,6 +547,7 @@ const AssetFormSheet = ({
                   type: 'video/mp4' as const,
                 }
               : {
+                  ...savedLot.videoFiles[0],
                   uri: savedLot.videoFiles[0].uri,
                   name: savedLot.videoFiles[0].name || 'restored-video.mp4',
                   type: savedLot.videoFiles[0].type || 'video/mp4',
@@ -451,13 +556,11 @@ const AssetFormSheet = ({
         coverIndex: savedLot.coverIndex,
       }));
 
-      if (restoredLots.length > 0) {
-        setLots(restoredLots);
-        setActiveLotIdx(data.activeLotIdx >= 0 ? data.activeLotIdx : 0);
-        setActiveStep('images');
-      }
+      setLots(restoredLots);
+      setActiveLotIdx(Math.max(0, Math.min(data.activeLotIdx || 0, restoredLots.length - 1)));
+      setActiveStep(restoredLots.length ? 'images' : 'details');
     },
-    []
+    [setLots]
   );
 
   useEffect(() => {
@@ -465,16 +568,31 @@ const AssetFormSheet = ({
 
     let cancelled = false;
     const loadDraft = async () => {
+      const owner = OfflineCaptureStore.getOwnerId();
+      setDraftLoadError(undefined);
       try {
+        // A draft queued or uploading in the background is not opened here:
+        // edits would change photos and identity under an upload on its way.
+        if (backgroundUploadManager.isBusy(draftIdToLoad)) throw new Error(BACKGROUND_UPLOAD_BUSY_MESSAGE);
+        // A paused or needs-attention background upload belongs to this form now.
+        backgroundUploadManager.forget(draftIdToLoad);
         const draft = await AutoSaveService.getDraft(draftIdToLoad);
-        if (cancelled || !draft || draft.type !== 'asset') return;
+        if (cancelled) return;
+        if (!owner || owner !== OfflineCaptureStore.getOwnerId()) throw new Error('The account changed. Reopen this draft from its owner account.');
+        if (!draft || draft.type !== 'asset') throw new Error('This saved draft is unavailable. No new report has been created.');
+        const offlineReview = Boolean(draft.captureMode === 'offline' || draft.manualSubmissionRequired || draft.formData.captureMode === 'offline' || draft.formData.manualSubmissionRequired);
+        if (offlineReview) {
+          await OfflineCaptureStore.recordDraftOpened(draft.id, reviewEventRef.current);
+          if (cancelled) return;
+          if (owner !== OfflineCaptureStore.getOwnerId()) throw new Error('The account changed. Reopen this draft from its owner account.');
+        }
         applyStoredDraftData(draft);
         setCurrentDraftId(draft.id);
         loadedDraftIdRef.current = draft.id;
+        setReviewingSavedDraft(offlineReview);
         onDraftLoaded?.();
       } catch (error) {
-        console.error('Error loading offline draft:', error);
-        Alert.alert('Error', 'Failed to open offline draft.');
+        if (!cancelled) setDraftLoadError(error instanceof Error ? error.message : 'Failed to open offline draft. Try again.');
       }
     };
 
@@ -482,13 +600,18 @@ const AssetFormSheet = ({
     return () => {
       cancelled = true;
     };
-  }, [applyStoredDraftData, draftIdToLoad, onDraftLoaded, visible]);
+  }, [applyStoredDraftData, draftIdToLoad, onDraftLoaded, visible, draftLoadAttempt]);
 
   const buildAutoSaveFormData = useCallback(
     (): AutoSaveFormData => ({
+      captureMode,
+      manualSubmissionRequired,
+      auctioneerSnapshot: auctioneer ? { ...auctioneer } : undefined,
+      auctioneerWorkItemId: auctioneer?.workItemId,
       clientSubmissionId:
         submissionIdRef.current ||
         (submissionIdRef.current = `cv-mobile-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`),
+      supersedesClientSubmissionId: supersedesSubmissionIdRef.current,
       clientName,
       effectiveDate,
       appraisalPurpose,
@@ -508,7 +631,9 @@ const AssetFormSheet = ({
       factorsQuality,
       factorsAnalysis,
       includeDamageAnalysis,
+      enhanceImages,
       bankPhotosEnabled,
+      watermarkImages,
       includeValuationTable,
       selectedValuationMethods,
     }),
@@ -529,34 +654,41 @@ const AssetFormSheet = ({
       factorsQuality,
       factorsAnalysis,
       includeDamageAnalysis,
+      enhanceImages,
       bankPhotosEnabled,
+      watermarkImages,
       includeValuationTable,
       selectedValuationMethods,
       hiddenLocation,
+      auctioneer,
+      captureMode,
+      manualSubmissionRequired,
     ]
   );
 
   useEffect(() => {
-    if (!visible) return;
+    if (!visible || auctioneer) return;
 
     let cancelled = false;
     void getHiddenCurrentLocation().then((snapshot) => {
       if (cancelled) return;
       setHiddenLocation((current) =>
-        current?.latitude !== undefined && current?.longitude !== undefined ? current : snapshot
+        current?.latitude !== undefined && current?.longitude !== undefined
+          ? current
+          : { ...snapshot, location: current?.location?.trim() || snapshot.location }
       );
     });
 
     return () => {
       cancelled = true;
     };
-  }, [visible]);
+  }, [visible, auctioneer]);
 
   const hasDraftableWork = useCallback((candidateLots: MixedLot[] = lots) => {
     const hasImages = candidateLots.some((l) => l.files.length > 0 || l.extraFiles.length > 0 || l.videoFile);
     const hasLots = candidateLots.length > 0;
     const hasDetails = Boolean(
-      clientName.trim() ||
+      contractNo.trim() || clientName.trim() ||
         appraisalPurpose.trim() ||
         ownerName.trim() ||
         industry.trim() ||
@@ -568,6 +700,7 @@ const AssetFormSheet = ({
     return hasImages || hasLots || hasDetails;
   }, [
     appraisalPurpose,
+    contractNo,
     clientName,
     factorsAgeCondition,
     factorsAnalysis,
@@ -579,34 +712,48 @@ const AssetFormSheet = ({
   ]);
 
   const requireContractNumberForDraft = useCallback(() => {
-    if (contractNo.trim()) return true;
+    if (contractNo.trim() || captureMode === 'offline') return true;
     Alert.alert(
       'Contract Number Required',
-      'Enter a unique contract number before adding lots, opening the camera, or saving this offline draft.'
+      'Enter a contract number before continuing, or choose Offline to save incomplete details on this device.'
     );
     return false;
-  }, [contractNo]);
+  }, [contractNo, captureMode]);
 
   const saveCurrentDraftNow = useCallback(async (
     lotsSnapshot: MixedLot[] = lots,
-    activeLotIdxSnapshot: number = activeLotIdx
+    activeLotIdxSnapshot: number = activeLotIdx,
+    draftIdOverride?: string,
+    explicitActivitySave = false
   ) => {
-    if (!hasDraftableWork(lotsSnapshot) || !contractNo.trim()) return null;
+    if (!hasValidAuctioneerLotStructure(auctioneer, lotsSnapshot)) throw new Error('Schedule A lots cannot be added, removed, reordered or regrouped.');
+    if (captureMode !== 'offline' && (!hasDraftableWork(lotsSnapshot) || !contractNo.trim())) return null;
 
     const savePromise = AutoSaveService.saveDraft({
-      id: currentDraftId,
+      explicitActivitySave,
+      id: draftIdOverride || currentDraftId || draftIdentityRef.current,
+      captureMode,
       type: 'asset',
       title: clientName.trim() || contractNo.trim() || 'Asset Report',
       formData: buildAutoSaveFormData(),
-      lots: lotsSnapshot,
+      lots: lotsSnapshot.map((lot, index) => ({ ...lot,
+        lotNumber: lot.lotNumber || (auctioneer?.kind === 'scheduleA' ? auctioneer.lots[index]?.lotNumber : undefined),
+        title: lot.title || (auctioneer?.kind === 'scheduleA' ? auctioneer.lots[index]?.title : undefined),
+      })),
       activeLotIdx: activeLotIdxSnapshot,
     });
 
     draftSavePromiseRef.current = savePromise;
     try {
       const draft = await savePromise;
+      draftIdentityRef.current = draft.id;
+      setLocalSavedAt(draft.updatedAt);
+      setLocalSaveError(undefined);
       if (currentDraftId !== draft.id) setCurrentDraftId(draft.id);
       return draft;
+    } catch (error) {
+      setLocalSaveError(error instanceof Error ? error.message : 'Could not save. Keep this form open and retry.');
+      throw error;
     } finally {
       if (draftSavePromiseRef.current === savePromise) {
         draftSavePromiseRef.current = null;
@@ -614,12 +761,82 @@ const AssetFormSheet = ({
     }
   }, [
     activeLotIdx,
+    auctioneer,
     buildAutoSaveFormData,
     clientName,
     contractNo,
     currentDraftId,
+    captureMode,
     hasDraftableWork,
     lots,
+  ]);
+
+  const saveExplicitLocalDraft = useCallback(() => saveCurrentDraftNow(lots, activeLotIdx, undefined, true), [saveCurrentDraftNow, lots, activeLotIdx]);
+  const { saving: savingLocal, saveOnDevice, saveLock } = useDeviceDraftSave(saveExplicitLocalDraft, draftSavePromiseRef, autoSaveTimeoutRef);
+
+  const handleSaveDraftPreview = useCallback(async () => {
+    if (awaitingDraft || submitting) return;
+    if (captureMode === 'offline' || manualSubmissionRequired) {
+      try { await saveOnDevice(); } catch (error) { setLocalSaveError(error instanceof Error ? error.message : 'Save failed. Please try again.'); }
+      return;
+    }
+    if (auctioneer || savingDraftPreview || submitting) return;
+    if (!requireContractNumberForDraft()) return;
+
+    const mediaCount = lots.reduce(
+      (sum, lot) => sum + lot.files.length + lot.extraFiles.length + (lot.videoFile ? 1 : 0),
+      0
+    );
+    if (mediaCount === 0) {
+      Alert.alert('Images Required', 'Add at least one image before creating a draft preview.');
+      return;
+    }
+
+    const operation = createUploadOperation();
+    const attemptOwner = OfflineCaptureStore.getOwnerId();
+    setSavingDraftPreview(true);
+    try {
+      // Explicit preview creation verifies cloud media; normal autosave remains persistence-only.
+      const localDraft = await saveCurrentDraftNow(lots, activeLotIdx, undefined, true);
+      operation.assertActive();
+      if (!localDraft) throw new Error('The draft could not be saved.');
+      const cloudDraft = await reportDraftService.upsertFromLocalDraft(localDraft);
+      operation.assertActive();
+      const cloudDraftId = cloudDraft.id || cloudDraft._id;
+      if (!cloudDraftId) throw new Error('The cloud draft could not be identified.');
+      const duplicateWarning = getDuplicateLotWarning(cloudDraft);
+      if (duplicateWarning) {
+        Alert.alert('Duplicate Lot Detected', duplicateWarning);
+        return;
+      }
+      await reportDraftService.processPreview(cloudDraftId);
+      operation.assertActive();
+      Alert.alert(
+        'Draft Preview Started',
+        'Your draft is safe in cloud storage and is being processed. Track it in Previews > Draft Previews. You can continue editing the original draft later.'
+      );
+    } catch (error: any) {
+      if (OfflineCaptureStore.getOwnerId() !== attemptOwner) return;
+      const duplicateWarning = getDuplicateLotWarning(error);
+      Alert.alert(
+        duplicateWarning ? 'Duplicate Lot Detected' : 'Draft Preview Not Started',
+        duplicateWarning || getSubmissionError(error, 'Save Draft').message
+      );
+    } finally {
+      setSavingDraftPreview(false);
+    }
+  }, [
+    auctioneer,
+    activeLotIdx,
+    captureMode,
+    manualSubmissionRequired,
+    lots,
+    requireContractNumberForDraft,
+    saveCurrentDraftNow,
+    saveOnDevice,
+    awaitingDraft,
+    savingDraftPreview,
+    submitting,
   ]);
 
   // Auto-save form data and images
@@ -659,10 +876,11 @@ const AssetFormSheet = ({
 
   // Trigger auto-save when form fields or lots change after a contract number exists.
   useEffect(() => {
-    if (visible && contractNo.trim() && hasDraftableWork()) {
+    if (visible && !submitting && !savingLocal && !awaitingDraft && (captureMode === 'offline' || (contractNo.trim() && hasDraftableWork()))) {
       triggerAutoSave();
     }
-  }, [contractNo, hasDraftableWork, triggerAutoSave, visible]);
+    return () => { if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current); };
+  }, [contractNo, hasDraftableWork, triggerAutoSave, visible, captureMode, submitting, savingLocal, awaitingDraft]);
 
   // Cleanup timeout on unmount
   useEffect(() => {
@@ -678,6 +896,10 @@ const AssetFormSheet = ({
 
   // Save inputs to server (like web version)
   const saveInputs = async () => {
+    if (captureMode === 'offline') {
+      Alert.alert('Offline capture', 'Your inputs are saved with this local draft. Shared templates require Online mode.');
+      return;
+    }
     try {
       setSavingInputs(true);
 
@@ -713,6 +935,8 @@ const AssetFormSheet = ({
         factorsQuality,
         factorsAnalysis,
         includeDamageAnalysis,
+        bankPhotosEnabled,
+        watermarkImages,
       };
 
       await savedInputService.create({
@@ -732,18 +956,18 @@ const AssetFormSheet = ({
 
   // Auto-detect currency on mount
   useEffect(() => {
-    if (!currency && visible) {
+    if (!currency && visible && !draftIdToLoad && !loadedDraftIdRef.current) {
       detectCurrency();
     }
   }, [visible]);
 
   // Pre-fill user data
   useEffect(() => {
-    if (user && visible) {
+    if (user && visible && !draftIdToLoad && !loadedDraftIdRef.current && !savedInputData) {
       setAppraiser((user as any)?.username || '');
       setAppraisalCompany((user as any)?.companyName || '');
     }
-  }, [user, visible]);
+  }, [user, visible, draftIdToLoad, savedInputData]);
 
   // Load saved input data when provided
   useEffect(() => {
@@ -776,6 +1000,7 @@ const AssetFormSheet = ({
       if (typeof data.bankPhotosEnabled === 'boolean') {
         setBankPhotosEnabled(data.bankPhotosEnabled);
       }
+      setWatermarkImages(restoreImageWatermarkPreference(data.watermarkImages));
       if (typeof data.includeValuationTable === 'boolean')
         setIncludeValuationTable(data.includeValuationTable);
       if (
@@ -866,19 +1091,13 @@ const AssetFormSheet = ({
     });
   };
 
-  const clearCurrentDraft = async () => {
-    try {
-      if (currentDraftId) {
-        await AutoSaveService.deleteDraft(currentDraftId);
-      } else {
-        await AutoSaveService.deleteAutoSave();
-      }
-    } catch (e) {
-      console.warn('Failed to clear draft:', e);
-    }
-  };
-
-  const handleSubmit = async (options: { forceNew?: boolean } = {}) => {
+  const handleSubmit = async (options: { forceNew?: boolean; nextLot?: boolean; replaceSubmissionId?: string; replacementSourceId?: string; newSubmissionFromId?: string } = {}) => {
+    if (submissionLockRef.current || saveLock.current || awaitingDraft || submitting || auctioneerControl?.accepted) return;
+    if (options.nextLot && captureMode === 'offline') return;
+    if (saveOnly) { await handleSaveOfflineAndClose(); return; }
+    if (auctioneer && (options.forceNew || !hasValidAuctioneerLotStructure(auctioneer, lots))) return;
+    if (options.replaceSubmissionId && (auctioneer || submissionIdRef.current !== options.replaceSubmissionId)) return;
+    if (options.newSubmissionFromId && (auctioneer || submissionIdRef.current !== options.newSubmissionFromId)) return;
     if (!validateForm()) {
       Alert.alert('Validation Error', 'Please fix the required fields');
       return;
@@ -905,16 +1124,92 @@ const AssetFormSheet = ({
       return;
     }
 
+    const submissionFileCount = lots.reduce(
+      (sum, lot) => sum + lot.files.length + lot.extraFiles.length + (lot.videoFile ? 1 : 0),
+      0
+    );
+    // Background hand-off (2026-10-02, services/backgroundUploadManager.ts):
+    // an ordinary Submit or Resume from the Dashboard is saved, checked and
+    // handed to the upload line, and the form closes. Incoming work keeps
+    // waiting here for acceptance (its next lot depends on it), and so do the
+    // explicit separate/replace choices. A draft whose
+    // last background attempt needs a decision runs here once, where the
+    // prompts can appear; this attempt uses up that mark.
+    const plannedDraftId = currentDraftId || draftIdentityRef.current;
+    // Never save over, or send a second time, a draft the line is sending.
+    if (backgroundUploadManager.isBusy(plannedDraftId)) {
+      Alert.alert(ALREADY_UPLOADING_TITLE, ALREADY_UPLOADING_MESSAGE);
+      return;
+    }
+    let background = backgroundUploads && !auctioneer && !options.nextLot && !options.forceNew
+      && !options.replaceSubmissionId && !options.newSubmissionFromId;
+    if (backgroundUploads && backgroundUploadManager.prefersForeground(plannedDraftId)) {
+      background = false;
+      backgroundUploadManager.consumeForegroundMark(plannedDraftId);
+    }
+    // The fence begins before local preparation, not only inside the transport.
+    // A closed/paused account's asynchronous handler must never start a new upload.
+    const operation = createUploadOperation();
+    activeOperationRef.current = operation;
+    const attemptOwner = OfflineCaptureStore.getOwnerId();
+    const attemptRecoveryScope = recoveryScopeRef.current;
+    submissionLockRef.current = true;
+    pauseRequestedRef.current = false;
+    uploadAcceptedRef.current = false;
+    setPausingUpload(false);
     setSubmitting(true);
     setProgressPhase('uploading');
-    setUploadProgress(0);
+    setUploadProgress(1);
+    setUploadStatus({
+      percent: 1,
+      stage: 'preparing',
+      message: `Preparing ${submissionFileCount} ${submissionFileCount === 1 ? 'file' : 'files'}...`,
+      completedFiles: 0,
+      totalFiles: submissionFileCount,
+      uploadedBytes: 0,
+      totalBytes: 0,
+    });
 
     let details: AssetCreateDetails | null = null;
     let serviceLots: ServiceMixedLot[] | null = null;
+    let attemptDraftId = currentDraftId || draftIdentityRef.current;
+    let uploadAccepted = false;
+    let draftSaved = false;
+    const previousSubmissionId = submissionIdRef.current;
+    const previousSupersedesId = supersedesSubmissionIdRef.current;
 
     try {
+      if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
+      // A deliberately separate report needs its own capture AND submission identity.
+      // Ordinary retries keep both identities, including an uncertain acceptance.
+      const separateDraftId = options.forceNew || options.newSubmissionFromId ? randomUUID() : undefined;
+      if (separateDraftId) {
+        submissionIdRef.current = randomUUID();
+        supersedesSubmissionIdRef.current = undefined;
+        setDraftCaptureMode(separateDraftId, captureMode);
+      }
+      if (options.replaceSubmissionId) {
+        // Save this exact pair before transport, including after a lost response
+        // or app restart. The server atomically refuses accepted replacements.
+        supersedesSubmissionIdRef.current = options.replacementSourceId || options.replaceSubmissionId;
+        submissionIdRef.current = randomUUID();
+      }
+      const localDraft = await saveCurrentDraftNow(lots, activeLotIdx, separateDraftId);
+      if (!localDraft) throw new Error('Save this draft before submitting.');
+      // Record the save before checking for a pause. A Pause tapped while the
+      // draft was being saved is a pause: it used to be reported as "Draft not
+      // saved -- check device storage" although the save had succeeded
+      // (2026-10-02).
+      draftSaved = true;
+      attemptDraftId = localDraft.id;
+      operation.assertActive();
+      await prepareOfflineSubmission(localDraft);
+      operation.assertActive();
+      // Persist intent before transport, so a killed process reopens as Resume.
+      await OfflineCaptureStore.setSubmissionState(localDraft.id, 'ready');
+      operation.assertActive();
+      setUploadPaused(false);
       // Generate unique job ID for progress tracking
-      if (options.forceNew) submissionIdRef.current = null;
       const newJobId =
         submissionIdRef.current ||
         `cv-mobile-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -923,9 +1218,11 @@ const AssetFormSheet = ({
       const locationSnapshot = hiddenLocation || normalizeHiddenLocation();
 
       // Build mixed_lots mapping for server
-      const mixedLotsMapping = lots.map((lot) => ({
+      const mixedLotsMapping = lots.map((lot, index) => ({
+        ...auctioneerLotSource(auctioneer, index),
         count: lot.files.length,
         extra_count: lot.extraFiles.length,
+        video_count: lot.videoFile ? 1 : 0,
         cover_index: lot.coverIndex || 0,
         mode: lot.mode || 'single_lot',
       }));
@@ -946,6 +1243,8 @@ const AssetFormSheet = ({
 
       // Build details object matching web/server format
       details = {
+        capture_id: localDraft.captureId,
+        auctioneer_work_item_id: auctioneer?.workItemId,
         // Client info
         client_name: clientName.trim(),
         owner_name: ownerName.trim() || undefined,
@@ -975,6 +1274,7 @@ const AssetFormSheet = ({
         valuation_methods: includeValuationTable ? selectedValuationMethods : undefined,
         include_damage_analysis: includeDamageAnalysis,
         bank_photos_enabled: bankPhotosEnabled,
+        watermark_images: watermarkImages,
 
         // Factors
         factors_age_condition: factorsAgeCondition.trim() || undefined,
@@ -993,6 +1293,7 @@ const AssetFormSheet = ({
         // Progress tracking
         progress_id: newJobId,
         client_submission_id: newJobId,
+        supersedes_client_submission_id: supersedesSubmissionIdRef.current,
         force_new: options.forceNew === true,
       };
 
@@ -1003,6 +1304,7 @@ const AssetFormSheet = ({
           uri: getPhotoUploadUri(f),
           name: f.name,
           type: f.type || 'image/jpeg',
+          size: f.size,
           captureOrder: f.captureOrder,
           originalOrder: f.originalOrder,
         })),
@@ -1010,6 +1312,7 @@ const AssetFormSheet = ({
           uri: getPhotoUploadUri(f),
           name: f.name,
           type: f.type || 'image/jpeg',
+          size: f.size,
           captureOrder: f.captureOrder,
           originalOrder: f.originalOrder,
         })),
@@ -1018,49 +1321,87 @@ const AssetFormSheet = ({
               uri: lot.videoFile.uri,
               name: lot.videoFile.name,
               type: lot.videoFile.type || 'video/mp4',
+              size: lot.videoFile.size,
             }
           : undefined,
         coverIndex: lot.coverIndex || 0,
         mode: lot.mode,
       }));
 
-      const connectivity = await OfflineQueueService.getConnectivityStatus();
-      if (connectivity.status === 'offline') {
-        setProgressPhase('processing');
-        const offlineDraft = await saveCurrentDraftNow();
-        const offlineDraftId = offlineDraft?.id || currentDraftId || undefined;
-        await OfflineQueueService.enqueueAssetReport(details, serviceLots, {
-          sourceDraftId: offlineDraftId,
+      if (background) {
+        if (!attemptOwner) throw new Error('Sign in to the account that owns this draft.');
+        // The same details and photos this form would send, frozen now.
+        const queuedDetails = details;
+        const queuedLots = serviceLots;
+        const handedOff = backgroundUploadManager.enqueue({
+          draftId: localDraft.id,
+          type: 'asset',
+          ownerId: attemptOwner,
+          title: contractNo.trim() || clientName.trim() || 'Asset report',
+          totalFiles: submissionFileCount,
+          draft: localDraft,
+          upload: (onProgress, uploadOperation) =>
+            assetService.createAssetReport(queuedDetails, queuedLots, onProgress, { operation: uploadOperation }),
         });
-
-        if (offlineDraftId) {
-          await AutoSaveService.removeDraftRecordOnly(offlineDraftId);
-          setCurrentDraftId(null);
-          loadedDraftIdRef.current = null;
-        } else {
-          await clearCurrentDraft();
-        }
-
         setSubmitting(false);
+        setProgressPhase('idle');
+        if (!handedOff) {
+          Alert.alert(ALREADY_UPLOADING_TITLE, ALREADY_UPLOADING_MESSAGE);
+          return;
+        }
+        // No alert: the upload bar shows progress and the outcome from here.
         resetForm();
         onClose();
-        Alert.alert(
-          'Saved for Upload',
-          'No internet connection was detected. Your report is safely queued and will upload automatically when the connection returns. You can monitor it in Drafts.'
-        );
         return;
       }
 
+      const connectivity = await OfflineQueueService.getConnectivityStatus();
+      operation.assertActive();
+      if (options.nextLot && connectivity.status === 'offline') {
+        setSubmitting(false);
+        setProgressPhase('idle');
+        Alert.alert('Connection required', 'Keep this lot open and retry when online. A new lot starts only after the server accepts this report.');
+        return;
+      }
+      if (connectivity.status === 'offline') {
+        throw new Error('Saved on this device. Connect and tap Resume upload. Nothing will submit automatically.');
+      }
+
       // Submit to API
-      await assetService.createAssetReport(details, serviceLots, (progress) => {
+      const modernDraft = auctioneer ? await saveCurrentDraftNow() : null;
+      operation.assertActive();
+      const acceptedResponse = await assetService.createAssetReport(details, serviceLots, (progress, detail) => {
+        if (!operation.isActive() || recoveryScopeRef.current !== attemptRecoveryScope || OfflineCaptureStore.getOwnerId() !== attemptOwner) return;
         setUploadProgress(progress);
-      });
+        if (detail) setUploadStatus(detail);
+      }, { operation });
+      operation.assertActive();
+      assertReportUploadAccepted(acceptedResponse);
+      uploadAccepted = true;
+      uploadAcceptedRef.current = true;
+      if (isExistingReportUploadReceipt(acceptedResponse)) {
+        // The immutable server manifest may match the photos but not recent
+        // editable fields. This receipt cannot authorize hiding those edits.
+        setSubmitting(false);
+        setProgressPhase('idle');
+        setUploadPaused(true);
+        Alert.alert('Earlier upload accepted', 'The server returned the earlier report, not confirmation of your current edits. This draft and its originals are kept. Open Reports or Previews to review the earlier report before making further changes.');
+        return;
+      }
+      await OfflineCaptureStore.setSubmissionState(localDraft.id, 'accepted', (acceptedResponse as any).reportId);
+
+      if (options.nextLot && auctioneerControl) {
+        if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
+        await auctioneerControl.acceptAndContinue(acceptedResponse, modernDraft?.id);
+        setSubmitting(false);
+        return;
+      }
 
       // Upload complete - show success immediately
+      onSuccess?.();
       setProgressPhase('done');
 
-      // Clear auto-save data on success
-      await clearCurrentDraft();
+      // The accepted receipt hides the draft while retaining its inventory history.
       await AutoSaveService.cleanupOrphanedMedia([], 0).catch(() => undefined);
 
       // Brief delay to show "Upload Complete" then close
@@ -1075,74 +1416,72 @@ const AssetFormSheet = ({
       }, 800);
     } catch (e: any) {
       console.error('Submit error:', e);
+      if (OfflineCaptureStore.getOwnerId() !== attemptOwner) {
+        setSubmitting(false);
+        setProgressPhase('idle');
+        return;
+      }
+      if (uploadAccepted) {
+        setSubmitting(false);
+        setProgressPhase('done');
+        Alert.alert('Upload accepted', 'The server accepted this report. Open Previews to check its progress; local confirmation could not be refreshed.');
+        return;
+      }
+      if (!draftSaved) {
+        submissionIdRef.current = previousSubmissionId;
+        supersedesSubmissionIdRef.current = previousSupersedesId;
+        setSubmitting(false);
+        setProgressPhase('error');
+        Alert.alert('Draft not saved', 'Your latest changes could not be saved on this device. Keep this form and its originals open. Check device storage, then use Save on device before trying again. No upload was started.');
+        return;
+      }
+      const conflictedSubmissionId = submissionIdRef.current;
+      const canAct = () => operation.isActive() && recoveryScopeRef.current === attemptRecoveryScope && OfflineCaptureStore.getOwnerId() === attemptOwner && submissionIdRef.current === conflictedSubmissionId;
 
-      if (e?.response?.status === 409 && e?.response?.data?.code === 'ACTIVE_REPORT_EXISTS') {
+      if (!auctioneer && !supersedesSubmissionIdRef.current && e?.response?.status === 409 && e?.response?.data?.code === 'ACTIVE_REPORT_EXISTS') {
         setProgressPhase('error');
         setSubmitting(false);
         Alert.alert(
           'Report Already Processing',
-          'An asset report for this contract is already queued or processing.',
+          'An asset report for this contract is already queued or processing. Keep this draft and review it in Reports or Previews, or explicitly create a separate report with these photos.',
           [
-            {
-              text: 'Resume Existing',
-              onPress: () => void handleClose(),
-            },
+            { text: 'Keep Draft', style: 'cancel' },
             {
               text: 'Create Separate',
-              onPress: () => void handleSubmit({ forceNew: true }),
+              onPress: () => { if (canAct()) void handleSubmit({ forceNew: true }); },
             },
-            { text: 'Cancel', style: 'cancel' },
           ]
         );
         return;
       }
 
-      if (details && serviceLots && (await OfflineQueueService.shouldQueueAfterError(e))) {
-        try {
-          setProgressPhase('processing');
-          const offlineDraft = await saveCurrentDraftNow();
-          const offlineDraftId = offlineDraft?.id || currentDraftId || undefined;
-          await OfflineQueueService.enqueueAssetReport(details, serviceLots, {
-            sourceDraftId: offlineDraftId,
-          });
-
-          if (offlineDraftId) {
-            await AutoSaveService.removeDraftRecordOnly(offlineDraftId);
-            setCurrentDraftId(null);
-            loadedDraftIdRef.current = null;
-          } else {
-            await clearCurrentDraft();
-          }
-
-          setSubmitting(false);
-          resetForm();
-          onClose();
-          Alert.alert(
-            'Saved for Upload',
-            'The internet connection was lost during upload. Your report is safely queued and will retry automatically when the connection returns.'
-          );
-          return;
-        } catch (queueErr: any) {
-          console.error('Queue error:', queueErr);
-          setProgressPhase('error');
-          setSubmitting(false);
-          Alert.alert(
-            'Could Not Save Offline Upload',
-            queueErr?.message || 'The report remains open. Check the selected photos, then try again.'
-          );
-          return;
-        }
-      }
-
+      setUploadPaused(true);
+      await OfflineCaptureStore.setSubmissionState(attemptDraftId, 'paused', undefined, e?.message).catch(() => undefined);
       setProgressPhase('error');
       setSubmitting(false);
+      if (showUploadManifestRecovery(e, !auctioneer && conflictedSubmissionId ? {
+        replace: () => {
+          if (canAct()) void handleSubmit({ replaceSubmissionId: conflictedSubmissionId, replacementSourceId: uploadConflictSource(e, conflictedSubmissionId) });
+        },
+        startSeparate: () => {
+          if (canAct()) void handleSubmit({ newSubmissionFromId: conflictedSubmissionId });
+        },
+      } : undefined)) return;
       const feedback = OfflineQueueService.getSubmissionError(e);
       Alert.alert(feedback.title, feedback.message);
+    } finally {
+      submissionLockRef.current = false;
+      if (activeOperationRef.current === operation) activeOperationRef.current = null;
+      setPausingUpload(false);
     }
   };
 
   const resetForm = () => {
+    draftIdentityRef.current = randomUUID();
+    setReviewingSavedDraft(false); setDraftLoadError(undefined); reviewEventRef.current = randomUUID();
+    setCaptureMode('online'); setManualSubmissionRequired(false); setLocalSavedAt(undefined); setLocalSaveError(undefined); setUploadPaused(false);
     submissionIdRef.current = null;
+    supersedesSubmissionIdRef.current = undefined;
     setClientName('');
     setEffectiveDate(isoDate(new Date()));
     setAppraisalPurpose('');
@@ -1159,7 +1498,9 @@ const AssetFormSheet = ({
     setFactorsQuality('');
     setFactorsAnalysis('');
     setIncludeDamageAnalysis(true);
+    setEnhanceImages(false);
     setBankPhotosEnabled(false);
+    setWatermarkImages(DEFAULT_IMAGE_WATERMARK);
     setHiddenLocation(null);
     setIncludeValuationTable(false);
     setSelectedValuationMethods(['FML']);
@@ -1167,6 +1508,7 @@ const AssetFormSheet = ({
     setActiveStep('details');
     setProgressPhase('idle');
     setUploadProgress(0);
+    setUploadStatus(null);
     setProgressData(null);
     setJobId(null);
     setErrors({});
@@ -1177,6 +1519,7 @@ const AssetFormSheet = ({
   };
 
   const createLot = () => {
+    if (auctioneer?.kind === 'scheduleA') return -1;
     if (!requireContractNumberForDraft()) return -1;
     const id = `lot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const newLot: MixedLot = {
@@ -1190,16 +1533,37 @@ const AssetFormSheet = ({
     return lots.length;
   };
 
-  const openCameraForLot = (lotIdx: number) => {
+  // Try again (below) runs the handler from the latest render, so it saves the
+  // form as it is when tapped, not the snapshot from the failed tap.
+  const openCameraForLotRef = useRef<(lotIdx: number) => Promise<void>>(async () => undefined);
+  const openCameraForLot = async (lotIdx: number) => {
     if (!requireContractNumberForDraft()) return;
+    const owner = OfflineCaptureStore.getOwnerId();
+    const scope = recoveryScopeRef.current;
+    try {
+      if (!await saveCurrentDraftNow()) return;
+    } catch (error) {
+      // Say why instead of ignoring the tap, and offer Try again
+      // (cameraOpenFailure.ts). The retry does nothing once the account or
+      // this form changed, like the other delayed alert buttons here.
+      if (OfflineCaptureStore.getOwnerId() !== owner || recoveryScopeRef.current !== scope) return;
+      Alert.alert(CAMERA_NOT_OPENED_TITLE, describeCameraOpenFailure(error), cameraOpenFailureButtons(() => {
+        if (OfflineCaptureStore.getOwnerId() !== owner || recoveryScopeRef.current !== scope) return;
+        void openCameraForLotRef.current(lotIdx);
+      }));
+      return;
+    }
     // Camera will auto-create lot if none exist
     // Just set the active index (can be -1 or 0, camera handles it)
+    if (OfflineCaptureStore.getOwnerId() !== owner || recoveryScopeRef.current !== scope) return;
     setActiveLotIdx(lotIdx >= 0 ? lotIdx : 0);
     setCameraOpen(true);
   };
+  openCameraForLotRef.current = openCameraForLot;
 
   const handleClose = async () => {
-    if (submitting) return;
+    if (submitting || saveLock.current) return;
+    if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
     if (hasDraftableWork() && !requireContractNumberForDraft()) return;
     try {
       if (draftSavePromiseRef.current) {
@@ -1208,9 +1572,24 @@ const AssetFormSheet = ({
       await saveCurrentDraftNow();
     } catch (error) {
       console.error('Error saving draft before close:', error);
+      Alert.alert('Not saved', 'Keep this form open and retry saving. Your latest changes have not been saved.');
+      return;
     }
     resetForm();
     onClose();
+  };
+
+  const handleSaveOfflineAndClose = async () => {
+    try {
+      await saveOnDevice(() => {
+        void resetForm();
+        onClose();
+        Alert.alert('Saved on this device', 'Open Drafts → Offline captures → Open and submit to review your saved work. Nothing has been uploaded.');
+      });
+    } catch (error) {
+      setLocalSaveError(error instanceof Error ? error.message : 'Save failed. Please try again.');
+      Alert.alert('Not saved', 'Keep this form open and retry saving. Your latest changes have not been saved.');
+    }
   };
 
   const toggleValuationMethod = (method: 'FML' | 'TKV' | 'OLV' | 'FLV') => {
@@ -1231,7 +1610,12 @@ const AssetFormSheet = ({
       style={styles.formScroll}
       contentContainerStyle={styles.formContent}
       keyboardShouldPersistTaps="handled"
+      keyboardDismissMode="on-drag"
       showsVerticalScrollIndicator={false}>
+      <OfflineCapturePanel mode={captureMode} onChange={changeCaptureMode} lots={lots} savedAt={localSavedAt}
+        manualSubmissionRequired={manualSubmissionRequired} reviewingSavedDraft={reviewingSavedDraft}
+        error={localSaveError} disabled={submitting || savingDraftPreview} paused={uploadPaused}
+        onSave={() => { void handleSaveDraftPreview(); }} />
       {/* Client Information Section */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Client Information</Text>
@@ -1239,6 +1623,7 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Client Name *</Text>
           <TextInput
+            accessibilityLabel="Client name, required"
             style={[styles.input, errors.clientName && styles.inputError]}
             value={clientName}
             onChangeText={(t) => {
@@ -1254,6 +1639,7 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Owner Name</Text>
           <TextInput
+            accessibilityLabel="Owner name"
             style={styles.input}
             value={ownerName}
             onChangeText={setOwnerName}
@@ -1265,6 +1651,7 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Prepared For</Text>
           <TextInput
+            accessibilityLabel="Prepared for"
             style={styles.input}
             value={preparedFor}
             onChangeText={setPreparedFor}
@@ -1281,6 +1668,7 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Purpose of Appraisal *</Text>
           <TextInput
+            accessibilityLabel="Purpose of appraisal, required"
             style={[styles.input, errors.appraisalPurpose && styles.inputError]}
             value={appraisalPurpose}
             onChangeText={(t) => {
@@ -1295,10 +1683,12 @@ const AssetFormSheet = ({
           )}
         </View>
 
-        <View style={styles.row}>
-          <View style={[styles.fieldContainer, { flex: 1, marginRight: 8 }]}>
+        <View style={[styles.row, compactFields && styles.stackedRow]}>
+          <View style={[styles.fieldContainer, { flex: 1, marginRight: compactFields ? 0 : 8 }]}>
             <Text style={styles.fieldLabel}>Effective Date *</Text>
             <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel={`Effective date, ${formatDateDisplay(effectiveDate)}`}
               style={[styles.datePickerButton, errors.effectiveDate && styles.inputError]}
               onPress={() => setShowEffectiveDatePicker(true)}>
               <Feather name="calendar" size={18} color="#6B7280" />
@@ -1341,9 +1731,11 @@ const AssetFormSheet = ({
                 />
               ))}
           </View>
-          <View style={[styles.fieldContainer, { flex: 1, marginLeft: 8 }]}>
+          <View style={[styles.fieldContainer, { flex: 1, marginLeft: compactFields ? 0 : 8 }]}>
             <Text style={styles.fieldLabel}>Inspection Date</Text>
             <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel={`Inspection date, ${formatDateDisplay(inspectionDate)}`}
               style={styles.datePickerButton}
               onPress={() => setShowInspectionDatePicker(true)}>
               <Feather name="calendar" size={18} color="#6B7280" />
@@ -1391,6 +1783,7 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Industry</Text>
           <TextInput
+            accessibilityLabel="Industry"
             style={styles.input}
             value={industry}
             onChangeText={setIndustry}
@@ -1402,12 +1795,15 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Contract No.</Text>
           <TextInput
+            accessibilityLabel="Contract number"
+            editable={!auctioneer}
             style={styles.input}
             value={contractNo}
             onChangeText={setContractNo}
             placeholder="Enter contract number"
             placeholderTextColor="#9CA3AF"
-            keyboardType="number-pad"
+            autoCapitalize="characters"
+            autoCorrect={false}
           />
         </View>
       </View>
@@ -1419,6 +1815,7 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Appraiser Name *</Text>
           <TextInput
+            accessibilityLabel="Appraiser name, required"
             style={[styles.input, errors.appraiser && styles.inputError]}
             value={appraiser}
             onChangeText={(t) => {
@@ -1434,6 +1831,7 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Appraisal Company</Text>
           <TextInput
+            accessibilityLabel="Appraisal company"
             style={styles.input}
             value={appraisalCompany}
             onChangeText={setAppraisalCompany}
@@ -1447,11 +1845,12 @@ const AssetFormSheet = ({
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Settings</Text>
 
-        <View style={styles.row}>
-          <View style={[styles.fieldContainer, { flex: 1, marginRight: 8 }]}>
+        <View style={[styles.row, compactFields && styles.stackedRow]}>
+          <View style={[styles.fieldContainer, { flex: 1, marginRight: compactFields ? 0 : 8 }]}>
             <Text style={styles.fieldLabel}>Currency *</Text>
             <View style={styles.currencyContainer}>
               <TextInput
+                accessibilityLabel="Currency code, required"
                 style={[styles.input, styles.currencyInput, errors.currency && styles.inputError]}
                 value={currency}
                 onChangeText={(t) => {
@@ -1469,7 +1868,7 @@ const AssetFormSheet = ({
             </View>
             {errors.currency && <Text style={styles.errorText}>{errors.currency}</Text>}
           </View>
-          <View style={[styles.fieldContainer, { flex: 1, marginLeft: 8 }]}>
+          <View style={[styles.fieldContainer, { flex: 1, marginLeft: compactFields ? 0 : 8 }]}>
             <Text style={styles.fieldLabel}>Language</Text>
             <View style={styles.languageRow}>
               {(['en', 'fr', 'es'] as const).map((lang) => (
@@ -1564,8 +1963,30 @@ const AssetFormSheet = ({
         </View>
 
         <View style={styles.fieldContainer}>
+          <View style={styles.toggleRow}>
+            <View style={{ flex: 1, paddingRight: 12 }}>
+              <Text style={styles.fieldLabel}>Add logo where missing</Text>
+              <Text style={{ fontSize: 12, color: '#6B7280' }}>
+                Adds the company logo to photos that don’t have it. Photos that already show it, like Asset Insight camera photos, are left alone, so no photo gets two. On by default.
+              </Text>
+            </View>
+            <TouchableOpacity
+              onPress={() => setWatermarkImages((prev) => !prev)}
+              accessibilityRole="switch"
+              accessibilityState={{ checked: watermarkImages }}
+              style={[
+                styles.checkbox,
+                watermarkImages && styles.checkboxActive,
+              ]}>
+              {watermarkImages && <Feather name="check" size={14} color="#fff" />}
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Age & Condition</Text>
           <TextInput
+            accessibilityLabel="Age and condition factors"
             style={[styles.input, styles.textArea]}
             value={factorsAgeCondition}
             onChangeText={setFactorsAgeCondition}
@@ -1579,6 +2000,7 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Quality</Text>
           <TextInput
+            accessibilityLabel="Quality factors"
             style={[styles.input, styles.textArea]}
             value={factorsQuality}
             onChangeText={setFactorsQuality}
@@ -1592,6 +2014,7 @@ const AssetFormSheet = ({
         <View style={styles.fieldContainer}>
           <Text style={styles.fieldLabel}>Analysis</Text>
           <TextInput
+            accessibilityLabel="Analysis notes"
             style={[styles.input, styles.textArea]}
             value={factorsAnalysis}
             onChangeText={setFactorsAnalysis}
@@ -1627,14 +2050,29 @@ const AssetFormSheet = ({
         </TouchableOpacity>
       </View>
 
+      <TouchableOpacity
+        style={[styles.draftPreviewButton, (submitting || savingDraftPreview) && styles.buttonDisabled]}
+        onPress={() => void handleSaveDraftPreview()}
+        disabled={Boolean(auctioneer) || submitting || savingDraftPreview}>
+        {savingDraftPreview ? (
+          <ActivityIndicator color="#1D4ED8" size="small" />
+        ) : (
+          <Feather name="cloud" size={18} color="#1D4ED8" />
+        )}
+        <Text style={styles.draftPreviewButtonText}>
+          {savingDraftPreview ? 'Saving Draft...' : captureMode === 'offline' || manualSubmissionRequired ? 'Save on device' : 'Save Draft & Create Preview'}
+        </Text>
+      </TouchableOpacity>
+
       {/* Submit Button - Also available on details page */}
       <TouchableOpacity
         style={[
           styles.submitButtonDetails,
-          (submitting || lots.reduce((sum, lot) => sum + lot.files.length + lot.extraFiles.length, 0) === 0) && styles.submitButtonDisabled,
+          (submitting || (!saveOnly && lots.reduce((sum, lot) => sum + lot.files.length + lot.extraFiles.length, 0) === 0)) && styles.submitButtonDisabled,
         ]}
         onPress={() => void handleSubmit()}
-        disabled={submitting || lots.reduce((sum, lot) => sum + lot.files.length + lot.extraFiles.length, 0) === 0}>
+        accessibilityRole="button" accessibilityLabel={saveOnly ? 'Save offline asset report' : uploadPaused ? 'Resume upload' : 'Submit asset report'}
+        disabled={submitting || (!saveOnly && lots.reduce((sum, lot) => sum + lot.files.length + lot.extraFiles.length, 0) === 0)}>
         {submitting ? (
           <>
             <ActivityIndicator color="#fff" size="small" />
@@ -1644,15 +2082,15 @@ const AssetFormSheet = ({
           </>
         ) : (
           <>
-            <Feather name="send" size={18} color="#fff" />
-            <Text style={styles.submitButtonText}>Submit Report</Text>
+            <Feather name={saveOnly ? 'save' : 'send'} size={18} color="#fff" />
+            <Text style={styles.submitButtonText}>{saveOnly ? 'Save' : uploadPaused ? 'Resume upload' : 'Submit Report'}</Text>
           </>
         )}
       </TouchableOpacity>
     </ScrollView>
   );
 
-  const renderImagesStep = () => {
+  const renderUploadProgress = () => {
     // Calculate totals for display
     const totalImages = lots.reduce(
       (sum, lot) => sum + lot.files.length + lot.extraFiles.length,
@@ -1661,13 +2099,26 @@ const AssetFormSheet = ({
     const totalLots = lots.filter(
       (lot) => lot.files.length > 0 || lot.extraFiles.length > 0
     ).length;
+    const uploadStageTitle = uploadStatus?.stage === 'preparing'
+      ? 'Preparing Images'
+      : uploadStatus?.stage === 'creating_session'
+        ? 'Starting Secure Upload'
+        : uploadStatus?.stage === 'finalizing'
+          ? 'Finalizing Report'
+          : uploadStatus?.stage === 'complete'
+            ? 'Upload Complete'
+            : 'Uploading Images';
 
     return (
-      <View style={styles.imagesContainer}>
-        {/* Progress Overlay when submitting */}
-        {submitting && (
+      <Modal testID="asset-upload-progress" visible={visible && submitting} transparent animationType="fade" onRequestClose={handlePauseUpload}>
           <View style={styles.progressOverlay}>
-            <View style={styles.progressCard}>
+            <View style={styles.progressCard} accessibilityViewIsModal>
+              {progressPhase === 'uploading' && uploadStatus?.stage !== 'complete' && uploadStatus?.stage !== 'finalizing' && !uploadAcceptedRef.current ? (
+                <TouchableOpacity accessibilityRole="button" accessibilityLabel={pausingUpload ? 'Pausing upload' : 'Pause upload'}
+                  accessibilityState={{ disabled: pausingUpload }} disabled={pausingUpload} onPress={handlePauseUpload} style={{ minHeight: 44, padding: 12 }}>
+                  <Text style={{ color: '#1D4ED8' }}>{pausingUpload ? 'Pausing upload…' : 'Pause upload'}</Text>
+                </TouchableOpacity>
+              ) : null}
               {/* Header with icon */}
               <View style={styles.progressHeader}>
                 {progressPhase === 'done' ? (
@@ -1680,8 +2131,8 @@ const AssetFormSheet = ({
                   </View>
                 )}
                 <Text style={styles.progressTitle}>
-                  {progressPhase === 'uploading'
-                    ? 'Uploading Images...'
+                  {pausingUpload ? 'Pausing upload…' : progressPhase === 'uploading'
+                    ? uploadStageTitle
                     : progressPhase === 'done'
                       ? 'Complete!'
                       : 'Processing Report...'}
@@ -1720,13 +2171,29 @@ const AssetFormSheet = ({
                 />
               </View>
 
-              <Text style={styles.progressText}>
-                {progressPhase === 'uploading'
-                  ? `${uploadProgress}% uploaded`
+              <Text style={styles.progressText} accessibilityLiveRegion="polite">
+                {pausingUpload ? 'Stopping this transfer. Your saved draft will stay available; tap Resume upload when ready.' : progressPhase === 'uploading'
+                  ? uploadStatus?.message || `${uploadProgress}% uploaded`
                   : progressPhase === 'done'
                     ? 'Report submitted successfully!'
                     : progressData?.message || 'Please wait...'}
               </Text>
+
+              {progressPhase === 'uploading' && !!uploadStatus?.totalFiles && (
+                <View style={styles.uploadFileProgress}>
+                  <Text style={styles.uploadFileProgressText}>
+                    {uploadProgress}%
+                  </Text>
+                  <Text style={styles.uploadFileProgressText}>
+                    {uploadStatus.completedFiles} / {uploadStatus.totalFiles} files
+                  </Text>
+                </View>
+              )}
+              {progressPhase === 'uploading' && !!uploadStatus?.activeFileName && (
+                <Text style={styles.uploadActiveFile} numberOfLines={1}>
+                  {uploadStatus.activeFileName}
+                </Text>
+              )}
 
               {/* Step indicators */}
               {progressData?.steps && progressData.steps.length > 0 && (
@@ -1757,9 +2224,25 @@ const AssetFormSheet = ({
               )}
             </View>
           </View>
-        )}
+      </Modal>
+    );
+  };
 
+  const renderImagesStep = () => {
+    const totalImages = lots.reduce((sum, lot) => sum + lot.files.length + lot.extraFiles.length, 0);
+    return (
+      <View style={styles.imagesContainer}>
+
+        <ScrollView testID="asset-images-scroll" style={styles.imagesScroll}
+          keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
+        <OfflineCapturePanel mode={captureMode} onChange={changeCaptureMode} lots={lots} savedAt={localSavedAt}
+          manualSubmissionRequired={manualSubmissionRequired} reviewingSavedDraft={reviewingSavedDraft}
+          error={localSaveError} disabled={submitting || savingDraftPreview} paused={uploadPaused}
+          onSave={() => { void handleSaveDraftPreview(); }} />
         <LotManager
+          embedded
+          lockedStructure={auctioneer?.kind === 'scheduleA'}
+          sourceLabels={auctioneer?.kind === 'scheduleA' ? auctioneer.lots.map((lot, index) => lot.lotNumber ? `Lot ${lot.lotNumber}` : `Lot ${index + 1}`) : undefined}
           lots={lots}
           setLots={setLots}
           activeLotIdx={activeLotIdx}
@@ -1767,6 +2250,7 @@ const AssetFormSheet = ({
           onOpenCamera={openCameraForLot}
           onCreateLot={createLot}
         />
+        </ScrollView>
 
         {/* Action Buttons */}
         <View style={styles.actionRow}>
@@ -1779,12 +2263,25 @@ const AssetFormSheet = ({
           </TouchableOpacity>
 
           <TouchableOpacity
+            style={[styles.actionDraftButton, (submitting || savingDraftPreview) && styles.buttonDisabled]}
+            onPress={() => void handleSaveDraftPreview()}
+            disabled={Boolean(auctioneer) || submitting || savingDraftPreview}>
+            {savingDraftPreview ? (
+              <ActivityIndicator color="#1D4ED8" size="small" />
+            ) : (
+              <Feather name="cloud" size={18} color="#1D4ED8" />
+            )}
+            <Text style={styles.actionDraftButtonText}>Draft</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
             style={[
               styles.submitButton,
-              (submitting || totalImages === 0) && styles.submitButtonDisabled,
+              (submitting || (!saveOnly && totalImages === 0)) && styles.submitButtonDisabled,
             ]}
             onPress={() => void handleSubmit()}
-            disabled={submitting || totalImages === 0}>
+            accessibilityRole="button" accessibilityLabel={saveOnly ? 'Save offline asset report' : uploadPaused ? 'Resume upload' : 'Submit asset report'}
+            disabled={submitting || (!saveOnly && totalImages === 0)}>
             {submitting ? (
               <>
                 <ActivityIndicator color="#fff" size="small" />
@@ -1794,8 +2291,8 @@ const AssetFormSheet = ({
               </>
             ) : (
               <>
-                <Text style={styles.submitButtonText}>Submit Report</Text>
-                <Feather name="send" size={18} color="#fff" />
+                <Text style={styles.submitButtonText}>{saveOnly ? 'Save' : uploadPaused ? 'Resume upload' : 'Submit Report'}</Text>
+                <Feather name={saveOnly ? 'save' : 'send'} size={18} color="#fff" />
               </>
             )}
           </TouchableOpacity>
@@ -1804,12 +2301,18 @@ const AssetFormSheet = ({
     );
   };
 
+  if (visible && (awaitingDraft || savingLocal)) return <DraftStorageStatus saving={savingLocal} error={draftLoadError}
+    onRetry={() => setDraftLoadAttempt(value => value + 1)} onClose={() => { resetForm(); onClose(); }} />;
+
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={handleClose}>
       <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+        {auctioneer && captureMode !== 'offline' ? <AuctioneerFormHeader setup={auctioneer}
+          disabled={submitting || savingDraftPreview || !lots.some((lot) => lot.files.length > 0)}
+          onPress={() => void handleSubmit({ nextLot: true })} /> : null}
         {/* Header */}
         <View style={styles.header}>
-          <TouchableOpacity onPress={handleClose} style={styles.closeButton}>
+          <TouchableOpacity onPress={handleClose} style={styles.closeButton} accessibilityRole="button" accessibilityLabel="Close asset appraisal">
             <Feather name="x" size={24} color="#374151" />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Asset Appraisal</Text>
@@ -1821,6 +2324,21 @@ const AssetFormSheet = ({
             </View>
           </View>
         </View>
+
+        <Modal visible={savingDraftPreview} transparent animationType="fade">
+          <View style={styles.progressOverlay}>
+            <View style={styles.progressCard}>
+              <View style={styles.progressIconBg}>
+                <ActivityIndicator size="large" color="#2563EB" />
+              </View>
+              <Text style={styles.progressTitle}>Saving Draft to Cloud</Text>
+              <Text style={styles.draftProgressText}>
+                Uploading and verifying draft media, then starting preview processing. Keep the app open until this finishes.
+              </Text>
+            </View>
+          </View>
+        </Modal>
+        {renderUploadProgress()}
 
         {/* 3D Tab Navigation */}
         <View style={styles.tabContainer}>
@@ -1836,6 +2354,9 @@ const AssetFormSheet = ({
           </View>
           <TouchableOpacity
             style={[styles.tabButton, activeStep === 'details' && styles.tabButtonActive]}
+            accessibilityRole="tab" accessibilityLabel="Details"
+            accessibilityState={{ selected: activeStep === 'details', disabled: submitting || savingDraftPreview }}
+            disabled={submitting || savingDraftPreview}
             onPress={() => setActiveStep('details')}
             activeOpacity={0.7}>
             <View style={styles.tabIconContainer}>
@@ -1851,6 +2372,9 @@ const AssetFormSheet = ({
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.tabButton, activeStep === 'images' && styles.tabButtonActive]}
+            accessibilityRole="tab" accessibilityLabel="Images"
+            accessibilityState={{ selected: activeStep === 'images', disabled: submitting || savingDraftPreview }}
+            disabled={submitting || savingDraftPreview}
             onPress={() => setActiveStep('images')}
             activeOpacity={0.7}>
             <View style={styles.tabIconContainer}>
@@ -1868,6 +2392,7 @@ const AssetFormSheet = ({
 
         {/* Content */}
         <KeyboardAvoidingView
+          testID="asset-form-keyboard-layout"
           behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.content}>
           {activeStep === 'details' ? renderDetailsStep() : renderImagesStep()}
@@ -1875,7 +2400,11 @@ const AssetFormSheet = ({
 
         {/* Camera Modal */}
         <CameraCapture
+            captureContext={visible && currentDraftId && OfflineCaptureStore.getOwnerId() ? { ownerId: OfflineCaptureStore.getOwnerId()!, draftId: currentDraftId, sessionId: currentDraftId } : undefined}
+            manualSubmissionRequired={captureMode === 'offline' || manualSubmissionRequired}
             visible={cameraOpen}
+            lockedStructure={auctioneer?.kind === 'scheduleA'}
+            sourceLabels={auctioneer?.kind === 'scheduleA' ? auctioneer.lots.map((lot, index) => lot.lotNumber ? `Lot ${lot.lotNumber}` : `Lot ${index + 1}`) : undefined}
             onClose={() => setCameraOpen(false)}
             lots={lots}
             setLots={setLots}
@@ -1941,7 +2470,10 @@ const styles = StyleSheet.create({
     borderBottomColor: '#E5E7EB',
   },
   closeButton: {
-    padding: 4,
+    minWidth: 44,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   headerTitle: {
     fontSize: 18,
@@ -2036,11 +2568,15 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
+    minHeight: 0,
   },
   formScroll: {
     flex: 1,
   },
   formContent: {
+    width: '100%',
+    maxWidth: 920,
+    alignSelf: 'center',
     padding: 16,
     paddingBottom: 40,
   },
@@ -2152,6 +2688,7 @@ const styles = StyleSheet.create({
   row: {
     flexDirection: 'row',
   },
+  stackedRow: { flexDirection: 'column' },
   currencyContainer: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2298,11 +2835,32 @@ const styles = StyleSheet.create({
     marginRight: 6,
     letterSpacing: -0.3,
   },
+  draftPreviewButton: {
+    minHeight: 48,
+    marginTop: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    backgroundColor: '#EFF6FF',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  draftPreviewButtonText: {
+    color: '#1D4ED8',
+    fontSize: 14,
+    fontWeight: '800',
+  },
   imagesContainer: {
     flex: 1,
+    minHeight: 0,
   },
+  imagesScroll: { flex: 1, minHeight: 0 },
   actionRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
     padding: 16,
     borderTopWidth: 1,
     borderTopColor: '#E5E7EB',
@@ -2315,7 +2873,7 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     backgroundColor: '#F3F4F6',
     borderRadius: 10,
-    marginRight: 12,
+    minHeight: 44,
   },
   backButtonText: {
     fontSize: 16,
@@ -2323,8 +2881,29 @@ const styles = StyleSheet.create({
     color: '#374151',
     marginLeft: 6,
   },
+  actionDraftButton: {
+    minWidth: 76,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    minHeight: 44,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    backgroundColor: '#EFF6FF',
+  },
+  actionDraftButtonText: {
+    color: '#1D4ED8',
+    fontSize: 13,
+    fontWeight: '800',
+  },
   submitButton: {
     flex: 1,
+    minWidth: 160,
+    minHeight: 44,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -2402,6 +2981,13 @@ const styles = StyleSheet.create({
     color: '#1F2937',
     textAlign: 'center',
   },
+  draftProgressText: {
+    color: '#6B7280',
+    fontSize: 13,
+    lineHeight: 19,
+    textAlign: 'center',
+    marginTop: 4,
+  },
   progressStats: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2448,6 +3034,26 @@ const styles = StyleSheet.create({
     color: '#6B7280',
     textAlign: 'center',
     marginBottom: 12,
+  },
+  uploadFileProgress: {
+    width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: -4,
+    marginBottom: 8,
+  },
+  uploadFileProgressText: {
+    color: '#4B5563',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  uploadActiveFile: {
+    width: '100%',
+    color: '#9CA3AF',
+    fontSize: 12,
+    textAlign: 'center',
+    marginBottom: 8,
   },
   stepsContainer: {
     width: '100%',
@@ -2560,4 +3166,16 @@ const styles = StyleSheet.create({
   },
 });
 
-export default AssetFormSheet;
+export default function AssetFormWithAuctioneer(props: AssetFormSheetProps) {
+  const draftSessionRef = useRef<string | null>(props.draftIdToLoad || null);
+  if (!props.visible) draftSessionRef.current = null;
+  else if (props.draftIdToLoad) draftSessionRef.current = props.draftIdToLoad;
+  const sessionDraftId = draftSessionRef.current;
+  if (!props.auctioneer && !sessionDraftId) return <AssetFormSheet {...props} />;
+  return <AuctioneerFormBoundary visible={props.visible} type="asset" setup={props.auctioneer}
+    draftIdToLoad={sessionDraftId} onClose={props.onClose} onSetupChange={props.onAuctioneerSetupChange}>
+    {(control) => <AssetFormSheet {...props} auctioneerControl={control}
+      savedInputData={control ? undefined : props.savedInputData}
+      draftIdToLoad={control && !control.restoreDraft ? undefined : sessionDraftId} />}
+  </AuctioneerFormBoundary>;
+}

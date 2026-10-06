@@ -9,20 +9,33 @@ import {
   normalizePhotoFile,
 } from '../utils/photoFileUtils';
 import { LocalMediaStore } from './localMediaStore';
+import OfflineCaptureStore from './offlineCaptureStore';
+import type { OfflineCaptureMetadata, CaptureModePreference, MediaOwnership } from './offlineCaptureTypes';
+import type { AuctioneerWorkItemSetup } from './auctioneerService';
+import type { AuctionManagementTaskPayload } from './auctionManagementService';
+import { setUploadOwner } from './uploadCancellation';
 
 const AUTO_SAVE_KEY = '@clearvalue_auto_save';
-const DRAFTS_KEY = '@clearvalue_offline_report_drafts_v1';
-const LEGACY_MIGRATED_KEY = '@clearvalue_auto_save_migrated_to_drafts_v1';
 const getAutoSaveImagesDir = (): string => `${FileSystem.documentDirectory || ''}auto_save_images/`;
-const getLegacyDraftImagesDir = (draftId: string): string =>
-  `${FileSystem.documentDirectory || ''}offline_report_drafts/${draftId}/`;
 const getDraftImagesDir = (draftId: string): string =>
   LocalMediaStore.getDraftDir(draftId);
+const draftSaveTails = new Map<string, Promise<unknown>>();
+async function serializeDraftSave<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const next = (draftSaveTails.get(key) || Promise.resolve()).catch(() => undefined).then(work);
+  draftSaveTails.set(key, next);
+  try { return await next; }
+  finally { if (draftSaveTails.get(key) === next) draftSaveTails.delete(key); }
+}
 
-type SavedVideoFileData = {
+export type SavedVideoFileData = {
+  missing?: boolean;
+  ownership?: MediaOwnership;
+  availability?: 'available' | 'missing';
   uri: string;
   name: string;
   type: string;
+  clientFileId?: string;
+  localKey?: string;
   mediaId?: string;
   sourceUri?: string;
   size?: number;
@@ -30,9 +43,16 @@ type SavedVideoFileData = {
   slot?: 'video';
   index?: number;
   createdAt?: string;
+  captureOrder?: number;
+  originalOrder?: number;
 };
 
 export interface SavedPhotoFileData {
+  captureOrigin?: 'camera' | 'import';
+  captureTimestamp?: number;
+  missing?: boolean;
+  ownership?: MediaOwnership;
+  availability?: 'available' | 'missing';
   uri: string;
   originalUri?: string;
   editedUri?: string;
@@ -40,6 +60,8 @@ export interface SavedPhotoFileData {
   thumbnailUri?: string;
   name: string;
   type: string;
+  clientFileId?: string;
+  localKey?: string;
   mediaId?: string;
   sourceUri?: string;
   cacheUri?: string;
@@ -60,6 +82,8 @@ export interface SavedPhotoFileData {
 
 export interface SavedLotData {
   id: string;
+  lotNumber?: string;
+  title?: string;
   mode?: 'single_lot' | 'per_item' | 'per_photo';
   mainImages: (SavedPhotoFileData | string)[];
   extraImages: (SavedPhotoFileData | string)[];
@@ -68,7 +92,18 @@ export interface SavedLotData {
 }
 
 export interface AutoSaveFormData {
+  manualSubmissionRequired?: boolean;
+  auctionServiceSelections?: Record<string, unknown>;
+  auctionCloseContract?: boolean;
+  captureMode?: CaptureModePreference;
+  auctioneerSnapshot?: AuctioneerWorkItemSetup;
+  auctionsoftSnapshot?: AuctionManagementTaskPayload;
+  legacyRequiresIncomingReview?: boolean;
+  auctionManagementTaskId?: string;
+  auctionsoft?: { taskId?: string; contractId?: string; [key: string]: unknown };
   clientSubmissionId?: string;
+  supersedesClientSubmissionId?: string;
+  auctioneerWorkItemId?: string;
   clientName?: string;
   effectiveDate?: string;
   appraisalPurpose?: string;
@@ -89,7 +124,9 @@ export interface AutoSaveFormData {
   factorsQuality?: string;
   factorsAnalysis?: string;
   includeDamageAnalysis?: boolean;
+  enhanceImages?: boolean;
   bankPhotosEnabled?: boolean;
+  watermarkImages?: boolean;
   includeValuationTable?: boolean;
   selectedValuationMethods?: ('FML' | 'TKV' | 'OLV' | 'FLV')[];
 }
@@ -104,7 +141,14 @@ export interface AutoSaveData {
 
 export type OfflineDraftType = 'asset' | 'lotListing';
 
-export interface OfflineReportDraft {
+export type DraftCloudSyncErrorKind =
+  | 'network'
+  | 'transient_server'
+  | 'auth'
+  | 'validation'
+  | 'unknown';
+
+export interface OfflineReportDraft extends OfflineCaptureMetadata {
   id: string;
   type: OfflineDraftType;
   title: string;
@@ -113,6 +157,10 @@ export interface OfflineReportDraft {
   cloudId?: string;
   cloudSyncedAt?: string;
   cloudSyncError?: string;
+  cloudSyncErrorKind?: DraftCloudSyncErrorKind;
+  cloudSyncRetryAt?: number;
+  cloudSyncAttempts?: number;
+  cloudSyncLastAttemptAt?: string;
   formData: AutoSaveFormData;
   lots: SavedLotData[];
   activeLotIdx: number;
@@ -122,6 +170,8 @@ export interface OfflineReportDraft {
 
 type AutoSaveLotInput = {
   id: string;
+  lotNumber?: string;
+  title?: string;
   mode?: 'single_lot' | 'per_item' | 'per_photo';
   files: PhotoFile[];
   extraFiles: PhotoFile[];
@@ -164,12 +214,14 @@ const ensureUriExists = async (uri?: string | null) => {
   if (!uri) return false;
   if (/^https?:\/\//i.test(uri)) return true;
   try {
-    const info = await FileSystem.getInfoAsync(uri);
+    const info = await LocalMediaStore.getFileInfo(uri);
     return Boolean(info.exists);
   } catch {
     return false;
   }
 };
+
+const isRemoteMediaUri = (uri?: string | null) => Boolean(uri && /^https?:\/\//i.test(uri));
 
 const copyToDirectory = async (
   sourceUri: string,
@@ -200,7 +252,7 @@ const copyToDirectory = async (
 const getFileSize = async (uri?: string | null): Promise<number | undefined> => {
   if (!uri || /^https?:\/\//i.test(uri)) return undefined;
   try {
-    const info = await FileSystem.getInfoAsync(uri);
+    const info = await LocalMediaStore.getFileInfo(uri);
     return info.exists && typeof info.size === 'number' ? info.size : undefined;
   } catch {
     return undefined;
@@ -229,14 +281,13 @@ const normalizeSavedPhotoFile = async (
   fallbackName: string
 ): Promise<SavedPhotoFileData | null> => {
   if (typeof photo === 'string') {
-    if (!(await ensureUriExists(photo))) return null;
-
     return normalizePhotoFile({
       uri: photo,
       originalUri: photo,
       displayUri: photo,
       name: fallbackName,
       type: 'image/jpeg',
+      ...(!(await ensureUriExists(photo)) ? { availability: 'missing' as const, missing: true } : { missing: false }),
     }) as SavedPhotoFileData;
   }
 
@@ -245,7 +296,7 @@ const normalizeSavedPhotoFile = async (
   const editedExists = await ensureUriExists(photo.editedUri);
   const fallbackUri = originalExists ? originalUri : editedExists ? photo.editedUri : null;
 
-  if (!fallbackUri) return null;
+  if (!fallbackUri) return { ...photo, availability: 'missing', missing: true };
 
   return normalizePhotoFile({
     ...photo,
@@ -254,6 +305,8 @@ const normalizeSavedPhotoFile = async (
     editedUri: editedExists ? photo.editedUri : undefined,
     displayUri: editedExists ? photo.editedUri : fallbackUri,
     adjustments: normalizeImageAdjustments(photo.adjustments),
+    availability: 'available',
+    missing: false,
   }) as SavedPhotoFileData;
 };
 
@@ -262,12 +315,10 @@ const normalizeSavedVideoFile = async (
   fallbackName: string
 ): Promise<SavedVideoFileData | null> => {
   if (typeof video === 'string') {
-    if (!(await ensureUriExists(video))) return null;
-    return { uri: video, name: fallbackName, type: 'video/mp4' };
+    return { uri: video, name: fallbackName, type: 'video/mp4', availability: await ensureUriExists(video) ? 'available' : 'missing' };
   }
 
-  if (!(await ensureUriExists(video.uri))) return null;
-  return video;
+  return { ...video, availability: await ensureUriExists(video.uri) ? 'available' : 'missing' };
 };
 
 const persistPhotoFile = async (
@@ -282,19 +333,43 @@ const persistPhotoFile = async (
 ): Promise<SavedPhotoFileData | null> => {
   const normalized = normalizePhotoFile(photo);
   const originalUri = getPhotoOriginalUri(normalized);
-  const existingPhoto = typeof existing === 'string' ? null : existing;
+  const candidate = typeof existing === 'string' ? null : existing;
+  const existingPhoto = candidate && (
+    (normalized.mediaId && normalized.mediaId === candidate.mediaId) ||
+    [candidate.uri, candidate.originalUri, candidate.sourceUri].includes(originalUri)
+  ) ? candidate : null;
+
+  // Cloud-restored drafts keep R2 as the media source. Downloading those
+  // files back into LocalMediaStore on every autosave caused large drafts to
+  // consume device storage again and introduced a second ordering source.
+  if (isRemoteMediaUri(originalUri)) {
+    return normalizePhotoFile({
+      ...normalized,
+      uri: originalUri,
+      originalUri,
+      displayUri: normalized.editedUri || normalized.displayUri || originalUri,
+      clientFileId: (photo as any)?.clientFileId,
+      localKey: (photo as any)?.localKey,
+      mediaId: normalized.mediaId || (photo as any)?.clientFileId,
+      sourceUri: normalized.sourceUri || originalUri,
+      lotId,
+      slot,
+      index,
+    }) as SavedPhotoFileData;
+  }
 
   if (
     existingPhoto &&
     existingPhoto.sourceUri === originalUri &&
+    normalized.editedUri === existingPhoto.editedUri &&
     (await ensureUriExists(existingPhoto.uri))
   ) {
     return normalizePhotoFile({
       ...existingPhoto,
+      adjustments: normalizeImageAdjustments(normalized.adjustments),
       originalUri: existingPhoto.originalUri || existingPhoto.uri,
       displayUri: existingPhoto.editedUri || existingPhoto.displayUri || existingPhoto.uri,
       thumbnailUri: existingPhoto.thumbnailUri,
-      adjustments: normalizeImageAdjustments(existingPhoto.adjustments),
       timestamp: normalized.timestamp ?? existingPhoto.timestamp,
       captureOrder: normalized.captureOrder ?? existingPhoto.captureOrder,
       originalOrder: normalized.originalOrder ?? existingPhoto.originalOrder,
@@ -310,10 +385,10 @@ const persistPhotoFile = async (
       sourceUri: originalUri,
       name: normalized.name,
       type: normalized.type,
-      mediaId: existingPhoto?.mediaId,
+      mediaId: normalized.mediaId || existingPhoto?.mediaId,
     });
 
-    if (!imported) return null;
+    if (!imported) return { ...normalized, availability: 'missing', missing: true, lotId, slot, index };
 
     let persistedEditedUri: string | undefined;
     if (normalized.editedUri && (await ensureUriExists(normalized.editedUri))) {
@@ -343,6 +418,10 @@ const persistPhotoFile = async (
       name: imported.name,
       type: imported.type,
       mediaId: imported.mediaId,
+      ownership: imported.ownership,
+      availability: 'available',
+      missing: false,
+      captureTimestamp: normalized.timestamp || existingPhoto?.captureTimestamp,
       sourceUri: originalUri,
       cacheUri: normalized.cacheUri,
       size: imported.size,
@@ -401,6 +480,23 @@ const persistVideoFile = async (
   draftId?: string
 ): Promise<SavedVideoFileData | null> => {
   const existingVideo = typeof existing === 'string' ? null : existing;
+  if (isRemoteMediaUri(videoFile.uri)) {
+    return {
+      ...(typeof videoFile === 'object' ? videoFile : {}),
+      uri: videoFile.uri,
+      name: videoFile.name || `video-${index}.mp4`,
+      type: videoFile.type || 'video/mp4',
+      clientFileId: (videoFile as any)?.clientFileId,
+      localKey: (videoFile as any)?.localKey,
+      mediaId: (videoFile as any)?.mediaId || (videoFile as any)?.clientFileId,
+      sourceUri: videoFile.uri,
+      lotId,
+      slot: 'video',
+      index,
+      captureOrder: (videoFile as any)?.captureOrder,
+      originalOrder: (videoFile as any)?.originalOrder,
+    };
+  }
   if (
     existingVideo &&
     existingVideo.sourceUri === videoFile.uri &&
@@ -418,14 +514,17 @@ const persistVideoFile = async (
       sourceUri: videoFile.uri,
       name: videoFile.name,
       type: videoFile.type || 'video/mp4',
-      mediaId: existingVideo?.mediaId,
+      mediaId: (videoFile as SavedVideoFileData).mediaId || existingVideo?.mediaId,
     });
-    if (!imported) return null;
+    if (!imported) return { ...videoFile, name: videoFile.name || `video-${index}.mp4`, type: videoFile.type || 'video/mp4', availability: 'missing' };
     return {
+      ...videoFile,
       uri: imported.uri,
       name: imported.name,
       type: imported.type,
       mediaId: imported.mediaId,
+      ownership: imported.ownership,
+      availability: 'available',
       sourceUri: videoFile.uri,
       size: imported.size,
       lotId,
@@ -445,6 +544,7 @@ const persistVideoFile = async (
   if (!persistedUri) return null;
 
   return {
+    ...videoFile,
     uri: persistedUri,
     name: videoFile.name || `video-${index}.${ext}`,
     type: videoFile.type || 'video/mp4',
@@ -458,6 +558,12 @@ const persistVideoFile = async (
 
 const asSavedPhoto = (value?: SavedPhotoFileData | string): SavedPhotoFileData | string | null =>
   value || null;
+const existingPhotoFor = (images: SavedLotData['mainImages'] | undefined, photo: PhotoFile) => {
+  const original = getPhotoOriginalUri(photo);
+  return images?.find((image) => typeof image === 'string' ? image === original :
+    (photo.mediaId && photo.mediaId === image.mediaId) ||
+    [image.uri, image.originalUri, image.sourceUri].includes(original));
+};
 
 const getExistingLot = (existingLots: SavedLotData[] | undefined, lotId: string, index: number) =>
   existingLots?.find((lot) => lot.id === lotId) || existingLots?.[index];
@@ -482,7 +588,7 @@ const persistLotsForStorage = async (
               index,
               destinationDir,
               keepManagedEditedUri,
-              asSavedPhoto(existingLot?.mainImages?.[index]),
+              asSavedPhoto(existingPhotoFor(existingLot?.mainImages, file)),
               draftId
             )
           )
@@ -499,7 +605,7 @@ const persistLotsForStorage = async (
               index,
               destinationDir,
               keepManagedEditedUri,
-              asSavedPhoto(existingLot?.extraImages?.[index]),
+              asSavedPhoto(existingPhotoFor(existingLot?.extraImages, file)),
               draftId
             )
           )
@@ -522,6 +628,8 @@ const persistLotsForStorage = async (
 
       return {
         id: lot.id,
+        lotNumber: lot.lotNumber,
+        title: lot.title,
         mode: lot.mode,
         mainImages,
         extraImages,
@@ -633,41 +741,7 @@ const draftTitleFor = (type: OfflineDraftType, formData: AutoSaveFormData, fallb
   return formData.contractNo?.trim() || formData.location?.trim() || 'Lot Listing';
 };
 
-const loadDraftsRaw = async (): Promise<OfflineReportDraft[]> => {
-  const raw = await AsyncStorage.getItem(DRAFTS_KEY);
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-};
-
-const saveDraftsRaw = async (drafts: OfflineReportDraft[]): Promise<void> => {
-  await AsyncStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
-};
-
-const deleteDraftDirectory = async (id: string): Promise<void> => {
-  const draftDir = getDraftImagesDir(id);
-  const legacyDraftDir = getLegacyDraftImagesDir(id);
-  try {
-    const info = await FileSystem.getInfoAsync(draftDir);
-    if (info.exists) {
-      await FileSystem.deleteAsync(draftDir, { idempotent: true });
-    }
-  } catch {
-    // ignore cleanup failures
-  }
-  try {
-    const legacyInfo = await FileSystem.getInfoAsync(legacyDraftDir);
-    if (legacyInfo.exists) {
-      await FileSystem.deleteAsync(legacyDraftDir, { idempotent: true });
-    }
-  } catch {
-    // ignore cleanup failures
-  }
-};
+const loadDraftsRaw = () => OfflineCaptureStore.listDrafts();
 
 const normalizeAutoSaveData = async (parsed: AutoSaveData): Promise<AutoSaveData> => {
   for (const [lotIndex, lot] of parsed.lots.entries()) {
@@ -724,112 +798,86 @@ const normalizeDraftForRead = async (draft: OfflineReportDraft): Promise<Offline
 };
 
 const replaceOrAppendDraft = async (draft: OfflineReportDraft): Promise<OfflineReportDraft> => {
-  const drafts = await loadDraftsRaw();
-  const normalizedContractNo = getDraftNormalizedContractNo(draft);
-  const existingIndex = drafts.findIndex(
-    (item) =>
-      item.id === draft.id ||
-      (item.type === draft.type && getDraftNormalizedContractNo(item) === normalizedContractNo)
-  );
-
-  const nextDrafts = [...drafts];
-  if (existingIndex >= 0) {
-    nextDrafts[existingIndex] = {
-      ...draft,
-      id: nextDrafts[existingIndex].id || draft.id,
-      createdAt: nextDrafts[existingIndex].createdAt || draft.createdAt,
-    };
-  } else {
-    nextDrafts.push(draft);
-  }
-
-  await saveDraftsRaw(nextDrafts);
-  return normalizeDraftForRead(existingIndex >= 0 ? nextDrafts[existingIndex] : draft);
+  const existing = await OfflineCaptureStore.getDraft(draft.id);
+  return normalizeDraftForRead(await OfflineCaptureStore.saveDraft({ ...existing, ...draft,
+    createdAt: existing?.createdAt || draft.createdAt, localRevision: existing?.localRevision }));
 };
 
 export const AutoSaveService = {
+  setOwner(ownerId: string | null) {
+    setUploadOwner(ownerId);
+    OfflineCaptureStore.setOwner(ownerId);
+    LocalMediaStore.setOwner(ownerId);
+  },
+  initialize: () => OfflineCaptureStore.initialize(),
+  listLegacyDrafts: () => OfflineCaptureStore.listLegacyDrafts(),
+  claimLegacyDraft: (id: string) => OfflineCaptureStore.claimLegacyDraft(id),
+  getDraftSummaries: (type?: OfflineDraftType) => OfflineCaptureStore.listSummaries(type),
   async migrateLegacyAutoSaveIfNeeded(): Promise<void> {
-    try {
-      const alreadyMigrated = await AsyncStorage.getItem(LEGACY_MIGRATED_KEY);
-      if (alreadyMigrated) return;
-
-      const raw = await AsyncStorage.getItem(AUTO_SAVE_KEY);
-      if (!raw) {
-        await AsyncStorage.setItem(LEGACY_MIGRATED_KEY, '1');
-        return;
-      }
-
-      const parsed: AutoSaveData = JSON.parse(raw);
-      if (parsed.formType !== 'asset' && parsed.formType !== 'lotListing') {
-        await AsyncStorage.setItem(LEGACY_MIGRATED_KEY, '1');
-        return;
-      }
-
-      const existing = await loadDraftsRaw();
-      const now = parsed.savedAt || new Date().toISOString();
-      const id = makeDraftId(parsed.formType);
-      const contractNo = parsed.formData.contractNo?.trim() || undefined;
-      existing.push({
-        id,
-        type: parsed.formType,
-        title: draftTitleFor(parsed.formType, parsed.formData),
-        contractNo,
-        normalizedContractNo: normalizeDraftContractNo(contractNo) || undefined,
-        formData: parsed.formData,
-        lots: parsed.lots,
-        activeLotIdx: parsed.activeLotIdx,
-        createdAt: now,
-        updatedAt: now,
-      });
-      await saveDraftsRaw(existing);
-      await AsyncStorage.setItem(LEGACY_MIGRATED_KEY, '1');
-    } catch (error) {
-      console.error('Error migrating legacy auto-save:', error);
-    }
+    await OfflineCaptureStore.initialize();
   },
 
   async getDrafts(type?: OfflineDraftType): Promise<OfflineReportDraft[]> {
+    const ownerId = OfflineCaptureStore.getOwnerId();
     await this.migrateLegacyAutoSaveIfNeeded();
+    if (ownerId !== OfflineCaptureStore.getOwnerId()) throw new Error('The signed-in account changed while opening drafts.');
     const drafts = await loadDraftsRaw();
     const filtered = type ? drafts.filter((draft) => draft.type === type) : drafts;
     const normalized = await Promise.all(filtered.map((draft) => normalizeDraftForRead(draft)));
+    if (ownerId !== OfflineCaptureStore.getOwnerId()) throw new Error('The signed-in account changed while opening drafts.');
     return normalized.sort(
       (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
     );
   },
 
   async getDraft(id: string): Promise<OfflineReportDraft | null> {
-    await this.migrateLegacyAutoSaveIfNeeded();
-    const drafts = await loadDraftsRaw();
-    const draft = drafts.find((item) => item.id === id);
-    return draft ? normalizeDraftForRead(draft) : null;
+    const ownerId = OfflineCaptureStore.getOwnerId();
+    const draft = await OfflineCaptureStore.getDraft(id);
+    const normalized = draft ? await normalizeDraftForRead(draft) : null;
+    if (ownerId !== OfflineCaptureStore.getOwnerId()) throw new Error('The signed-in account changed while opening this draft.');
+    return normalized;
   },
 
   async saveDraft(args: {
+    explicitActivitySave?: boolean;
     id?: string | null;
     type: OfflineDraftType;
     title?: string;
     formData: AutoSaveFormData;
     lots: AutoSaveLotInput[];
     activeLotIdx: number;
+    captureMode?: CaptureModePreference;
   }): Promise<OfflineReportDraft> {
+    const ownerId = OfflineCaptureStore.getOwnerId();
+    if (!ownerId) throw new Error('Sign in before saving a report draft.');
     await this.migrateLegacyAutoSaveIfNeeded();
-
-    const drafts = await loadDraftsRaw();
+    if (OfflineCaptureStore.getOwnerId() !== ownerId) throw new Error('The signed-in account changed while saving.');
+    return serializeDraftSave(`${ownerId}:${args.id || args.formData.clientSubmissionId || makeDraftId(args.type)}`, async () => {
+    if (OfflineCaptureStore.getOwnerId() !== ownerId) throw new Error('The signed-in account changed while saving.');
     const contractNo = args.formData.contractNo?.trim();
     const normalizedContractNo = normalizeDraftContractNo(contractNo);
-    if (!normalizedContractNo) {
+    if (!normalizedContractNo && (args.captureMode || args.formData.captureMode || 'online') !== 'offline') {
       throw new Error('Contract number is required before saving this draft.');
     }
 
-    const idIndex = args.id ? drafts.findIndex((draft) => draft.id === args.id) : -1;
-    const contractIndex = drafts.findIndex(
-      (draft) => draft.type === args.type && getDraftNormalizedContractNo(draft) === normalizedContractNo
-    );
-    const existingIndex = contractIndex >= 0 ? contractIndex : idIndex;
-    const existing = existingIndex >= 0 ? drafts[existingIndex] : null;
-    const duplicateIdToRemove =
-      idIndex >= 0 && contractIndex >= 0 && idIndex !== contractIndex ? drafts[idIndex].id : null;
+    // A contract groups multiple independent reports; only an exact draft ID is a retry.
+    const existing = args.id ? await OfflineCaptureStore.getDraft(args.id) : null;
+    const formData: AutoSaveFormData = { ...existing?.formData, ...args.formData,
+      clientSubmissionId: args.formData.clientSubmissionId || existing?.formData.clientSubmissionId,
+      auctioneerWorkItemId: args.formData.auctioneerWorkItemId || existing?.formData.auctioneerWorkItemId,
+      auctioneerSnapshot: args.formData.auctioneerSnapshot || existing?.formData.auctioneerSnapshot,
+      auctionsoftSnapshot: args.formData.auctionsoftSnapshot || existing?.formData.auctionsoftSnapshot,
+    };
+    if (existing?.formData.legacyRequiresIncomingReview) {
+      const currentSetup = args.formData.auctioneerSnapshot;
+      const currentTask = args.formData.auctionsoftSnapshot;
+      const verifiedModern = !!currentSetup && currentSetup.workItemId === existing.formData.auctioneerWorkItemId &&
+        currentSetup.clientSubmissionId === existing.formData.clientSubmissionId && currentSetup.reportType === args.type &&
+        currentSetup.contract.contractNo === existing.formData.contractNo;
+      const verifiedLegacy = !!currentTask && currentTask.task.rowGuid === (existing.formData.auctionsoft?.taskId || existing.formData.auctionManagementTaskId) &&
+        currentTask.contract.rowGuid === existing.formData.auctionsoft?.contractId;
+      formData.legacyRequiresIncomingReview = !(verifiedModern || verifiedLegacy);
+    }
     const id = existing?.id || args.id || makeDraftId(args.type);
     const now = new Date().toISOString();
     const lots = await persistLotsForStorage(
@@ -848,6 +896,9 @@ export const AutoSaveService = {
     }
 
     const draft: OfflineReportDraft = {
+      ...existing,
+      ownerId,
+      captureMode: args.captureMode || args.formData.captureMode || existing?.captureMode || 'online',
       id,
       type: args.type,
       title: draftTitleFor(args.type, args.formData, args.title),
@@ -855,62 +906,63 @@ export const AutoSaveService = {
       normalizedContractNo,
       cloudId: existing?.cloudId,
       cloudSyncedAt: existing?.cloudSyncedAt,
-      formData: args.formData,
+      formData,
       lots,
       activeLotIdx: args.activeLotIdx,
       createdAt: existing?.createdAt || now,
       updatedAt: now,
     };
 
-    let nextDrafts = drafts;
-    if (existingIndex >= 0) {
-      nextDrafts = [...drafts];
-      nextDrafts[existingIndex] = draft;
-    } else {
-      nextDrafts = [...drafts, draft];
-    }
-
-    if (duplicateIdToRemove) {
-      nextDrafts = nextDrafts.filter((item) => item.id !== duplicateIdToRemove);
-    }
-
-    await saveDraftsRaw(nextDrafts);
-    await LocalMediaStore.pruneDraftFiles(id, getDraftKeepUris(draft));
-    if (duplicateIdToRemove) {
-      await deleteDraftDirectory(duplicateIdToRemove);
-    }
-    return draft;
+    if (existing) return OfflineCaptureStore.updateDraft(id, (current) => ({ ...current, ...draft,
+      localRevision: current.localRevision, cloudId: current.cloudId, cloudSyncedAt: current.cloudSyncedAt,
+      cloudSyncError: current.cloudSyncError, cloudSyncErrorKind: current.cloudSyncErrorKind,
+      cloudSyncRetryAt: current.cloudSyncRetryAt, cloudSyncAttempts: current.cloudSyncAttempts,
+      cloudSyncLastAttemptAt: current.cloudSyncLastAttemptAt,
+    }), args.explicitActivitySave);
+    return OfflineCaptureStore.saveDraft(draft, args.explicitActivitySave);
+    });
   },
 
-  async markDraftCloudSynced(id: string, cloudId: string): Promise<void> {
-    const drafts = await loadDraftsRaw();
+  async markDraftCloudSynced(
+    id: string,
+    cloudId: string,
+    expectedUpdatedAt?: string
+  ): Promise<void> {
     const now = new Date().toISOString();
-    await saveDraftsRaw(
-      drafts.map((draft) =>
-        draft.id === id
+    await OfflineCaptureStore.updateDraft(id, (draft) =>
+        (!expectedUpdatedAt || draft.updatedAt === expectedUpdatedAt)
           ? {
               ...draft,
               cloudId,
               cloudSyncedAt: now,
               cloudSyncError: undefined,
+              cloudSyncErrorKind: undefined,
+              cloudSyncRetryAt: undefined,
+              cloudSyncAttempts: undefined,
+              cloudSyncLastAttemptAt: undefined,
             }
           : draft
-      )
     );
   },
 
-  async markDraftCloudSyncError(id: string, message: string): Promise<void> {
-    const drafts = await loadDraftsRaw();
-    await saveDraftsRaw(
-      drafts.map((draft) =>
-        draft.id === id
-          ? {
+  async markDraftCloudSyncError(
+    id: string,
+    message: string,
+    metadata: {
+      kind?: DraftCloudSyncErrorKind;
+      retryAt?: number;
+      attempts?: number;
+      lastAttemptAt?: string;
+    } = {}
+  ): Promise<void> {
+    await OfflineCaptureStore.updateDraft(id, (draft) => ({
               ...draft,
               cloudSyncError: message,
-            }
-          : draft
-      )
-    );
+              cloudSyncErrorKind: metadata.kind,
+              cloudSyncRetryAt: metadata.retryAt,
+              cloudSyncAttempts: metadata.attempts,
+              cloudSyncLastAttemptAt: metadata.lastAttemptAt,
+            }));
   },
 
   async saveCloudDraftSnapshot(args: {
@@ -950,39 +1002,25 @@ export const AutoSaveService = {
   },
 
   async deleteDraft(id: string): Promise<void> {
-    const drafts = await loadDraftsRaw();
-    const draft = drafts.find((item) => item.id === id);
-
-    if (draft) {
-      for (const lot of draft.lots) {
-        for (const image of [...lot.mainImages, ...lot.extraImages]) {
-          if (typeof image === 'string') {
-            await deleteLocalFile(image);
-          } else {
-            await deleteLocalFile(image.uri);
-            await deleteLocalFile(image.originalUri);
-            await deleteLocalFile(image.editedUri);
-          }
-        }
-
-        for (const video of lot.videoFiles || []) {
-          await deleteLocalFile(typeof video === 'string' ? video : video.uri);
-        }
-      }
-    }
-
-    await deleteDraftDirectory(id);
-
-    await saveDraftsRaw(drafts.filter((item) => item.id !== id));
+    await OfflineCaptureStore.setSubmissionState(id, 'discarded');
   },
 
   async removeDraftRecordOnly(id: string): Promise<void> {
-    const drafts = await loadDraftsRaw();
-    await saveDraftsRaw(drafts.filter((item) => item.id !== id));
+    const draft = await OfflineCaptureStore.getDraft(id);
+    if (!draft) return;
+    // An acceptance receipt must remain available to the metadata outbox after UI cleanup.
+    if (draft.submissionState !== 'accepted' && draft.submissionState !== 'submitted') {
+      await OfflineCaptureStore.setSubmissionState(id, 'discarded');
+    }
   },
 
   async deleteDraftMedia(id: string): Promise<void> {
-    await deleteDraftDirectory(id);
+    const owner = OfflineCaptureStore.getOwnerId();
+    // Gallery/camera originals are user-owned. Managed copies are only pruned after all
+    // owners, queued submissions and legacy recovery references have been considered.
+    const protectedUris = await OfflineCaptureStore.getProtectedMediaUris();
+    if (OfflineCaptureStore.getOwnerId() !== owner) throw new Error('The signed-in account changed before cleaning local media.');
+    await LocalMediaStore.pruneDraftFiles(id, protectedUris);
   },
 
   async getLocalStorageSummary(
@@ -1031,20 +1069,27 @@ export const AutoSaveService = {
   },
 
   async cleanupOrphanedMedia(activeFileUris: string[] = [], maxNativeCacheAgeMs?: number): Promise<number> {
+    const owner = OfflineCaptureStore.getOwnerId();
+    const assertOwner = () => { if (OfflineCaptureStore.getOwnerId() !== owner) throw new Error('The signed-in account changed while cleaning local media.'); };
     const drafts = await loadDraftsRaw();
+    assertOwner();
     const activeUris = [
+      ...await OfflineCaptureStore.getProtectedMediaUris(),
       ...activeFileUris,
       ...drafts.flatMap((draft) => getDraftKeepUris(draft)),
       ...drafts.flatMap((draft) => getDraftSourceUris(draft)),
     ];
+    assertOwner();
     const deletedDraftBytes = await LocalMediaStore.cleanupOrphanedDraftFolders(
       drafts.map((draft) => draft.id),
       activeUris
     );
+    assertOwner();
     const deletedNativeBytes = await LocalMediaStore.cleanupNativeCameraCache(
       activeUris,
       maxNativeCacheAgeMs
     );
+    assertOwner();
     return deletedDraftBytes + deletedNativeBytes;
   },
 
@@ -1073,6 +1118,7 @@ export const AutoSaveService = {
       if (!data) return null;
 
       const parsed: AutoSaveData = JSON.parse(data);
+      if (parsed.formType === 'asset' || parsed.formType === 'lotListing') return null;
       return normalizeAutoSaveData(parsed);
     } catch (error) {
       console.error('Error getting auto-save:', error);
@@ -1086,6 +1132,10 @@ export const AutoSaveService = {
     activeLotIdx: number,
     formType: 'asset' | 'realEstate' | 'lotListing' = 'asset'
   ): Promise<void> {
+    if (formType === 'asset' || formType === 'lotListing') {
+      await this.saveDraft({ type: formType, formData, lots, activeLotIdx });
+      return;
+    }
     try {
       await ensureDirectoryExists();
 
@@ -1122,6 +1172,12 @@ export const AutoSaveService = {
   },
 
   async deleteAutoSave(): Promise<void> {
+    await OfflineCaptureStore.initialize();
+    const raw = await AsyncStorage.getItem(AUTO_SAVE_KEY);
+    if (raw) {
+      const legacy = JSON.parse(raw) as AutoSaveData;
+      if (legacy.formType === 'asset' || legacy.formType === 'lotListing') return;
+    }
     try {
       const existing = await this.getAutoSave();
       if (existing) {

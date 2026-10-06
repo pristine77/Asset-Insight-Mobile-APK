@@ -18,13 +18,21 @@ import AutoSaveService, {
   OfflineReportDraft,
   SavedLotData,
   SavedPhotoFileData,
+  SavedVideoFileData,
 } from '../services/autoSaveService';
 import OfflineQueueService, { OfflineQueueJob } from '../services/offlineQueueService';
+import OfflineCaptureStore from '../services/offlineCaptureStore';
+import OfflineCaptureList from '../components/OfflineCaptureList';
+import { useBackgroundUploads } from '../components/useBackgroundUploads';
+import backgroundUploadManager, { describeBackgroundUpload } from '../services/backgroundUploadManager';
 import reportDraftService, { ReportDraft } from '../services/reportDraftService';
+import DraftSyncService from '../services/draftSyncService';
+import {
+  canAttemptDraftCloudSync,
+  getDraftCloudSyncMessage,
+  isRecoverableDraftCloudError,
+} from '../services/draftCloudSyncState';
 import api from '../services/api';
-import assetService, { AssetCreateDetails, MixedLot as AssetMixedLot } from '../services/assetService';
-import lotListingService, { LotListingDetails, LotListingLot } from '../services/lotListingService';
-import { normalizeHiddenLocation } from '../utils/mobileLocation';
 import type { ConnectivityStatus } from '../services/connectivityService';
 
 type LegacyFormType = 'asset' | 'realEstate';
@@ -57,7 +65,7 @@ type UnifiedDraftItem =
       title: string;
       contractNo: string;
       updatedAt: string;
-      status: 'Local' | 'Syncing' | 'Cloud saved' | 'Failed';
+      status: 'Local' | 'Syncing' | 'Waiting to upload' | 'Cloud saved' | 'Failed';
       counts: { lots: number; images: number; videos: number };
       draft: OfflineReportDraft;
       cloud?: ReportDraft;
@@ -130,16 +138,6 @@ const normalizeContractNo = (value?: string | null) =>
 
 const draftKey = (type: string, value?: string | null) => `${type}:${normalizeContractNo(value)}`;
 
-const asPhoto = (value: SavedPhotoFileData | string, fallbackName: string) => {
-  if (typeof value === 'string') {
-    return { uri: value, name: fallbackName, type: 'image/jpeg' };
-  }
-  return {
-    uri: value.displayUri || value.editedUri || value.uri || value.originalUri || '',
-    name: value.name || fallbackName,
-    type: value.type || 'image/jpeg',
-  };
-};
 
 const getDraftCounts = (draft: Pick<OfflineReportDraft | ReportDraft, 'lots'> & { media?: any[] }) => {
   let images = 0;
@@ -203,115 +201,85 @@ const isDraftCloudClean = (draft: OfflineReportDraft, cloud?: ReportDraft) => {
   return new Date(syncedAt).getTime() >= new Date(draft.updatedAt).getTime();
 };
 
-const buildAssetSubmission = (draft: OfflineReportDraft) => {
-  const form = draft.formData;
-  const lots: AssetMixedLot[] = draft.lots.map((lot) => ({
-    id: lot.id,
-    files: lot.mainImages.map((image, index) => asPhoto(image, `${lot.id}-main-${index}.jpg`)),
-    extraFiles: lot.extraImages.map((image, index) => asPhoto(image, `${lot.id}-extra-${index}.jpg`)),
-    videoFile: lot.videoFiles?.[0]
-      ? typeof lot.videoFiles[0] === 'string'
-        ? { uri: lot.videoFiles[0], name: `${lot.id}-video.mp4`, type: 'video/mp4' }
-        : lot.videoFiles[0]
-      : undefined,
-    coverIndex: lot.coverIndex || 0,
-    mode: lot.mode,
-  }));
+// A draft the background upload line holds -- sending, waiting in line, paused
+// or needing attention -- is not cloud-synced by this screen (2026-10-02). That
+// sync ends by replacing the local draft with its cloud copy and deleting its
+// local photos, which the background upload reads and a Resume from the upload
+// bar sends again. syncOneDraft checks again after the cloud save, because
+// Submit can hand the draft over while that save is still running.
+const heldByBackgroundUpload = (draftId: string) => Boolean(backgroundUploadManager.statusFor(draftId));
 
-  const details: AssetCreateDetails = {
-    client_name: form.clientName?.trim() || form.contractNo?.trim() || 'Asset Report',
-    owner_name: form.ownerName,
-    prepared_for: form.preparedFor,
-    appraisal_purpose: form.appraisalPurpose || 'Asset appraisal',
-    effective_date: form.effectiveDate || new Date().toISOString().slice(0, 10),
-    inspection_date: form.inspectionDate,
-    industry: form.industry,
-    contract_no: form.contractNo,
-    location: form.location || normalizeHiddenLocation().location,
-    latitude: form.latitude,
-    longitude: form.longitude,
-    appraiser: form.appraiser || 'Asset Insight',
-    appraisal_company: form.appraisalCompany,
-    currency: form.currency || 'CAD',
-    language: form.language || 'en',
-    grouping_mode: 'mixed',
-    include_valuation_table: form.includeValuationTable,
-    valuation_methods: form.selectedValuationMethods,
-    include_damage_analysis: form.includeDamageAnalysis,
-    factors_age_condition: form.factorsAgeCondition,
-    factors_quality: form.factorsQuality,
-    factors_analysis: form.factorsAnalysis,
-    mixed_lots: lots.map((lot) => ({
-      count: lot.files.length,
-      extra_count: lot.extraFiles.length,
-      cover_index: lot.coverIndex || 0,
-      mode: lot.mode || 'single_lot',
-    })),
-  };
-
-  return { details, lots };
-};
-
-const buildLotListingSubmission = (draft: OfflineReportDraft) => {
-  const form = draft.formData;
-  const lots: LotListingLot[] = draft.lots.map((lot, index) => ({
-    id: lot.id,
-    files: lot.mainImages.map((image, imageIndex) => asPhoto(image, `${lot.id}-main-${imageIndex}.jpg`)),
-    extraFiles: lot.extraImages.map((image, imageIndex) => asPhoto(image, `${lot.id}-extra-${imageIndex}.jpg`)),
-    lot_number: index + 1,
-    mode: lot.mode,
-    coverIndex: lot.coverIndex,
-  }));
-
-  const details: LotListingDetails = {
-    contract_no: form.contractNo?.trim() || draft.contractNo || '',
-    sales_date: form.salesDate || new Date().toISOString().slice(0, 10),
-    location: form.location?.trim() || normalizeHiddenLocation().location,
-    latitude: form.latitude,
-    longitude: form.longitude,
-    language: form.language || 'en',
-    currency: form.currency || 'CAD',
-    include_damage_analysis: form.includeDamageAnalysis !== false,
-    valuation_methods: form.selectedValuationMethods?.length ? form.selectedValuationMethods : ['FML'],
-    mixed_lots: lots.map((lot) => ({
-      count: lot.files.length,
-      extra_count: lot.extraFiles?.length || 0,
-      cover_index: lot.coverIndex || 0,
-      mode: lot.mode || 'single_lot',
-    })),
-  };
-
-  return { details, lots };
-};
 
 const hydrateCloudLots = (cloud: ReportDraft): SavedLotData[] => {
-  const lots = JSON.parse(JSON.stringify(cloud.lots || [])) as SavedLotData[];
-  const media = cloud.media || [];
+  const lots = (JSON.parse(JSON.stringify(cloud.lots || [])) as SavedLotData[]).map(
+    (lot, index): SavedLotData => ({
+      ...lot,
+      id: String(lot.id || `draft-lot-${index + 1}`),
+      mainImages: [] as SavedPhotoFileData[],
+      extraImages: [] as SavedPhotoFileData[],
+      videoFiles: [] as SavedVideoFileData[],
+    })
+  );
+  const lotById = new Map(lots.map((lot) => [String(lot.id), lot]));
+  const lotRank = new Map(lots.map((lot, index) => [String(lot.id), index]));
+  const slotRank = { main: 0, extra: 1, video: 2 } as const;
+  const media = [...(cloud.media || [])].sort((a, b) => {
+    const lot =
+      (lotRank.get(String(a.lotId || '')) ?? Number.MAX_SAFE_INTEGER) -
+      (lotRank.get(String(b.lotId || '')) ?? Number.MAX_SAFE_INTEGER);
+    const slot =
+      (slotRank[a.slot as keyof typeof slotRank] ?? 9) -
+      (slotRank[b.slot as keyof typeof slotRank] ?? 9);
+    const orderA = Number.isFinite(Number(a.originalOrder))
+      ? Number(a.originalOrder)
+      : Number(a.captureOrder ?? a.index ?? 0);
+    const orderB = Number.isFinite(Number(b.originalOrder))
+      ? Number(b.originalOrder)
+      : Number(b.captureOrder ?? b.index ?? 0);
+    return lot || slot || orderA - orderB || Number(a.index || 0) - Number(b.index || 0);
+  });
 
   for (const item of media) {
-    if (!item.url || !item.lotId || item.index === undefined || !item.slot) continue;
-    const lot = lots.find((candidate) => candidate.id === item.lotId);
+    if (!item.url || !item.lotId || !item.slot) continue;
+    const lot = lotById.get(String(item.lotId));
     if (!lot) continue;
 
-    const photo = {
+    const photo: SavedPhotoFileData = {
       uri: item.url,
       originalUri: item.url,
       displayUri: item.url,
       name: item.name || `${item.slot}-${item.index}.jpg`,
       type: item.mimeType || (item.slot === 'video' ? 'video/mp4' : 'image/jpeg'),
+      clientFileId: item.clientFileId,
+      localKey: item.localKey,
+      mediaId: item.mediaId || item.clientFileId,
+      lotId: item.lotId,
+      slot: item.slot === 'extra' ? 'extra' : 'main',
+      index: item.index,
+      captureOrder: item.captureOrder,
+      originalOrder: item.originalOrder,
+      size: item.verifiedSize || item.size,
     };
 
     if (item.slot === 'main') {
-      lot.mainImages[item.index] = photo;
+      lot.mainImages.push(photo);
     } else if (item.slot === 'extra') {
-      lot.extraImages[item.index] = photo;
+      lot.extraImages.push(photo);
     } else if (item.slot === 'video') {
-      lot.videoFiles = lot.videoFiles || [];
-      lot.videoFiles[item.index] = {
+      lot.videoFiles.push({
         uri: item.url,
         name: item.name || `video-${item.index}.mp4`,
         type: item.mimeType || 'video/mp4',
-      };
+        clientFileId: item.clientFileId,
+        localKey: item.localKey,
+        mediaId: item.mediaId || item.clientFileId,
+        lotId: item.lotId,
+        slot: 'video',
+        index: item.index,
+        captureOrder: item.captureOrder,
+        originalOrder: item.originalOrder,
+        size: item.verifiedSize || item.size,
+      });
     }
   }
 
@@ -336,6 +304,9 @@ const OfflineReportsScreen = ({
   const [syncing, setSyncing] = useState(false);
   const [syncingDraftIds, setSyncingDraftIds] = useState<Set<string>>(new Set());
   const [sendingIds, setSendingIds] = useState<Set<string>>(new Set());
+  // Re-renders with every background upload change, so each card shows its
+  // live status (services/backgroundUploadManager.ts).
+  useBackgroundUploads();
   const [storageSummary, setStorageSummary] = useState<{
     bytes: number;
     formatted: string;
@@ -348,23 +319,61 @@ const OfflineReportsScreen = ({
     totalFormatted?: string;
   } | null>(null);
 
-  const syncOneDraft = useCallback(async (draft: OfflineReportDraft) => {
+  const syncOneDraft = useCallback(async (draft: OfflineReportDraft, force = false) => {
+    if (!canAttemptDraftCloudSync(draft, { force }) || heldByBackgroundUpload(draft.id)) return;
     setSyncingDraftIds((prev) => new Set(prev).add(draft.id));
     try {
-      const cloud = await reportDraftService.upsertFromLocalDraft(draft);
-      await AutoSaveService.markDraftCloudSynced(draft.id, cloud.id || cloud._id || '');
+      const result = await DraftSyncService.syncDraft(draft, { force });
+      if (result.status === 'skipped') return;
+      if (result.status === 'failed') {
+        const latest = await AutoSaveService.getDraft(draft.id);
+        if (latest) {
+          setDrafts((prev) => prev.map((item) => (item.id === latest.id ? latest : item)));
+        }
+        return;
+      }
+
+      const cloud = result.cloud;
+      const current = await AutoSaveService.getDraft(draft.id);
+      if (current && current.updatedAt !== draft.updatedAt) {
+        // The form changed while this revision was uploading. Keep the newer
+        // local revision and let the next sync send it instead of overwriting it.
+        setDrafts((prev) => prev.map((item) => (item.id === current.id ? current : item)));
+        return;
+      }
+      if (heldByBackgroundUpload(draft.id)) return;
+
+      const saved = await AutoSaveService.saveCloudDraftSnapshot({
+        id: draft.id,
+        cloudId: cloud.id || cloud._id || '',
+        type: cloud.type,
+        title: cloud.title,
+        contractNo: cloud.contractNo,
+        normalizedContractNo: cloud.normalizedContractNo,
+        formData: cloud.formData,
+        lots: hydrateCloudLots(cloud),
+        activeLotIdx: cloud.activeLotIdx || 0,
+        createdAt: cloud.createdAt,
+        updatedAt: cloud.updatedAt,
+      });
+      // R2 is now the durable source. Remove the local byte cache only after
+      // every manifest row has been verified by the server.
+      await AutoSaveService.deleteDraftMedia(draft.id);
+      setDrafts((prev) => prev.map((item) => (item.id === saved.id ? saved : item)));
       setCloudDrafts((prev) => {
-        const key = draftKey(cloud.type, cloud.normalizedContractNo || cloud.contractNo);
-        const others = prev.filter((item) => draftKey(item.type, item.normalizedContractNo || item.contractNo) !== key);
+        const key = draftKey(cloud.type, cloud.clientDraftId || cloud.id || cloud._id);
+        const others = prev.filter((item) => draftKey(item.type, item.clientDraftId || item.id || item._id) !== key);
         return [cloud, ...others].sort(
           (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
         );
       });
-    } catch (error: any) {
-      await AutoSaveService.markDraftCloudSyncError(
-        draft.id,
-        error?.response?.data?.message || error?.message || 'Cloud sync failed'
-      );
+    } catch {
+      // DraftSyncService persists classified failures. This guard protects the
+      // screen from a local snapshot/update failure without exposing raw Axios text.
+      const latest = await AutoSaveService.getDraft(draft.id);
+      if (latest) {
+        setDrafts((prev) => prev.map((item) => (item.id === latest.id ? latest : item)));
+      }
     } finally {
       setSyncingDraftIds((prev) => {
         const next = new Set(prev);
@@ -376,7 +385,12 @@ const OfflineReportsScreen = ({
 
   const loadData = useCallback(async (syncAfterLoad = true) => {
     const [nextDrafts, nextJobs, connectivity] = await Promise.all([
-      AutoSaveService.getDrafts(),
+      OfflineCaptureStore.listSummaries().then(async (summaries) => {
+        const online = summaries.filter((draft) => draft.captureMode !== 'offline' && !draft.manualSubmissionRequired);
+        const drafts: OfflineReportDraft[] = [];
+        for (const summary of online) { const draft = await AutoSaveService.getDraft(summary.id); if (draft) drafts.push(draft); }
+        return drafts;
+      }),
       OfflineQueueService.getJobs(),
       OfflineQueueService.getConnectivityStatus(),
     ]);
@@ -426,12 +440,12 @@ const OfflineReportsScreen = ({
     if (connectivity.status === 'online' && syncAfterLoad) {
       const cloudByKey = new Map(
         nextCloudDrafts.map((draft) => [
-          draftKey(draft.type, draft.normalizedContractNo || draft.contractNo),
+          draftKey(draft.type, draft.clientDraftId || draft.id || draft._id),
           draft,
         ])
       );
       for (const draft of nextDrafts) {
-        const cloud = cloudByKey.get(draftKey(draft.type, draft.normalizedContractNo || draft.contractNo));
+        const cloud = cloudByKey.get(draftKey(draft.type, draft.id));
         if (!isDraftCloudClean(draft, cloud)) {
           void syncOneDraft(draft);
         }
@@ -468,6 +482,9 @@ const OfflineReportsScreen = ({
     };
   }, [loadData]);
 
+  // A draft accepted in the background leaves the list at once.
+  useEffect(() => backgroundUploadManager.onAccepted(() => { void loadData(false); }), [loadData]);
+
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
     try {
@@ -480,7 +497,7 @@ const OfflineReportsScreen = ({
   const cloudByKey = useMemo(() => {
     const map = new Map<string, ReportDraft>();
     for (const draft of cloudDrafts) {
-      map.set(draftKey(draft.type, draft.normalizedContractNo || draft.contractNo), draft);
+      map.set(draftKey(draft.type, draft.clientDraftId || draft.id || draft._id), draft);
     }
     return map;
   }, [cloudDrafts]);
@@ -490,13 +507,15 @@ const OfflineReportsScreen = ({
     const merged: UnifiedDraftItem[] = [];
 
     for (const draft of drafts) {
-      const key = draftKey(draft.type, draft.normalizedContractNo || draft.contractNo || draft.formData.contractNo);
+      const key = draftKey(draft.type, draft.id);
       localKeys.add(key);
       const cloud = cloudByKey.get(key);
       const status: UnifiedDraftItem['status'] = syncingDraftIds.has(draft.id)
         ? 'Syncing'
         : draft.cloudSyncError
-          ? 'Failed'
+          ? isRecoverableDraftCloudError(draft)
+            ? 'Waiting to upload'
+            : 'Failed'
           : isDraftCloudClean(draft, cloud)
             ? 'Cloud saved'
             : 'Local';
@@ -516,7 +535,7 @@ const OfflineReportsScreen = ({
     }
 
     for (const cloud of cloudDrafts) {
-      const key = draftKey(cloud.type, cloud.normalizedContractNo || cloud.contractNo);
+      const key = draftKey(cloud.type, cloud.clientDraftId || cloud.id || cloud._id);
       if (localKeys.has(key)) continue;
       merged.push({
         id: `cloud:${cloud.id || cloud._id}`,
@@ -581,7 +600,9 @@ const OfflineReportsScreen = ({
 
     return {
       total: items.length,
-      local: items.filter((item) => item.status === 'Local').length,
+      local: items.filter(
+        (item) => item.status === 'Local' || item.status === 'Waiting to upload'
+      ).length,
       queued: jobs.length,
       images: media.images,
       videos: media.videos,
@@ -598,7 +619,7 @@ const OfflineReportsScreen = ({
     setSyncing(true);
     try {
       for (const draft of unsyncedDrafts) {
-        await syncOneDraft(draft);
+        await syncOneDraft(draft, true);
       }
       await loadData(false);
     } finally {
@@ -611,7 +632,7 @@ const OfflineReportsScreen = ({
       Alert.alert(
         connectionStatus === 'offline' ? 'No Internet Connection' : 'Server Unavailable',
         connectionStatus === 'offline'
-          ? 'This report is safely queued. Connect to the internet and it will retry automatically.'
+          ? 'Upload paused on this device. Connect and tap Resume upload; it will not submit automatically.'
           : 'Internet may be available, but the server cannot be reached right now. The report remains safely queued.'
       );
       return;
@@ -676,74 +697,22 @@ const OfflineReportsScreen = ({
     }
   }, [jobs]);
 
-  const submitLocalDraft = useCallback(async (draft: OfflineReportDraft, cloudId?: string) => {
-    setSendingIds((prev) => new Set(prev).add(draft.id));
-    try {
-      const connectivity = await OfflineQueueService.getConnectivityStatus();
-      let queued = connectivity.status === 'offline';
-
-      const submitOrQueue = async () => {
-        if (draft.type === 'asset') {
-          const payload = buildAssetSubmission(draft);
-          if (queued) {
-            await OfflineQueueService.enqueueAssetReport(payload.details, payload.lots, {
-              sourceDraftId: draft.id,
-            });
-          } else {
-            await assetService.createAssetReport(payload.details, payload.lots);
-          }
-        } else {
-          const payload = buildLotListingSubmission(draft);
-          if (queued) {
-            await OfflineQueueService.enqueueLotListing(payload.details, payload.lots, {
-              sourceDraftId: draft.id,
-            });
-          } else {
-            await lotListingService.createLotListing(payload.details, payload.lots);
-          }
-        }
-      };
-
-      try {
-        await submitOrQueue();
-      } catch (error: any) {
-        if (!queued && (await OfflineQueueService.shouldQueueAfterError(error))) {
-          queued = true;
-          await submitOrQueue();
-        } else {
-          throw error;
-        }
-      }
-
-      const targetCloudId = draft.cloudId || cloudId;
-      if (targetCloudId) {
-        await reportDraftService.delete(targetCloudId).catch(() => undefined);
-      }
-      if (!queued) {
-        await AutoSaveService.deleteDraft(draft.id);
-      } else {
-        await AutoSaveService.removeDraftRecordOnly(draft.id);
-      }
-      await loadData(false);
-      Alert.alert(
-        queued ? 'Saved for Upload' : 'Upload Complete',
-        queued
-          ? 'No internet connection was detected. Your report is safely queued and will upload automatically when the connection returns.'
-          : 'Your report was uploaded successfully and is now processing in the background.'
-      );
-    } catch (error: any) {
-      const feedback = OfflineQueueService.getSubmissionError(error);
-      Alert.alert(feedback.title, feedback.message);
-    } finally {
-      setSendingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(draft.id);
-        return next;
-      });
-    }
-  }, [loadData]);
+  const submitLocalDraft = useCallback((draft: OfflineReportDraft) => {
+    // Every draft uses the canonical form's complete settings, validation, and
+    // same-ID upload flow. Opening this screen never submits or clears a draft.
+    onContinueDraft(draft.id, draft.type);
+  }, [onContinueDraft]);
 
   const continueCloudDraft = useCallback(async (cloud: ReportDraft) => {
+    // Restoring from the cloud replaces the local draft and deletes its local
+    // media, so never while that draft is uploading in the background.
+    if (cloud.clientDraftId && backgroundUploadManager.isBusy(cloud.clientDraftId)) {
+      Alert.alert('Uploading in the background', 'This draft is uploading in the background. Pause it from the upload bar to edit it, or continue when the upload finishes.');
+      return;
+    }
+    // A paused upload of the local copy refers to the photos about to be
+    // replaced; it must not be resumable from the upload bar afterwards.
+    if (cloud.clientDraftId) backgroundUploadManager.forget(cloud.clientDraftId);
     const local = await AutoSaveService.saveCloudDraftSnapshot({
       id: cloud.clientDraftId,
       cloudId: cloud.id || cloud._id,
@@ -757,11 +726,18 @@ const OfflineReportsScreen = ({
       createdAt: cloud.createdAt,
       updatedAt: cloud.updatedAt,
     });
+    // The restored draft references R2 URLs, so any older local byte cache is
+    // no longer needed and cannot become a competing source of image order.
+    await AutoSaveService.deleteDraftMedia(local.id);
     await loadData(false);
     onContinueDraft(local.id, local.type);
   }, [loadData, onContinueDraft]);
 
   const deleteItem = useCallback((item: UnifiedDraftItem) => {
+    if (item.source === 'local' && backgroundUploadManager.isBusy(item.draft.id)) {
+      Alert.alert('Uploading in the background', 'This draft is uploading in the background. Pause it from the upload bar before deleting it.');
+      return;
+    }
     const title = item.title || 'draft';
     Alert.alert('Delete Draft', `Delete "${title}"?`, [
       { text: 'Cancel', style: 'cancel' },
@@ -770,6 +746,9 @@ const OfflineReportsScreen = ({
         style: 'destructive',
         onPress: async () => {
           if (item.source === 'local') {
+            if (backgroundUploadManager.isBusy(item.draft.id)) return;
+            // A paused background upload of this draft must not be resumable once it is gone.
+            backgroundUploadManager.forget(item.draft.id);
             if (item.draft.cloudId) {
               await reportDraftService.delete(item.draft.cloudId).catch(() => undefined);
             }
@@ -819,11 +798,17 @@ const OfflineReportsScreen = ({
     const status = statusStyle(item.status);
     const recoverableQueueError =
       item.source === 'queue' && isRecoverableQueueError(item.job);
+    const recoverableDraftError =
+      item.source === 'local' && isRecoverableDraftCloudError(item.draft);
     const busy =
       item.status === 'Syncing' ||
       item.status === 'Uploading' ||
       (item.source === 'local' && sendingIds.has(item.draft.id)) ||
       (item.source === 'queue' && sendingIds.has(item.job.id));
+    // Live status from the background upload line; a draft it is sending or
+    // holding in line cannot be deleted (the bar's Pause comes first).
+    const background = item.source === 'local' ? backgroundUploadManager.statusFor(item.draft.id) : undefined;
+    const uploadingInBackground = item.source === 'local' && backgroundUploadManager.isBusy(item.draft.id);
 
     return (
       <View key={item.id} style={styles.card}>
@@ -847,11 +832,34 @@ const OfflineReportsScreen = ({
         <Text style={styles.contractText}>Contract: {item.contractNo || '-'}</Text>
         {renderMeta(item.counts)}
 
+        {background ? (
+          <View style={[styles.errorBox, background.status === 'attention' ? styles.retryBox : styles.backgroundBox]}>
+            <Feather
+              name={background.status === 'attention' ? 'alert-triangle' : 'upload-cloud'}
+              size={14}
+              color={background.status === 'attention' ? '#B45309' : '#2563EB'}
+            />
+            <Text
+              style={[styles.errorText, background.status === 'attention' ? styles.retryText : styles.backgroundText]}
+              accessibilityLiveRegion="polite"
+            >
+              Background upload: {describeBackgroundUpload(background)}
+            </Text>
+          </View>
+        ) : null}
+
         {item.source === 'local' && item.draft.cloudSyncError ? (
-          <View style={styles.errorBox}>
-            <Feather name="alert-triangle" size={14} color="#DC2626" />
-            <Text style={styles.errorText} numberOfLines={2}>
-              {item.draft.cloudSyncError}
+          <View style={[styles.errorBox, recoverableDraftError && styles.retryBox]}>
+            <Feather
+              name={recoverableDraftError ? 'wifi-off' : 'alert-triangle'}
+              size={14}
+              color={recoverableDraftError ? '#B45309' : '#DC2626'}
+            />
+            <Text
+              style={[styles.errorText, recoverableDraftError && styles.retryText]}
+              numberOfLines={3}
+            >
+              {getDraftCloudSyncMessage(item.draft)}
             </Text>
           </View>
         ) : null}
@@ -881,8 +889,8 @@ const OfflineReportsScreen = ({
             />
             <Text style={[styles.errorText, styles.retryText]} numberOfLines={3}>
               {connectionStatus === 'offline'
-                ? 'Waiting for internet. This report is saved safely and will upload automatically when the connection returns.'
-                : 'Internet may be available, but the server cannot be reached. This report remains saved and will retry automatically.'}
+                ? 'Waiting for internet. This report remains on this device. Connect and tap Resume upload.'
+                : 'The server cannot be reached. Your report remains on this device; tap Resume upload when ready.'}
             </Text>
           </View>
         ) : null}
@@ -892,7 +900,11 @@ const OfflineReportsScreen = ({
             <>
               <TouchableOpacity
                 style={[styles.primaryAction, { backgroundColor: cfg.color }]}
-                onPress={() => onContinueDraft(item.draft.id, item.draft.type)}
+                onPress={() =>
+                  item.cloud && isDraftCloudClean(item.draft, item.cloud)
+                    ? continueCloudDraft(item.cloud)
+                    : onContinueDraft(item.draft.id, item.draft.type)
+                }
                 activeOpacity={0.88}
               >
                 <Feather name="edit-3" size={15} color="#FFFFFF" />
@@ -900,7 +912,7 @@ const OfflineReportsScreen = ({
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.secondaryAction, busy && styles.actionDisabled]}
-                onPress={() => submitLocalDraft(item.draft, item.cloud?.id || item.cloud?._id)}
+                onPress={() => submitLocalDraft(item.draft)}
                 disabled={busy}
               >
                 {busy ? (
@@ -945,7 +957,13 @@ const OfflineReportsScreen = ({
             </TouchableOpacity>
           )}
 
-          <TouchableOpacity style={styles.secondaryAction} onPress={() => deleteItem(item)}>
+          <TouchableOpacity
+            style={[styles.secondaryAction, uploadingInBackground && styles.actionDisabled]}
+            onPress={() => deleteItem(item)}
+            disabled={uploadingInBackground}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: uploadingInBackground }}
+          >
             <Feather name="trash-2" size={15} color="#DC2626" />
             <Text style={styles.deleteText}>Delete</Text>
           </TouchableOpacity>
@@ -986,7 +1004,7 @@ const OfflineReportsScreen = ({
                 <View style={styles.heroTitleSection}>
                   <Text style={styles.heroTitle}>Drafts</Text>
                   <Text style={styles.heroSubtitle}>
-                    Local drafts sync to cloud when you are online.
+                    Offline captures stay on this device until you submit. Only counts and status sync automatically.
                   </Text>
                 </View>
               </View>
@@ -1099,6 +1117,7 @@ const OfflineReportsScreen = ({
           </View>
         ) : null}
 
+        <OfflineCaptureList onOpen={onContinueDraft} />
         {loading ? (
           <View style={styles.loadingState}>
             <ActivityIndicator size="large" color="#E11D48" />
@@ -1495,6 +1514,12 @@ const styles = StyleSheet.create({
   },
   retryText: {
     color: '#92400E',
+  },
+  backgroundBox: {
+    backgroundColor: '#EFF6FF',
+  },
+  backgroundText: {
+    color: '#1D4ED8',
   },
   actions: {
     marginTop: 14,

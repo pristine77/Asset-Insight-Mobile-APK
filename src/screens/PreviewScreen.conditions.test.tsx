@@ -1,0 +1,412 @@
+import React from 'react';
+import { Alert, StyleSheet } from 'react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import PreviewScreen from './PreviewScreen';
+import api from '../services/api';
+
+jest.mock('@expo/vector-icons', () => ({ Feather: () => null }));
+jest.mock('react-native-safe-area-context', () => ({ SafeAreaView: require('react-native').View }));
+jest.mock('react-native/Libraries/Components/RefreshControl/RefreshControl', () => ({
+  __esModule: true,
+  default: (props: any) => {
+    const View = require('react-native').View;
+    return <View {...props} />;
+  },
+}));
+jest.mock('@shopify/react-native-skia', () => ({
+  Canvas: require('react-native').View,
+  Group: require('react-native').View,
+  Path: () => null,
+  Skia: {},
+  ImageFormat: {},
+}));
+jest.mock('expo-file-system/legacy', () => ({ cacheDirectory: 'file:///cache/' }));
+jest.mock('expo-sharing', () => ({}));
+jest.mock('expo-image-picker', () => ({}));
+jest.mock('../services/api', () => ({
+  __esModule: true,
+  default: { get: jest.fn(), put: jest.fn(), post: jest.fn() },
+}));
+jest.mock('../services/assetService', () => ({ __esModule: true, default: {} }));
+jest.mock('../services/lotListingService', () => ({ __esModule: true, default: {} }));
+jest.mock('../services/assignedApprovalService', () => ({ __esModule: true, default: {} }));
+jest.mock('../components/FarmlandValuationSummary', () => () => null);
+
+const onBack = jest.fn();
+const fixture = (count = 100, clientName = 'Original client') => ({
+  client_name: clientName,
+  contract_no: '93530',
+  currency: 'CAD',
+  lots: Array.from({ length: count }, (_, index) => ({
+    lot_id: `stable-${index}`,
+    lot_number: String(index + 1),
+    title: `Item ${index + 1}`,
+    description: `First line ${index + 1}\nKeep second line`,
+    details: 'Retain details',
+    estimated_value: '18500',
+    image_indexes: [index],
+    image_urls: [`https://assetinsight.pro/photo-${index}.jpg`],
+    cover_index: index,
+    condition_report_selections: {
+      condition: 'Starts and Runs',
+      completeness: 'Has Keys',
+      legal: 'No Title',
+    },
+    condition_report_specs: {
+      'Running Condition': 'Starts and Runs',
+      Notes: 'Keep original notes',
+    },
+  })),
+});
+let saved: ReturnType<typeof fixture>;
+let other: ReturnType<typeof fixture>;
+const wrapPreview = (data: ReturnType<typeof fixture>) => ({
+  data: {
+    data: {
+      status: 'preview',
+      preview_data: data,
+      imageUrls: data.lots.map((lot) => lot.image_urls[0]),
+      grouping_mode: 'Bundle',
+    },
+  },
+});
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
+  saved = fixture();
+  other = fixture(10, 'Other client');
+  jest
+    .mocked(api.get)
+    .mockImplementation(async (url) =>
+      url === '/asset/category-specs'
+        ? { data: { data: { specs: [] } } }
+        : wrapPreview(String(url).includes('other-report') ? other : saved)
+    );
+  jest.mocked(api.put).mockImplementation(async (_url, body) => {
+    saved = structuredClone((body as { preview_data: ReturnType<typeof fixture> }).preview_data);
+    return { data: { data: saved } };
+  });
+  jest.mocked(api.post).mockImplementation(async (_url, body) => {
+    saved = structuredClone((body as { preview_data: ReturnType<typeof fixture> }).preview_data);
+    return { data: { data: {} } };
+  });
+});
+afterEach(() => jest.restoreAllMocks());
+
+it.each(['Asset', 'LotListing'] as const)('saves and regenerates %s with one current snapshot and no separate save', async reportType => {
+  saved = fixture(2);
+  jest.mocked(api.get).mockImplementation(async url => String(url).includes('category-specs')
+    ? { data: { data: { specs: [] } } }
+    : { data: { data: { ...wrapPreview(saved).data.data, status: 'approved' } } });
+  let finish!: (value: any) => void;
+  jest.mocked(api.post).mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+  const success = jest.fn();
+  await render(<PreviewScreen reportId="combined" reportType={reportType} mode="pending" onBack={onBack} onSuccess={success} />);
+  const contract = await screen.findByDisplayValue('93530');
+  await fireEvent.changeText(contract, 'UPDATED-93530');
+  expect(screen.queryByRole('button', { name: 'Save preview changes' })).toBeNull();
+  await fireEvent.press(screen.getByRole('button', { name: 'Save & Regenerate' }));
+  const confirm = confirmGeneration();
+  await act(() => { void confirm.onPress?.(); void confirm.onPress?.(); });
+  expect(api.post).toHaveBeenCalledTimes(1);
+  expect(api.post).toHaveBeenCalledWith(`/${reportType === 'Asset' ? 'asset' : 'lot-listing'}/combined/resubmit`, {
+    preview_data: expect.objectContaining({ contract_no: 'UPDATED-93530', lots: saved.lots }),
+  });
+  expect(api.put).not.toHaveBeenCalled();
+  expect(screen.getByRole('button', { name: 'Save & Regenerate' })).toBeDisabled();
+  await fireEvent.changeText(contract, 'DO NOT REPLACE IN-FLIGHT SNAPSHOT');
+  expect(contract.props.value).toBe('UPDATED-93530');
+  expect(screen.queryByRole('button', { name: 'Back from report preview' })).toBeNull();
+  expect(onBack).not.toHaveBeenCalled();
+  await act(async () => finish({ data: { data: {} } }));
+  expect(success).toHaveBeenCalledTimes(1);
+  expect(onBack).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole('button', { name: 'Generating files...' })).toBeDisabled();
+});
+
+it('ignores a generation confirmation after refreshed data replaces its snapshot', async () => {
+  await open(2);
+  await fireEvent.press(screen.getByRole('button', { name: 'Save & Generate' }));
+  const confirm = confirmGeneration();
+  saved = { ...saved, contract_no: 'REFRESHED' };
+  await fireEvent(screen.getByTestId('preview-refresh'), 'refresh');
+  await screen.findByDisplayValue('REFRESHED');
+  await act(async () => { await confirm.onPress?.(); });
+  expect(api.post).not.toHaveBeenCalled();
+});
+
+it('submits Lot Listing without FMV or appraisal selection blocks while retaining saved data', async () => {
+  saved = fixture(2);
+  saved.lots[0].estimated_value = '';
+  saved.lots[0].condition_report_selections = { condition: '', completeness: '', legal: '' };
+  const original = structuredClone(saved);
+  await render(<PreviewScreen reportId="listing-report" reportType="LotListing" mode="pending" onBack={onBack} />);
+  await screen.findByDisplayValue('93530');
+  expect(screen.queryByText('Required selections')).toBeNull();
+  expect(screen.queryByText(/Running Condition for all lots/i)).toBeNull();
+  expect(screen.queryByRole('button', { name: /^Edit required selections/ })).toBeNull();
+  await fireEvent.press(screen.getByText('Save & Generate'));
+  const confirmation = jest.mocked(Alert.alert).mock.calls.find(([title]) => title === 'Save & Generate');
+  expect(confirmation).toBeDefined();
+  await act(async () => { await confirmation![2]!.find((button) => button.text === 'Save & Generate')!.onPress?.(); });
+  expect(api.post).toHaveBeenCalledWith('/lot-listing/listing-report/submit-approval', {
+    preview_data: expect.objectContaining({ lots: expect.arrayContaining([
+      expect.objectContaining({ ...original.lots[0] }),
+      expect.objectContaining({ ...original.lots[1] }),
+    ]) }),
+  });
+  expect(api.put).not.toHaveBeenCalled();
+});
+
+async function open(count = 100) {
+  saved = fixture(count);
+  const view = await render(
+    <PreviewScreen reportId="asset-report" reportType="Asset" mode="pending" onBack={onBack} />
+  );
+  await screen.findByText(`0 of ${count} lots selected`);
+  return view;
+}
+const select = (lot: number) =>
+  fireEvent.press(screen.getByRole('checkbox', { name: `Select lot ${lot} for bulk update` }));
+const apply = (group: string, value: string) =>
+  fireEvent.press(screen.getByRole('button', { name: `${group}: ${value} to selected lots` }));
+const confirmGeneration = () => jest.mocked(Alert.alert).mock.calls
+  .filter(([title]) => title === 'Save & Generate' || title === 'Save & Regenerate')
+  .at(-1)![2]!.find(button => button.text?.startsWith('Save &'))!;
+const save = async () => {
+  await fireEvent.press(screen.getByRole('button', { name: 'Save & Generate' }));
+  await act(async () => { await confirmGeneration().onPress?.(); });
+};
+
+it('applies all three groups only to lots4/8/9 in a100-lot preview and saves/reopens the same values and media', async () => {
+  const view = await open();
+  const original = structuredClone(saved);
+  expect(
+    screen.getAllByRole('button', { name: /^Edit required selections for lot / })
+  ).toHaveLength(100);
+  expect(screen.queryByRole('button', { name: 'Legal: Salvage for lot 4' })).toBeNull();
+  await select(4);
+  await select(8);
+  await select(9);
+  expect(screen.getByText('3 of 100 lots selected')).toBeTruthy();
+  await apply('Running Condition', 'Does not Start or Run');
+  await apply('Completeness', 'Missing Parts');
+  await apply('Legal', 'Salvage');
+  await save();
+  const payload = (
+    jest.mocked(api.post).mock.calls[0][1] as { preview_data: ReturnType<typeof fixture> }
+  ).preview_data;
+  expect(payload.lots).toHaveLength(100);
+  payload.lots.forEach((lot: any, index: number) => {
+    expect(lot.description).toBe(original.lots[index].description);
+    expect(lot.image_urls).toEqual(original.lots[index].image_urls);
+    expect(lot.image_indexes).toEqual(original.lots[index].image_indexes);
+    expect(lot.cover_index).toBe(index);
+    expect(lot.lot_number).toBe(String(index + 1));
+    expect(lot.condition_report_selections).toEqual(
+      [3, 7, 8].includes(index)
+        ? { condition: 'Does not Start or Run', completeness: 'Missing Parts', legal: 'Salvage' }
+        : original.lots[index].condition_report_selections
+    );
+  });
+  expect(screen.getByText('0 of 100 lots selected')).toBeTruthy();
+  await view.unmount();
+  await render(
+    <PreviewScreen reportId="asset-report" reportType="Asset" mode="pending" onBack={onBack} />
+  );
+  await fireEvent.press(
+    await screen.findByRole('button', { name: 'Edit required selections for lot 8' })
+  );
+  expect(
+    screen.getByRole('button', { name: 'Legal: Salvage for lot 8' }).props.accessibilityState
+      .selected
+  ).toBe(true);
+  expect(
+    screen.getByRole('button', { name: 'Completeness: Missing Parts for lot 8' }).props
+      .accessibilityState.selected
+  ).toBe(true);
+  expect(
+    screen.getByRole('button', { name: 'Running Condition: Does not Start or Run for lot 8' }).props
+      .accessibilityState.selected
+  ).toBe(true);
+});
+
+it('selects all100 lots, applies every group, and preserves an individual override for lot8', async () => {
+  await open();
+  await fireEvent.press(screen.getByRole('button', { name: 'Select all 100 lots' }));
+  expect(screen.getByText('100 of 100 lots selected')).toBeTruthy();
+  for (const group of ['Running Condition', 'Completeness', 'Legal']) await apply(group, 'N/A');
+  await fireEvent.press(screen.getByRole('button', { name: 'Edit required selections for lot 8' }));
+  await fireEvent.press(screen.getByRole('button', { name: 'Legal: No Title for lot 8' }));
+  await fireEvent.press(screen.getByRole('button', { name: 'Completeness: Has Keys for lot 8' }));
+  await fireEvent.press(
+    screen.getByRole('button', { name: 'Running Condition: Starts and Runs for lot 8' })
+  );
+  await save();
+  expect(saved.lots.filter((lot) => lot.condition_report_selections.legal === 'N/A')).toHaveLength(
+    99
+  );
+  expect(saved.lots[7].condition_report_selections).toEqual({
+    condition: 'Starts and Runs',
+    completeness: 'Has Keys',
+    legal: 'No Title',
+  });
+  expect(saved.lots[0].condition_report_specs).toEqual({ Notes: 'Keep original notes' });
+  expect(saved.lots[7].condition_report_specs['Running Condition']).toBe('Starts and Runs');
+});
+
+it('clears selection explicitly and when deleting a lot so remaining indexes cannot retarget', async () => {
+  await open(10);
+  await select(4);
+  await select(8);
+  await select(9);
+  await fireEvent.press(screen.getByRole('button', { name: 'Clear lot selection' }));
+  expect(screen.getByText('0 of 10 lots selected')).toBeTruthy();
+  await select(4);
+  await select(8);
+  await select(9);
+  await fireEvent.press(screen.getByRole('button', { name: 'Delete lot 4' }));
+  const buttons = jest
+    .mocked(Alert.alert)
+    .mock.calls.find(([title]) => title === 'Delete Lot')![2]!;
+  await act(() => buttons.find((button) => button.text === 'Delete')!.onPress?.());
+  expect(screen.getByText('0 of 9 lots selected')).toBeTruthy();
+  expect(
+    screen.getByRole('button', { name: 'Legal: Salvage to selected lots' }).props.accessibilityState
+      .disabled
+  ).toBe(true);
+  await select(8);
+  await apply('Legal', 'Salvage');
+  await save();
+  expect(
+    saved.lots
+      .filter((lot) => lot.condition_report_selections.legal === 'Salvage')
+      .map((lot) => lot.lot_id)
+  ).toEqual(['stable-7']);
+});
+
+it('clears selection and individual editors on refresh/reordered preview data', async () => {
+  await open(10);
+  await select(4);
+  await fireEvent.press(screen.getByRole('button', { name: 'Edit required selections for lot 4' }));
+  saved = { ...saved, lots: [...saved.lots].reverse() };
+  await fireEvent(screen.getByTestId('preview-refresh'), 'refresh');
+  await screen.findByText('0 of 10 lots selected');
+  expect(
+    screen.getByRole('checkbox', { name: 'Select lot 4 for bulk update' }).props.accessibilityState
+      .checked
+  ).toBe(false);
+  expect(screen.queryByRole('button', { name: 'Legal: Salvage for lot 4' })).toBeNull();
+});
+
+it('does not let a late save response overwrite another report or its new selection', async () => {
+  const view = await open(10);
+  let resolveSave!: (data: any) => void;
+  jest.mocked(api.post).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveSave = resolve;
+      })
+  );
+  await select(4);
+  await apply('Legal', 'Salvage');
+  await fireEvent.press(screen.getByRole('button', { name: 'Save & Generate' }));
+  await act(() => { void confirmGeneration().onPress?.(); });
+  expect(screen.getByText('0 of 10 lots selected', { includeHiddenElements: true })).toBeTruthy();
+  expect(
+    screen.getByRole('checkbox', { name: 'Select lot 8 for bulk update', includeHiddenElements: true }).props.accessibilityState
+      .disabled
+  ).toBe(true);
+  await view.rerender(
+    <PreviewScreen reportId="other-report" reportType="Asset" mode="pending" onBack={onBack} />
+  );
+  await waitFor(() =>
+    expect(screen.getByLabelText('Client Name *').props.value).toBe('Other client')
+  );
+  await select(9);
+  await act(async () => {
+    resolveSave({ data: { data: saved } });
+  });
+  expect(screen.getByLabelText('Client Name *').props.value).toBe('Other client');
+  expect(screen.getByText('1 of 10 lots selected')).toBeTruthy();
+  expect(api.post).toHaveBeenCalledTimes(1);
+  expect(onBack).not.toHaveBeenCalled();
+});
+
+it('keeps edited values after save failure but resets the selection for a deliberate retry', async () => {
+  const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  await open(10);
+  jest.mocked(api.post).mockRejectedValueOnce(new Error('offline'));
+  await select(4);
+  await apply('Legal', 'Salvage');
+  await save();
+  await waitFor(() => expect(Alert.alert).toHaveBeenCalledWith('Error', 'Failed to submit report'));
+  expect(screen.getByText('0 of 10 lots selected')).toBeTruthy();
+  await fireEvent.press(screen.getByRole('button', { name: 'Edit required selections for lot 4' }));
+  expect(
+    screen.getByRole('button', { name: 'Legal: Salvage for lot 4' }).props.accessibilityState
+      .selected
+  ).toBe(true);
+  log.mockRestore();
+});
+
+it('keeps the single-lot editor available without a bulk panel', async () => {
+  saved = fixture(1);
+  await render(
+    <PreviewScreen reportId="asset-report" reportType="Asset" mode="pending" onBack={onBack} />
+  );
+  await fireEvent.press(
+    await screen.findByRole('button', { name: 'Edit required selections for lot 1' })
+  );
+  expect(screen.queryByText('Update selected lots')).toBeNull();
+  await fireEvent.press(
+    screen.getByRole('button', { name: 'Completeness: Missing Parts for lot 1' })
+  );
+  await save();
+  expect(saved.lots[0].condition_report_selections.completeness).toBe('Missing Parts');
+});
+
+it('clears both visible condition spec aliases immediately when Asset Running Condition is N/A', async () => {
+  saved = fixture(2);
+  saved.lots[0].condition_report_specs = {
+    'Running Condition': 'Old',
+    'Working Condition': 'Stale',
+    Notes: 'Keep original notes',
+  } as any;
+  await render(
+    <PreviewScreen reportId="asset-report" reportType="Asset" mode="pending" onBack={onBack} />
+  );
+  await fireEvent.press(await screen.findByRole('button', { name: 'Select all 2 lots' }));
+  await apply('Running Condition', 'N/A');
+  expect(screen.queryByDisplayValue('Stale')).toBeNull();
+  expect(screen.queryByDisplayValue('Old')).toBeNull();
+  const option = screen.getByRole('button', { name: 'Legal: Salvage to selected lots' });
+  expect(StyleSheet.flatten(option.props.style)).toMatchObject({
+    minHeight: 44,
+    maxWidth: '100%',
+    flexShrink: 1,
+  });
+  expect(
+    StyleSheet.flatten(
+      screen.getByRole('checkbox', { name: 'Select lot 1 for bulk update' }).props.style
+    )
+  ).toMatchObject({ minHeight: 44, minWidth: 44 });
+  await save();
+  expect(saved.lots[0].condition_report_specs).toEqual({ Notes: 'Keep original notes' });
+});
+
+it('ignores an old delete confirmation after refreshed lot order replaces its target', async () => {
+  await open(10);
+  await fireEvent.press(screen.getByRole('button', { name: 'Delete lot 4' }));
+  const confirm = jest
+    .mocked(Alert.alert)
+    .mock.calls.find(([title]) => title === 'Delete Lot')![2]!
+    .find((button) => button.text === 'Delete')!;
+  saved = { ...saved, lots: [...saved.lots].reverse() };
+  await fireEvent(screen.getByTestId('preview-refresh'), 'refresh');
+  await screen.findByText('0 of 10 lots selected');
+  await act(() => confirm.onPress?.());
+  expect(screen.getByText('0 of 10 lots selected')).toBeTruthy();
+  expect(screen.getByRole('checkbox', { name: 'Select lot 4 for bulk update' })).toBeTruthy();
+});

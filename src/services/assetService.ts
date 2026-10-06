@@ -1,7 +1,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import api from "./api";
+import { createUploadOperation, cancellableUploadRequest, type UploadOperation } from './uploadCancellation';
 import { API_ENDPOINTS } from "../config/api";
-import { uploadReportFilesDirectToR2, type DirectUploadFile } from "./directR2UploadService";
+import { isRetryableRequestError } from "./connectivityService";
+import { restoreImageWatermarkPreference } from "../utils/watermarkPreference";
+import {
+  uploadReportFilesDirectToR2,
+  type DirectUploadFile,
+  type DirectUploadProgressCallback,
+} from "./directR2UploadService";
 
 // Types matching web and server
 export type AssetGroupingMode =
@@ -24,15 +31,18 @@ export type ReportWorkflowStage =
 
 export interface MixedLot {
   id: string;
-  files: Array<{ uri: string; name: string; type: string; captureOrder?: number; originalOrder?: number }>;
-  extraFiles: Array<{ uri: string; name: string; type: string; captureOrder?: number; originalOrder?: number }>;
-  videoFile?: { uri: string; name: string; type: string };
+  files: Array<{ uri: string; name: string; type: string; size?: number; captureOrder?: number; originalOrder?: number }>;
+  extraFiles: Array<{ uri: string; name: string; type: string; size?: number; captureOrder?: number; originalOrder?: number }>;
+  videoFile?: { uri: string; name: string; type: string; size?: number };
   coverIndex: number;
   mode?: MixedLotMode;
 }
 
 export interface AssetCreateDetails {
+  capture_id?: string;
   client_submission_id?: string;
+  supersedes_client_submission_id?: string;
+  auctioneer_work_item_id?: string;
   force_new?: boolean;
   // Client info
   client_name: string;
@@ -63,6 +73,7 @@ export interface AssetCreateDetails {
   valuation_methods?: Array<"FML" | "TKV" | "OLV" | "FLV">;
   include_damage_analysis?: boolean;
   bank_photos_enabled?: boolean;
+  watermark_images?: boolean;
 
   // Factors
   factors_age_condition?: string;
@@ -73,8 +84,12 @@ export interface AssetCreateDetails {
   mixed_lots?: Array<{
     count: number;
     extra_count: number;
+    video_count?: number;
     cover_index: number;
     mode: MixedLotMode;
+    source_key?: string;
+    source_lot_id?: string;
+    source_submission_id?: string;
   }>;
 
   // Image enhancement (server-side: +40% saturation, +40% sharpness, +30% contrast)
@@ -200,12 +215,31 @@ class AssetService {
    * @param details Report details
    * @param lots Mixed lots with images
    * @param onUploadProgress Progress callback
+   * @param options.operation The caller's upload operation. Pausing it
+   *   (pauseUploadOperation) stops this transfer, direct or multipart, and no
+   *   other upload.
    */
   async createAssetReport(
     details: AssetCreateDetails,
     lots: MixedLot[],
-    onUploadProgress?: (progress: number) => void
-  ): Promise<{ jobId: string; message: string }> {
+    onUploadProgress?: DirectUploadProgressCallback,
+    options?: { operation?: UploadOperation }
+  ): Promise<{ jobId: string; message: string; reportId?: string }> {
+    const operation = createUploadOperation(options?.operation);
+    // Send an explicit choice even to older APIs whose missing-field default
+    // was true. Never mutate the saved draft supplied by the caller.
+    const uploadDetails = {
+      ...details,
+      watermark_images: restoreImageWatermarkPreference(details.watermark_images),
+      ...(details.mixed_lots ? {
+        // Multipart has one ordered video array: explicit zeros prevent a clip
+        // from a later lot being attached to the first lot without a video.
+        mixed_lots: details.mixed_lots.map((lot, index) => ({
+          ...lot,
+          video_count: lots[index]?.videoFile ? 1 : 0,
+        })),
+      } : {}),
+    };
     try {
       const files: DirectUploadFile[] = [];
       lots.forEach((lot, lotIndex) => {
@@ -214,6 +248,7 @@ class AssetService {
             uri: file.uri,
             name: file.name || `lot-${lotIndex + 1}-main-${imageIndex + 1}.jpg`,
             type: file.type || "image/jpeg",
+            size: file.size,
             fieldname: "images",
             lotIndex,
             imageIndex,
@@ -227,6 +262,7 @@ class AssetService {
             uri: file.uri,
             name: file.name || `lot-${lotIndex + 1}-extra-${imageIndex + 1}.jpg`,
             type: file.type || "image/jpeg",
+            size: file.size,
             fieldname: "images",
             lotIndex,
             imageIndex,
@@ -240,20 +276,26 @@ class AssetService {
             uri: lot.videoFile.uri,
             name: lot.videoFile.name || `lot-${lotIndex + 1}-walkthrough.mp4`,
             type: lot.videoFile.type || "video/mp4",
+            size: lot.videoFile.size,
             fieldname: "videos",
             lotIndex,
+            imageIndex: 0,
             role: "video",
           });
         }
       });
 
-      return await uploadReportFilesDirectToR2({
+      const response = await uploadReportFilesDirectToR2({
         endpoint: "/asset",
-        details,
+        details: uploadDetails,
         files,
         onProgress: onUploadProgress,
+        operation,
       });
+      operation.assertActive();
+      return response;
     } catch (error: any) {
+      operation.assertActive();
       const status = Number(error?.response?.status || 0);
       if (![404, 405, 501].includes(status)) throw error;
       console.warn("[AssetService] Direct upload is unsupported; using legacy multipart upload.");
@@ -262,7 +304,7 @@ class AssetService {
     const formData = new FormData();
 
     // Add details as JSON
-    formData.append("details", JSON.stringify(details));
+    formData.append("details", JSON.stringify(uploadDetails));
 
     // Add images from lots
     let imageIndex = 0;
@@ -300,12 +342,15 @@ class AssetService {
       }
     }
 
-    const response = await api.post(API_ENDPOINTS.CREATE_ASSET, formData, {
+    operation.assertActive();
+    const response = await cancellableUploadRequest(operation, (signal) => api.post(API_ENDPOINTS.CREATE_ASSET, formData, {
+      signal,
       headers: {
         "Content-Type": "multipart/form-data",
       },
       timeout: 300000, // 5 minutes for large uploads
       onUploadProgress: (progressEvent: any) => {
+        if (!operation.isActive()) return;
         if (onUploadProgress && progressEvent.total) {
           const progress = Math.min(100, Math.round(
             (progressEvent.loaded * 100) / progressEvent.total
@@ -313,7 +358,7 @@ class AssetService {
           onUploadProgress(progress);
         }
       },
-    });
+    }));
 
     return response.data;
   }
@@ -321,9 +366,10 @@ class AssetService {
   /**
    * Get all asset reports for current user
    */
-  async getAssetReports(): Promise<AssetReport[]> {
-    const response = await api.get(API_ENDPOINTS.GET_ASSETS);
-    return response.data.data || [];
+  async getAssetReports(view?: 'previews'): Promise<AssetReport[]> {
+    const response = await api.get(API_ENDPOINTS.GET_ASSETS, view ? { params: { view } } : undefined);
+    if (!Array.isArray(response.data?.data)) throw new Error('Asset reports returned an incomplete response. Refresh to try again.');
+    return response.data.data;
   }
 
   /**
@@ -426,14 +472,22 @@ class AssetService {
     intervalMs: number = 2000
   ): Promise<void> {
     return new Promise((resolve, reject) => {
+      let transientFailures = 0;
+      const maxTransientFailures = 20;
       const poll = async () => {
         try {
           const data = await this.getProgress(jobId);
           if (!data) {
-            reject(new Error("Progress not found"));
+            transientFailures += 1;
+            if (transientFailures > maxTransientFailures) {
+              reject(new Error("Preview processing is continuing, but its progress is temporarily unavailable."));
+              return;
+            }
+            setTimeout(poll, Math.min(15000, intervalMs * 2 ** Math.min(transientFailures, 3)));
             return;
           }
 
+          transientFailures = 0;
           onProgress(data);
 
           if (data.phase === "done" || data.phase === "error") {
@@ -443,6 +497,11 @@ class AssetService {
 
           setTimeout(poll, intervalMs);
         } catch (e) {
+          if (isRetryableRequestError(e) && transientFailures < maxTransientFailures) {
+            transientFailures += 1;
+            setTimeout(poll, Math.min(15000, intervalMs * 2 ** Math.min(transientFailures, 3)));
+            return;
+          }
           reject(e);
         }
       };

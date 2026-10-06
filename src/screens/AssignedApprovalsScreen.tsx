@@ -4,7 +4,9 @@ import {
   Alert,
   FlatList,
   Modal,
+  Platform,
   RefreshControl,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -13,6 +15,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Feather } from "@expo/vector-icons";
+import KeyboardSafeViewport from "../components/KeyboardSafeViewport";
 import { useAppTheme, type AppThemeColors } from "../context/ThemeContext";
 import assignedApprovalService, {
   type AssignedApproval,
@@ -22,7 +25,7 @@ interface AssignedApprovalsScreenProps {
   onOpenDrawer: () => void;
   onOpenPreview: (
     reportId: string,
-    reportType: "Asset" | "RealEstate",
+    reportType: "Asset" | "RealEstate" | "Salvage",
     source: "assignedApproval"
   ) => void;
 }
@@ -106,8 +109,8 @@ export default function AssignedApprovalsScreen({
   };
 
   const renderItem = ({ item }: { item: AssignedApproval }) => {
-    const reportType = item.isRealEstateReport ? "RealEstate" : "Asset";
-    const canEdit = item.isAssetReport || item.isRealEstateReport;
+    const reportType = item.reportType === "Salvage" ? "Salvage" : item.isRealEstateReport ? "RealEstate" : "Asset";
+    const canEdit = item.isAssetReport || item.isRealEstateReport || item.reportType === "Salvage";
     const busy = busyId === item._id;
     return (
       <View style={styles.card}>
@@ -135,7 +138,7 @@ export default function AssignedApprovalsScreen({
               activeOpacity={0.86}
             >
               <Feather name="edit-3" size={15} color={colors.info} />
-              <Text style={[styles.actionText, styles.reviewText]}>Review / Edit</Text>
+              <Text style={[styles.actionText, styles.reviewText]}>{item.reportType === "Salvage" ? "Review" : "Review / Edit"}</Text>
             </TouchableOpacity>
           ) : null}
           <TouchableOpacity
@@ -218,29 +221,53 @@ export default function AssignedApprovalsScreen({
       )}
 
       <Modal visible={Boolean(rejectTarget)} transparent animationType="fade" onRequestClose={() => setRejectTarget(null)}>
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>Reject report</Text>
-            <Text style={styles.modalText}>Add a clear note so the report creator knows what to fix.</Text>
-            <TextInput
-              value={rejectNote}
-              onChangeText={setRejectNote}
-              placeholder="Rejection note"
-              placeholderTextColor={colors.textMuted}
-              multiline
-              style={styles.rejectInput}
-              textAlignVertical="top"
-            />
-            <View style={styles.modalActions}>
-              <TouchableOpacity style={styles.cancelBtn} onPress={() => setRejectTarget(null)}>
-                <Text style={styles.cancelText}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.confirmRejectBtn} onPress={() => void reject()}>
-                <Text style={styles.confirmRejectText}>Reject</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
+        <KeyboardSafeViewport
+          testID="rejection-keyboard-container"
+          style={styles.modalBackdrop}
+        >
+          <SafeAreaView style={styles.modalSafeArea} edges={["top", "bottom", "left", "right"]}>
+            <ScrollView
+              testID="rejection-scroll-container"
+              style={styles.modalScroll}
+              contentContainerStyle={styles.modalScrollContent}
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
+            >
+              <View style={styles.modalCard} accessibilityViewIsModal>
+                <Text style={styles.modalTitle} accessibilityRole="header">Reject report</Text>
+                <Text style={styles.modalText}>Add a clear note so the report creator knows what to fix.</Text>
+                <TextInput
+                  value={rejectNote}
+                  onChangeText={setRejectNote}
+                  placeholder="Rejection note"
+                  accessibilityLabel="Rejection note"
+                  placeholderTextColor={colors.textMuted}
+                  multiline
+                  style={styles.rejectInput}
+                  textAlignVertical="top"
+                />
+                <View style={styles.modalActions}>
+                  <TouchableOpacity
+                    style={styles.cancelBtn}
+                    onPress={() => setRejectTarget(null)}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cancel rejection"
+                  >
+                    <Text style={styles.cancelText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.confirmRejectBtn}
+                    onPress={() => void reject()}
+                    accessibilityRole="button"
+                    accessibilityLabel="Confirm report rejection"
+                  >
+                    <Text style={styles.confirmRejectText}>Reject</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </ScrollView>
+          </SafeAreaView>
+        </KeyboardSafeViewport>
       </Modal>
     </SafeAreaView>
   );
@@ -403,6 +430,15 @@ const createStyles = (colors: AppThemeColors) => StyleSheet.create({
   modalBackdrop: {
     flex: 1,
     backgroundColor: colors.overlay,
+  },
+  modalSafeArea: {
+    flex: 1,
+  },
+  modalScroll: {
+    flex: 1,
+  },
+  modalScrollContent: {
+    flexGrow: 1,
     alignItems: "center",
     justifyContent: "center",
     padding: 18,
@@ -435,11 +471,14 @@ const createStyles = (colors: AppThemeColors) => StyleSheet.create({
   },
   modalActions: {
     flexDirection: "row",
+    flexWrap: "wrap",
     justifyContent: "flex-end",
     gap: 10,
     marginTop: 14,
   },
   cancelBtn: {
+    minHeight: 44,
+    justifyContent: "center",
     paddingHorizontal: 14,
     paddingVertical: 10,
     borderRadius: 9,
@@ -450,6 +489,8 @@ const createStyles = (colors: AppThemeColors) => StyleSheet.create({
     fontWeight: "800",
   },
   confirmRejectBtn: {
+    minHeight: 44,
+    justifyContent: "center",
     paddingHorizontal: 14,
     paddingVertical: 10,
     borderRadius: 9,

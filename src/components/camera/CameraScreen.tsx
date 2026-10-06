@@ -39,6 +39,7 @@ import type {
 import * as Haptics from 'expo-haptics';
 import * as MediaLibrary from 'expo-media-library';
 import * as ScreenOrientation from 'expo-screen-orientation';
+import * as FileSystem from 'expo-file-system/legacy';
 
 import api from '../../services/api';
 import { API_BASE_URL } from '../../config/api';
@@ -50,8 +51,15 @@ import RecordButtonView from './RecordButton';
 import RecordingIndicatorView from './RecordingIndicator';
 import { DoneButton, TopControls } from './TopControls';
 import { CaptureMode, MixedLot, PhotoFile, createNewLot } from './types';
+import { loadCameraPhotoWatermark } from './cameraPhotoWatermarkModule';
+import { OfflineCaptureStore } from '../../services/offlineCaptureStore';
+import type { CaptureContext } from '../../services/offlineCaptureTypes';
+import { randomUUID } from 'expo-crypto';
+import { VIDEO_RECORDING_BIT_RATE, VIDEO_RECORDING_FPS, VIDEO_RECORDING_RESOLUTION, supportsRequiredVideoSession } from './videoRecordingPolicy';
 
 interface CameraScreenProps {
+  captureContext?: CaptureContext;
+  manualSubmissionRequired?: boolean;
   visible: boolean;
   onClose: () => void;
   lots: MixedLot[];
@@ -61,6 +69,8 @@ interface CameraScreenProps {
   onAutoSave?: (lots?: MixedLot[], activeLotIdx?: number) => void | Promise<void>;
   enhanceImages?: boolean;
   onEnhanceChange?: (enabled: boolean) => void;
+  lockedStructure?: boolean;
+  sourceLabels?: string[];
 }
 
 type FlashMode = 'off' | 'on' | 'auto';
@@ -88,12 +98,6 @@ const getPhotoTargetResolution = (mode: CameraPerformanceMode): Size => {
   return CommonResolutions.FHD_4_3;
 };
 
-const getVideoTargetResolution = (mode: CameraPerformanceMode): Size => {
-  if (mode === 'quality') return CommonResolutions.UHD_16_9;
-  if (mode === 'balanced') return CommonResolutions.FHD_16_9;
-  return CommonResolutions.HD_16_9;
-};
-
 const getModeLabel = (mode?: CaptureMode) => {
   if (!mode) return 'Not Set';
   if (mode === 'single_lot') return 'Bundle';
@@ -102,8 +106,10 @@ const getModeLabel = (mode?: CaptureMode) => {
 };
 
 const CameraScreen: React.FC<CameraScreenProps> = ({
+  captureContext,
+  manualSubmissionRequired = false,
   visible,
-  onClose,
+  onClose: onCloseRequested,
   lots,
   setLots,
   activeLotIdx,
@@ -111,6 +117,8 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
   onAutoSave,
   enhanceImages = false,
   onEnhanceChange,
+  lockedStructure = false,
+  sourceLabels,
 }) => {
   const insets = useSafeAreaInsets();
   const cameraRef = useRef<CameraRef>(null);
@@ -119,6 +127,48 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
   const pendingRecordTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const optimizeQueueRef = useRef<Promise<void>>(Promise.resolve());
   const lotsRef = useRef(lots);
+  const structureRef = useRef({ lockedStructure, activeLotIdx });
+  const capturePolicyRef = useRef({ captureContext, manualSubmissionRequired, visible });
+  capturePolicyRef.current = { captureContext, manualSubmissionRequired, visible };
+  const captureInFlight = useRef(false);
+  const pendingVideoRequestRef = useRef<{ lotId: string; index: number; context?: CaptureContext } | null>(null);
+  const pendingSaveRef = useRef<{ lots: MixedLot[]; index: number; context?: CaptureContext } | null>(null);
+  const optimizationControllers = useRef(new Set<AbortController>());
+  const sameCaptureOwner = useCallback((context?: CaptureContext) => !context || (
+    capturePolicyRef.current.captureContext?.ownerId === context.ownerId &&
+    capturePolicyRef.current.captureContext?.draftId === context.draftId &&
+    OfflineCaptureStore.getOwnerId() === context.ownerId
+  ), []);
+  const persistCapturedLots = useCallback(async (nextLots: MixedLot[], index: number, context?: CaptureContext) => {
+    if (!sameCaptureOwner(context)) throw new Error('Reopen the draft from its original account.');
+    pendingSaveRef.current = { lots: nextLots, index, context };
+    const journal = context ? await OfflineCaptureStore.savePendingCapture(context, nextLots) : undefined;
+    if (!sameCaptureOwner(context)) throw new Error('Reopen the draft from its original account.');
+    if (context && !onAutoSave) throw new Error('Draft saving is unavailable.');
+    await onAutoSave?.(nextLots, index);
+    if (!sameCaptureOwner(context)) throw new Error('Reopen the draft from its original account.');
+    if (context && journal) await OfflineCaptureStore.acknowledgePendingCapture(context, journal.revision);
+    pendingSaveRef.current = null;
+  }, [onAutoSave, sameCaptureOwner]);
+  const warnSaveFailure = useCallback(() => {
+    Alert.alert('Capture not saved to draft', 'Your captured file has been kept on this device. Keep this form open, free device storage if needed, and tap Done to retry saving. Do not clear app data.');
+  }, []);
+  const onClose = useCallback(() => {
+    if (captureInFlight.current || pendingVideoRequestRef.current) {
+      Alert.alert('Capture in progress', pendingVideoRequestRef.current
+        ? 'Stop recording and wait for the video to finish saving.'
+        : 'Please wait for the photo to finish saving.');
+      return;
+    }
+    const pending = pendingSaveRef.current;
+    if (pending) {
+      captureInFlight.current = true;
+      void persistCapturedLots(pending.lots, pending.index, pending.context).then(onCloseRequested, warnSaveFailure)
+        .finally(() => { captureInFlight.current = false; });
+      return;
+    }
+    onCloseRequested();
+  }, [onCloseRequested, persistCapturedLots, warnSaveFailure]);
 
   const { hasPermission: hasCameraPermission, requestPermission: requestCameraPermission } =
     useCameraPermission();
@@ -132,7 +182,8 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
 
   useEffect(() => {
     lotsRef.current = lots;
-  }, [lots]);
+    structureRef.current = { lockedStructure, activeLotIdx };
+  }, [lots, lockedStructure, activeLotIdx]);
 
   const [performanceMode, setPerformanceMode] =
     useState<CameraPerformanceMode>(DEFAULT_PERFORMANCE_MODE);
@@ -146,6 +197,7 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [videoSessionRequested, setVideoSessionRequested] = useState(false);
+  const [videoSessionConfig, setVideoSessionConfig] = useState<{ fps?: number } | null>(null);
   const [cameraConfigured, setCameraConfigured] = useState(false);
   const [cameraStarted, setCameraStarted] = useState(false);
   const [cameraErrorMessage, setCameraErrorMessage] = useState<string | null>(null);
@@ -170,10 +222,6 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
     () => getPhotoTargetResolution(performanceMode),
     [performanceMode]
   );
-  const videoTargetResolution = useMemo(
-    () => getVideoTargetResolution(performanceMode),
-    [performanceMode]
-  );
   const photoOutput = usePhotoOutput({
     targetResolution: photoTargetResolution,
     containerFormat: 'jpeg',
@@ -186,28 +234,26 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
           : 'quality',
   });
   const videoOutput = useVideoOutput({
-    targetResolution: videoTargetResolution,
-    targetBitRate:
-      performanceMode === 'speed'
-        ? 12_000_000
-        : performanceMode === 'balanced'
-          ? 20_000_000
-          : 28_000_000,
+    targetResolution: VIDEO_RECORDING_RESOLUTION,
+    targetBitRate: VIDEO_RECORDING_BIT_RATE,
     enableAudio: hasMicPermission,
+    fileType: 'mp4',
   });
 
-  const enableVideoSession = Platform.OS === 'android' ? videoSessionRequested || isRecording : true;
+  const enableVideoSession = videoSessionRequested || isRecording;
   const outputs = useMemo(
-    () => (enableVideoSession ? [photoOutput, videoOutput] : [photoOutput]),
+    // A high-resolution photo output must not force the video session above HD.
+    () => (enableVideoSession ? [videoOutput] : [photoOutput]),
     [enableVideoSession, photoOutput, videoOutput]
   );
 
   const constraints = useMemo<Constraint[]>(() => {
+    if (enableVideoSession) return [{ fps: VIDEO_RECORDING_FPS }, { resolutionBias: videoOutput }];
     if (lowLightBoost) return [{ fps: 24 }, { binned: true }];
     if (performanceMode === 'quality') return [{ fps: 30 }, { binned: false }];
     if (performanceMode === 'balanced') return [{ fps: 30 }];
     return [{ fps: 30 }, { binned: true }];
-  }, [lowLightBoost, performanceMode]);
+  }, [enableVideoSession, lowLightBoost, performanceMode, videoOutput]);
 
   const neutralZoom = useMemo(() => getNeutralZoom(device?.zoomLensSwitchFactors), [device]);
   const maxZoom = useMemo(() => device?.maxZoom ?? 1, [device]);
@@ -229,6 +275,7 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
   }, [canUseMacro, device, maxZoom, neutralZoom]);
 
   const currentLot = lots[activeLotIdx];
+  const currentLotLabel = sourceLabels?.[activeLotIdx] || `Lot ${activeLotIdx + 1}`;
   const allPhotos = currentLot ? [...currentLot.files, ...currentLot.extraFiles] : [];
   const totalImages = useMemo(
     () => lots.reduce((sum, lot) => sum + lot.files.length + lot.extraFiles.length, 0),
@@ -247,6 +294,13 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
   useEffect(() => {
     setEnhanceOn(enhanceImages);
   }, [enhanceImages]);
+
+  useEffect(() => {
+    if (manualSubmissionRequired || !visible) {
+      optimizationControllers.current.forEach((controller) => controller.abort());
+    }
+    return () => { optimizationControllers.current.forEach((controller) => controller.abort()); };
+  }, [manualSubmissionRequired, visible, captureContext?.ownerId, captureContext?.draftId]);
 
   useEffect(() => {
     if (!visible) return;
@@ -269,10 +323,10 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
   }, [visible]);
 
   useEffect(() => {
-    if (!visible || lots.length > 0) return;
+    if (!visible || lockedStructure || lots.length > 0) return;
     setLots([createNewLot()]);
     setActiveLotIdx(0);
-  }, [lots.length, setActiveLotIdx, setLots, visible]);
+  }, [lots.length, lockedStructure, setActiveLotIdx, setLots, visible]);
 
   useEffect(() => {
     if (!visible) return;
@@ -317,6 +371,8 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
     return () => {
       if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current);
       if (pendingRecordTimeoutRef.current) clearTimeout(pendingRecordTimeoutRef.current);
+      // Stop/finalize; cancellation would delete the recording original.
+      void recorderRef.current?.stopRecording().catch(() => undefined);
     };
   }, []);
 
@@ -353,9 +409,15 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
 
   const queueAutoOptimizePhoto = useCallback(
     (photo: PhotoFile, lotId: string, isExtra: boolean) => {
+      const context = capturePolicyRef.current.captureContext;
+      const canOptimize = () => !capturePolicyRef.current.manualSubmissionRequired && capturePolicyRef.current.visible && sameCaptureOwner(context);
+      if (!canOptimize()) return;
       optimizeQueueRef.current = optimizeQueueRef.current
         .catch(() => undefined)
         .then(async () => {
+          if (!canOptimize()) return;
+          const controller = new AbortController();
+          optimizationControllers.current.add(controller);
           try {
             const formData = new FormData();
             formData.append('lotId', lotId);
@@ -369,18 +431,22 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
             const uploadResponse = await api.post('/saved-inputs/draft/upload', formData, {
               headers: { 'Content-Type': 'multipart/form-data' },
               timeout: 300000,
+              signal: controller.signal,
             });
+            if (!canOptimize() || controller.signal.aborted) return;
 
             const relativeUrl = uploadResponse.data?.data?.[0]?.url;
             if (typeof relativeUrl !== 'string' || relativeUrl.length === 0) return;
 
             const sourceUrl = `${API_HOST}${relativeUrl}`;
             const optimizedResponse = await api.get('/gallery/cloudinary-url', {
+              signal: controller.signal,
               params: {
                 url: sourceUrl,
                 preset: 'highQuality',
               },
             });
+            if (!canOptimize() || controller.signal.aborted) return;
 
             const optimizedUrl = optimizedResponse.data?.url;
             if (typeof optimizedUrl !== 'string' || optimizedUrl.length === 0) return;
@@ -404,11 +470,13 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
               })
             );
           } catch (error) {
-            console.warn('[Camera] Auto enhance failed:', error);
+            if (!controller.signal.aborted) console.warn('[Camera] Auto enhance failed:', error);
+          } finally {
+            optimizationControllers.current.delete(controller);
           }
         });
     },
-    [setLots]
+    [setLots, sameCaptureOwner]
   );
 
   const getImageMetaAsync = useCallback(async (uri: string) => {
@@ -440,7 +508,7 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
 
   const setPerformance = useCallback(
     (mode: CameraPerformanceMode) => {
-      if (isRecording) return;
+      if (isRecording || pendingVideoRequestRef.current) return;
       setPerformanceMode(mode);
     },
     [isRecording]
@@ -463,10 +531,11 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
   }, []);
 
   const handleSessionConfigSelected = useCallback((config: CameraSessionConfig) => {
+    if (enableVideoSession) setVideoSessionConfig({ fps: config.selectedFPS });
     console.log(
       `[Camera] Session config selected: fps=${config.selectedFPS ?? 'auto'}, binned=${String(config.isBinned)}, pixelFormat=${config.nativePixelFormat}`
     );
-  }, []);
+  }, [enableVideoSession]);
 
   const handleCameraError = useCallback((error: Error) => {
     console.error('[Camera] Error:', error);
@@ -485,19 +554,34 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
   }, []);
 
   const handlePrevLot = useCallback(() => {
-    if (activeLotIdx <= 0) return;
-    setActiveLotIdx(activeLotIdx - 1);
-  }, [activeLotIdx, setActiveLotIdx]);
-
-  const handleNextLot = useCallback(() => {
-    if (activeLotIdx < lots.length - 1) {
-      setActiveLotIdx(activeLotIdx + 1);
+    if (captureInFlight.current || pendingVideoRequestRef.current) {
+      Alert.alert('Capture in progress', pendingVideoRequestRef.current
+        ? 'Stop recording and wait for the video to finish saving.'
+        : 'Please wait for the photo to finish saving.');
       return;
     }
+    const index = structureRef.current.activeLotIdx;
+    if (index <= 0) return;
+    setActiveLotIdx(index - 1);
+  }, [setActiveLotIdx]);
+
+  const handleNextLot = useCallback(() => {
+    if (captureInFlight.current || pendingVideoRequestRef.current) {
+      Alert.alert('Capture in progress', pendingVideoRequestRef.current
+        ? 'Stop recording and wait for the video to finish saving.'
+        : 'Please wait for the photo to finish saving.');
+      return;
+    }
+    const { activeLotIdx: index, lockedStructure: locked } = structureRef.current;
+    if (index >= 0 && index < lotsRef.current.length - 1) {
+      setActiveLotIdx(index + 1);
+      return;
+    }
+    if (locked) return;
     const newLot = createNewLot();
     setLots((previous) => [...previous, newLot]);
-    setActiveLotIdx(lots.length);
-  }, [activeLotIdx, lots.length, setActiveLotIdx, setLots]);
+    setActiveLotIdx(lotsRef.current.length);
+  }, [setActiveLotIdx, setLots]);
 
   const handleFocusAtPoint = useCallback(
     async (x: number, y: number) => {
@@ -531,16 +615,16 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
     ) => {
       const nextLots = lotsRef.current.map((lot, index) => {
         if (index !== activeLotIdx) return lot;
+        const locked = structureRef.current.lockedStructure;
+        if (locked && (lot.id !== lotId || lot.mode !== mode)) return lot;
         return {
           ...lot,
-          id: lotId ?? lot.id,
-          mode: isExtra ? lot.mode : mode,
+          id: locked ? lot.id : lotId ?? lot.id,
+          mode: locked || isExtra ? lot.mode : mode,
           files: isExtra ? lot.files : [...lot.files, photo],
           extraFiles: isExtra ? [...lot.extraFiles, photo] : lot.extraFiles,
         };
       });
-      lotsRef.current = nextLots;
-      setLots(nextLots);
       return nextLots;
     },
     [activeLotIdx, setLots]
@@ -548,8 +632,15 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
 
   const handleCapture = useCallback(
     async (mode: CaptureMode, isExtra: boolean) => {
+      if (captureInFlight.current || pendingVideoRequestRef.current) return;
       if (!cameraConfigured || !cameraStarted) return;
       if (!currentLot) return;
+
+      // Recheck the current policy even for a callback retained before locking.
+      const structure = structureRef.current;
+      const savedLot = lotsRef.current[structure.activeLotIdx];
+      if (structure.lockedStructure &&
+          (structure.activeLotIdx !== activeLotIdx || savedLot?.id !== currentLot.id || !savedLot?.mode || savedLot.mode !== mode)) return;
 
       if (currentLot.mode && currentLot.mode !== mode && !isExtra) {
         Alert.alert(
@@ -561,7 +652,7 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
       if (currentLot.files.length + currentLot.extraFiles.length >= MAX_ASSET_LOT_PHOTOS) {
         Alert.alert(
           'Photo Limit Reached',
-          `Lot ${activeLotIdx + 1} already has ${MAX_ASSET_LOT_PHOTOS} photos. Delete photos before capturing more.`
+          `${currentLotLabel} already has ${MAX_ASSET_LOT_PHOTOS} photos. Delete photos before capturing more.`
         );
         return;
       }
@@ -572,6 +663,9 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
         Vibration.vibrate(35);
       }
 
+      captureInFlight.current = true;
+      const context = captureContext;
+      let capturedLots: MixedLot[] | undefined;
       try {
         const captured = await photoOutput.capturePhotoToFile(
           {
@@ -584,11 +678,17 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
           },
           {}
         );
-        const uri = captured.filePath.startsWith('file://')
+        const rawUri = captured.filePath.startsWith('file://')
           ? captured.filePath
           : `file://${captured.filePath}`;
+        const { stampCameraPhoto } = await loadCameraPhotoWatermark();
+        const uri = await stampCameraPhoto(rawUri);
         const meta = await getImageMetaAsync(uri);
         const photo: PhotoFile = {
+          mediaId: randomUUID(),
+          ownership: 'camera',
+          captureOrigin: 'camera',
+          captureTimestamp: Date.now(),
           uri,
           originalUri: uri,
           name: `lot-${activeLotIdx + 1}-${Date.now()}.jpg`,
@@ -601,29 +701,45 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
           captureOrder: currentLot.files.length + currentLot.extraFiles.length + 1,
         };
 
+        if (!sameCaptureOwner(context)) throw new Error('The capture belongs to the original draft owner.');
         const nextLots = updateLotsWithCapturedPhoto(photo, mode, isExtra, currentLot.id);
+        capturedLots = nextLots;
         void saveToGallery(uri);
-        void onAutoSave?.(nextLots, activeLotIdx);
+        await persistCapturedLots(nextLots, activeLotIdx, context);
+        if (!sameCaptureOwner(context)) return;
+        lotsRef.current = nextLots;
+        setLots(nextLots);
 
-        if (enhanceOn && currentLot.id) {
+        if (enhanceOn && !capturePolicyRef.current.manualSubmissionRequired && currentLot.id) {
           queueAutoOptimizePhoto(photo, currentLot.id, isExtra);
         }
       } catch (error) {
         console.error('[Camera] Photo capture failed:', error);
-        Alert.alert('Capture Failed', 'Unable to capture photo. Please try again.');
+        if (capturedLots && sameCaptureOwner(context)) {
+          lotsRef.current = capturedLots;
+          setLots(capturedLots);
+          warnSaveFailure();
+        } else Alert.alert('Capture Failed', 'Unable to save this capture. Reopen the original draft and try again.');
+      } finally {
+        captureInFlight.current = false;
       }
     },
     [
       activeLotIdx,
       cameraConfigured,
       cameraStarted,
+      captureContext,
       computeNormalizedFocusBox,
       currentLot,
+      currentLotLabel,
       device,
       enhanceOn,
       flash,
       getImageMetaAsync,
-      onAutoSave,
+      persistCapturedLots,
+      sameCaptureOwner,
+      setLots,
+      warnSaveFailure,
       performanceMode,
       photoOutput,
       portraitMode,
@@ -634,14 +750,25 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
   );
 
   const clearRecordingState = useCallback(() => {
+    captureInFlight.current = false;
+    pendingVideoRequestRef.current = null;
     recorderRef.current = null;
     setIsRecording(false);
     setVideoSessionRequested(false);
+    setVideoSessionConfig(null);
     if (recordingIntervalRef.current) {
       clearInterval(recordingIntervalRef.current);
       recordingIntervalRef.current = null;
     }
   }, []);
+
+  useEffect(() => {
+    const request = pendingVideoRequestRef.current;
+    if (visible && (!request || sameCaptureOwner(request.context))) return;
+    const recorder = recorderRef.current;
+    if (recorder) void recorder.stopRecording().catch(() => undefined);
+    else if (!captureInFlight.current) clearRecordingState();
+  }, [captureContext?.draftId, captureContext?.ownerId, clearRecordingState, sameCaptureOwner, visible]);
 
   const startRecording = useCallback(async () => {
     if (!cameraConfigured || !cameraStarted) return;
@@ -649,24 +776,58 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
       Alert.alert('Select Mode', 'Capture at least one photo first to set the lot mode.');
       return;
     }
-    if (isRecording || recorderRef.current) return;
-
-    if (!hasMicPermission) {
-      const granted = await requestMicPermission();
-      if (!granted) {
-        Alert.alert('Microphone Permission Required', 'Allow microphone access to record video.');
-        setVideoSessionRequested(false);
-        return;
-      }
-    }
+    if (isRecording || recorderRef.current || captureInFlight.current) return;
 
     if (!enableVideoSession) {
-      setVideoSessionRequested(true);
+      if (pendingVideoRequestRef.current) return;
+      const request = { lotId: currentLot.id, index: activeLotIdx, context: captureContext };
+      pendingVideoRequestRef.current = request;
+      try {
+        if (!hasMicPermission && !await requestMicPermission()) {
+          if (pendingVideoRequestRef.current === request) {
+            Alert.alert('Microphone Permission Required', 'Allow microphone access to record video.');
+            clearRecordingState();
+          }
+          return;
+        }
+        if (!sameCaptureOwner(request.context) || !capturePolicyRef.current.visible || pendingVideoRequestRef.current !== request) {
+          if (pendingVideoRequestRef.current === request) clearRecordingState();
+          return;
+        }
+        setCameraConfigured(false);
+        setVideoSessionConfig(null);
+        setVideoSessionRequested(true);
+      } catch {
+        if (pendingVideoRequestRef.current === request) {
+          clearRecordingState();
+          Alert.alert('Recording Failed', 'Unable to prepare the microphone for recording.');
+        }
+      }
       return;
     }
 
+    const request = pendingVideoRequestRef.current;
+    if (!request || !videoSessionConfig) return;
+    if (!supportsRequiredVideoSession(videoOutput.currentResolution, videoSessionConfig.fps)) {
+      clearRecordingState();
+      Alert.alert('720p recording unavailable', 'This camera could not configure 720p at 30 fps. Your photos are unchanged. Try again with another supported camera or device.');
+      return;
+    }
+    if (!sameCaptureOwner(request.context) || !capturePolicyRef.current.visible) {
+      clearRecordingState();
+      return;
+    }
+    captureInFlight.current = true;
+    const context = request.context;
     try {
-      const recorder = await videoOutput.createRecorder({});
+      if (!FileSystem.documentDirectory) throw new Error('Device storage is unavailable.');
+      // Record directly to durable device storage. No second full-size offline copy.
+      const destination = `${FileSystem.documentDirectory}camera-videos/${randomUUID()}.mp4`;
+      const recorder = await videoOutput.createRecorder({ filePath: destination.replace(/^file:\/\//, '') });
+      if (!sameCaptureOwner(context) || !capturePolicyRef.current.visible || pendingVideoRequestRef.current !== request) {
+        clearRecordingState();
+        return;
+      }
       recorderRef.current = recorder;
       setIsRecording(true);
       setRecordingTime(0);
@@ -676,29 +837,61 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
 
       await recorder.startRecording(
         async (filePath: string) => {
-          const uri = filePath.startsWith('file://') ? filePath : `file://${filePath}`;
+          let uri = filePath.startsWith('file://') ? filePath : `file://${filePath}`;
+          // Relocate the camera's temporary original, rather than keeping a second
+          // offline copy. The durable file remains available if the draft save fails.
+          try {
+            if (!sameCaptureOwner(context)) throw new Error('The capture belongs to the original draft owner.');
+            if (!FileSystem.documentDirectory) throw new Error('Device storage is unavailable.');
+            if (!uri.startsWith(FileSystem.documentDirectory)) {
+              const directory = `${FileSystem.documentDirectory}camera-videos/`;
+              await FileSystem.makeDirectoryAsync(directory, { intermediates: true });
+              const destination = `${directory}${randomUUID()}.mp4`;
+              await FileSystem.moveAsync({ from: uri, to: destination });
+              uri = destination;
+            }
+          } catch {
+            // Keep the original URI for retry; never delete a capture on failure.
+            warnSaveFailure();
+          }
           const videoFile: PhotoFile = {
+            mediaId: randomUUID(),
+            captureTimestamp: Date.now(),
+            captureOrigin: 'camera',
+            slot: 'video',
+            ownership: FileSystem.documentDirectory && uri.startsWith(FileSystem.documentDirectory) ? 'camera' : undefined,
             uri,
-            name: `lot-${activeLotIdx + 1}-video-${Date.now()}.mp4`,
+            name: `lot-${request.index + 1}-video-${Date.now()}.mp4`,
             type: 'video/mp4',
           };
+          const savedIndex = lotsRef.current.findIndex((lot) => lot.id === request.lotId);
           const nextLots = lotsRef.current.map((lot, index) =>
-            index === activeLotIdx
+            index === savedIndex
               ? {
                 ...lot,
                 videoFile,
               }
               : lot
           );
-          lotsRef.current = nextLots;
-          setLots(nextLots);
-          void saveToGallery(uri);
-          void onAutoSave?.(nextLots, activeLotIdx);
-          clearRecordingState();
+          try {
+            if (!sameCaptureOwner(context)) throw new Error('The capture belongs to the original draft owner.');
+            if (savedIndex < 0) throw new Error('Reopen the original lot to recover this recording.');
+            void saveToGallery(uri);
+            await persistCapturedLots(nextLots, savedIndex, context);
+          } catch {
+            warnSaveFailure();
+          } finally {
+            if (sameCaptureOwner(context)) {
+              lotsRef.current = nextLots;
+              setLots(nextLots);
+            }
+            clearRecordingState();
+          }
         },
         (error: Error) => {
           console.error('[Camera] Recording failed:', error);
           clearRecordingState();
+          Alert.alert('Recording Failed', 'The video could not be completed. Check device storage and record it again. Your existing lot photos are unchanged.');
         }
       );
     } catch (error) {
@@ -710,26 +903,41 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
     activeLotIdx,
     cameraConfigured,
     cameraStarted,
+    captureContext,
     clearRecordingState,
     currentLot?.mode,
+    currentLot?.id,
     enableVideoSession,
     hasMicPermission,
     isRecording,
-    onAutoSave,
+    persistCapturedLots,
+    sameCaptureOwner,
+    warnSaveFailure,
     requestMicPermission,
     saveToGallery,
     setLots,
     videoOutput,
+    videoSessionConfig,
   ]);
 
   useEffect(() => {
-    if (!visible || !videoSessionRequested || !enableVideoSession || isRecording) return;
+    if (!visible || !videoSessionRequested || !enableVideoSession || isRecording || !cameraConfigured || !cameraStarted || !videoSessionConfig) return;
     const timer = setTimeout(() => {
       void startRecording();
     }, 250);
     pendingRecordTimeoutRef.current = timer;
     return () => clearTimeout(timer);
-  }, [enableVideoSession, isRecording, startRecording, videoSessionRequested, visible]);
+  }, [cameraConfigured, cameraStarted, enableVideoSession, isRecording, startRecording, videoSessionConfig, videoSessionRequested, visible]);
+
+  useEffect(() => {
+    if (!videoSessionRequested || isRecording) return;
+    const timer = setTimeout(() => {
+      if (captureInFlight.current) return;
+      clearRecordingState();
+      Alert.alert('720p recording unavailable', 'The camera did not finish preparing 720p at 30 fps. Your photos are unchanged. Try recording again.');
+    }, 10_000);
+    return () => clearTimeout(timer);
+  }, [clearRecordingState, isRecording, videoSessionRequested]);
 
   const stopRecording = useCallback(async () => {
     if (!recorderRef.current) return;
@@ -904,9 +1112,9 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
       zoom={cameraConfigured && cameraStarted ? zoom : undefined}
       enableNativeZoomGesture={false}
       torchMode={flash === 'on' ? 'on' : 'off'}
-      enableLowLightBoost={lowLightBoost && Boolean(device.supportsLowLightBoost)}
+      enableLowLightBoost={!enableVideoSession && lowLightBoost && Boolean(device.supportsLowLightBoost)}
       enableDistortionCorrection={
-        performanceMode === 'quality' && Boolean(device.supportsDistortionCorrection)
+        !enableVideoSession && performanceMode === 'quality' && Boolean(device.supportsDistortionCorrection)
       }
     />
   );
@@ -988,6 +1196,10 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
     <>
       {device.supportsLowLightBoost && (
         <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="Low-light photo mode"
+          accessibilityState={{ selected: lowLightBoost, disabled: enableVideoSession }}
+          disabled={enableVideoSession}
           style={[styles.modeToggle, lowLightBoost && styles.modeToggleActive]}
           onPress={() => setLowLightBoost((previous) => !previous)}>
           <Feather name="moon" size={16} color={lowLightBoost ? '#FCD34D' : '#fff'} />
@@ -1109,6 +1321,8 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
                   activeLotIdx={activeLotIdx}
                   onPrevLot={handlePrevLot}
                   onNextLot={handleNextLot}
+                  lockedStructure={lockedStructure}
+                  sourceLabels={sourceLabels}
                   compact
                 />
                 <TopControls
@@ -1151,11 +1365,13 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
                   <CaptureButtonsView
                     onCapture={handleCapture}
                     disabled={!cameraConfigured || !cameraStarted}
+                    lockedStructure={lockedStructure}
+                    currentMode={currentLot?.mode}
                   />
                 </View>
 
                 <Text style={styles.footerText}>
-                  Lot {activeLotIdx + 1} | Main {currentLot?.files.length ?? 0} | Extra{' '}
+                  {currentLotLabel} | Main {currentLot?.files.length ?? 0} | Extra{' '}
                   {currentLot?.extraFiles.length ?? 0} | Total {totalImages}
                 </Text>
               </View>
@@ -1194,13 +1410,26 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
               </TouchableOpacity>
 
               <View style={styles.landscapeCenterInfo}>
+                {lockedStructure ? (
+                  <LotNavigationView
+                    lots={lots}
+                    activeLotIdx={activeLotIdx}
+                    onPrevLot={handlePrevLot}
+                    onNextLot={handleNextLot}
+                    lockedStructure
+                    sourceLabels={sourceLabels}
+                    compact
+                    isLandscape
+                  />
+                ) : (
                 <View style={styles.landscapeCenterInfoRow}>
                   <Text style={styles.landscapeInfoText} numberOfLines={1}>
-                    Lot {activeLotIdx + 1} | {currentLot?.files.length ?? 0} main |{' '}
+                    {currentLotLabel} | {currentLot?.files.length ?? 0} main |{' '}
                     {currentLot?.extraFiles.length ?? 0} extra | {getModeLabel(currentLot?.mode)}
                     {isRecording ? ' | REC' : ''}
                   </Text>
                 </View>
+                )}
               </View>
 
               <View style={styles.landscapeTopControls}>
@@ -1261,6 +1490,8 @@ const CameraScreen: React.FC<CameraScreenProps> = ({
                   <CaptureButtonsView
                     onCapture={handleCapture}
                     disabled={!cameraConfigured || !cameraStarted}
+                    lockedStructure={lockedStructure}
+                    currentMode={currentLot?.mode}
                     isLandscape
                   />
                 </View>

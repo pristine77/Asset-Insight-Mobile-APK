@@ -32,7 +32,6 @@ export interface AuctionManagementTaskLot {
 export interface AuctionManagementTaskPayload {
   task: {
     rowGuid: string;
-    auctioneerWorkItemId?: string;
     status: AuctionManagementTaskStatus;
     sentAt?: string;
     openedAt?: string | null;

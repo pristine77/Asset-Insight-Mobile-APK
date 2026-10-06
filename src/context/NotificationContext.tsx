@@ -68,6 +68,7 @@ function buildNotificationItem(notification: Notifications.Notification, read: b
     type: typeof rawData.type === "string" ? rawData.type : "",
     title: content.title || "Notification",
     body: content.body || "",
+    requiresDetails: rawData.type === "preview_review_reminder",
     data: rawData,
     createdAt,
     read,
@@ -240,6 +241,17 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
 
   const openNotification = useCallback(async (item: NotificationItem) => {
     const nextItem = notificationsRef.current.find((entry) => entry.id === item.id) || item;
+
+    if ((nextItem.type || nextItem.data?.type) === "preview_review_reminder") {
+      // Saved guidance must remain readable even while a read receipt is offline.
+      setLastOpenedNotification({
+        ...nextItem,
+        read: true,
+        readAt: nextItem.readAt || new Date().toISOString(),
+      });
+      if (!nextItem.read && nextItem.id) void markAsRead(nextItem.id);
+      return;
+    }
 
     if (!nextItem.read && nextItem.id) {
       await markAsRead(nextItem.id);

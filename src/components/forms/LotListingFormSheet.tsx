@@ -3,7 +3,8 @@ import {
   View,
   Text,
   StyleSheet,
-  TextInput,
+  KeyboardAvoidingView,
+  Platform,
   TouchableOpacity,
   Modal,
   Alert,
@@ -11,20 +12,47 @@ import {
   ScrollView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import TextInput from './ListingTextInput';
 import { Feather } from '@expo/vector-icons';
+import { randomUUID } from 'expo-crypto';
+import OfflineCapturePanel from './OfflineCapturePanel';
+import useDeviceDraftSave from './useDeviceDraftSave';
+import DraftStorageStatus from './DraftStorageStatus';
+import OfflineCaptureStore from '../../services/offlineCaptureStore';
+import { prepareOfflineSubmission } from '../../services/offlineSubmissionService';
+import { assertReportUploadAccepted, isExistingReportUploadReceipt } from '../../services/reportUploadReceipt';
+import { showUploadManifestRecovery, uploadConflictSource } from './uploadManifestRecovery';
+import { createUploadOperation, pauseUploadOperation, type UploadOperation } from '../../services/uploadCancellation';
+import backgroundUploadManager, {
+  ALREADY_UPLOADING_MESSAGE,
+  ALREADY_UPLOADING_TITLE,
+  BACKGROUND_UPLOAD_BUSY_MESSAGE,
+} from '../../services/backgroundUploadManager';
+import { CAMERA_NOT_OPENED_TITLE, cameraOpenFailureButtons, describeCameraOpenFailure } from '../../utils/cameraOpenFailure';
+import { needsExplicitUploadResume, setDraftCaptureMode } from '../../services/offlineDraftPolicy';
 import CameraScreen from '../camera/NativeAuctionCameraScreen';
 import { MixedLot, createNewLot } from '../camera/types';
 import LotManager from './LotManager';
 import lotListingService, { LotListingDetails, LotListingLot } from '../../services/lotListingService';
+import reportDraftService, {
+  getDuplicateLotWarning,
+} from '../../services/reportDraftService';
 import AutoSaveService, { AutoSaveData, AutoSaveFormData } from '../../services/autoSaveService';
 import OfflineQueueService from '../../services/offlineQueueService';
+import { getSubmissionError } from '../../services/connectivityService';
+import type { DirectUploadProgress } from '../../services/directR2UploadService';
 import { getPhotoUploadUri, normalizePhotoFile } from '../../utils/photoFileUtils';
+import { DEFAULT_IMAGE_WATERMARK, restoreImageWatermarkPreference } from '../../utils/watermarkPreference';
 import { getHiddenCurrentLocation, normalizeHiddenLocation } from '../../utils/mobileLocation';
 import type {
   AuctionManagementDestination,
   AuctionManagementServiceItem,
   AuctionManagementTaskPayload,
 } from '../../services/auctionManagementService';
+import AuctioneerFormBoundary, { type AuctioneerFormControl } from './AuctioneerFormBoundary';
+import AuctioneerFormHeader from './AuctioneerFormHeader';
+import type { AuctioneerWorkItemSetup } from '../../services/auctioneerService';
+import { auctioneerSeedLots, auctioneerLotSource, hasValidAuctioneerLotStructure } from './auctioneerFormPolicy';
 
 interface LotListingFormSheetProps {
   visible: boolean;
@@ -33,6 +61,15 @@ interface LotListingFormSheetProps {
   draftIdToLoad?: string | null;
   onDraftLoaded?: () => void;
   auctionManagementTask?: AuctionManagementTaskPayload | null;
+  auctioneer?: AuctioneerWorkItemSetup;
+  onAuctioneerSetupChange?: (setup: AuctioneerWorkItemSetup) => void;
+  auctioneerControl?: AuctioneerFormControl;
+  /**
+   * Hand an ordinary Submit to the background upload line and close the form
+   * (services/backgroundUploadManager.ts). Off by default: only the Dashboard
+   * turns it on, so every other caller keeps the foreground upload.
+   */
+  backgroundUploads?: boolean;
 }
 
 const isoDate = (d: Date) =>
@@ -47,21 +84,33 @@ const LotListingFormSheet = ({
   onSuccess,
   draftIdToLoad,
   onDraftLoaded,
-  auctionManagementTask,
+  auctionManagementTask: suppliedAuctionManagementTask,
+  auctioneerControl,
+  backgroundUploads = false,
 }: LotListingFormSheetProps) => {
+  const auctioneer = auctioneerControl?.setup;
+  const [recoveredAuctionTask, setRecoveredAuctionTask] = useState<AuctionManagementTaskPayload>();
+  const auctionManagementTask = suppliedAuctionManagementTask || recoveredAuctionTask;
 
   // Form fields
-  const [contractNo, setContractNo] = useState('');
-  const [salesDate, setSalesDate] = useState(isoDate(new Date()));
-  const [location, setLocation] = useState(() => normalizeHiddenLocation().location);
+  const [contractNo, setContractNo] = useState(auctioneer?.contract.contractNo || '');
+  const [salesDate, setSalesDate] = useState(auctioneer?.contract.eventDate?.slice(0, 10) || isoDate(new Date()));
+  const [location, setLocation] = useState(() => normalizeHiddenLocation(auctioneer?.contract.location).location);
   const [latitude, setLatitude] = useState<number | undefined>(undefined);
   const [longitude, setLongitude] = useState<number | undefined>(undefined);
   const [bankPhotosEnabled, setBankPhotosEnabled] = useState(false);
+  const [watermarkImages, setWatermarkImages] = useState(DEFAULT_IMAGE_WATERMARK);
   const [auctionCloseContract, setAuctionCloseContract] = useState(false);
   const [auctionServiceSelections, setAuctionServiceSelections] = useState<Record<number, string[]>>({});
 
   // Lots with images (using MixedLot type for LotManager compatibility)
-  const [lots, setLots] = useState<MixedLot[]>([]);
+  const [lots, setLotsRaw] = useState<MixedLot[]>(() => auctioneer ? auctioneerSeedLots(auctioneer) : []);
+  const setLots = useCallback<React.Dispatch<React.SetStateAction<MixedLot[]>>>((update) => {
+    setLotsRaw((previous) => {
+      const next = typeof update === 'function' ? update(previous) : update;
+      return hasValidAuctioneerLotStructure(auctioneer, next) ? next : previous;
+    });
+  }, [auctioneer]);
   const [activeLotIdx, setActiveLotIdx] = useState(0);
 
   // Camera state
@@ -69,8 +118,13 @@ const LotListingFormSheet = ({
 
   // Submission state
   const [submitting, setSubmitting] = useState(false);
+  const [pausingUpload, setPausingUpload] = useState(false);
+  const pauseRequestedRef = useRef(false);
+  const uploadAcceptedRef = useRef(false);
+  const [savingDraftPreview, setSavingDraftPreview] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStatus, setUploadStatus] = useState<DirectUploadProgress | null>(null);
 
   // Details section expanded state (default expanded)
   const [detailsExpanded, setDetailsExpanded] = useState(true);
@@ -83,9 +137,48 @@ const LotListingFormSheet = ({
     totalLots?: number;
   } | null>(null);
   const [currentDraftId, setCurrentDraftId] = useState<string | null>(null);
-  const submissionIdRef = useRef<string | null>(null);
+  const draftIdentityRef = useRef(randomUUID());
+  const [captureMode, setCaptureMode] = useState<'online' | 'offline'>('online');
+  const [manualSubmissionRequired, setManualSubmissionRequired] = useState(false);
+  const [reviewingSavedDraft, setReviewingSavedDraft] = useState(false);
+  const [draftLoadError, setDraftLoadError] = useState<string>();
+  const [draftLoadAttempt, setDraftLoadAttempt] = useState(0);
+  const reviewEventRef = useRef(randomUUID());
+  const saveOnly = captureMode === 'offline' && !reviewingSavedDraft;
+  const [localSavedAt, setLocalSavedAt] = useState<string>();
+  const [localSaveError, setLocalSaveError] = useState<string>();
+  const [uploadPaused, setUploadPaused] = useState(false);
+  const changeCaptureMode = (mode: 'online' | 'offline') => {
+    setDraftCaptureMode(currentDraftId || draftIdentityRef.current, mode);
+    if (mode === 'offline') setManualSubmissionRequired(true);
+    setCaptureMode(mode);
+  };
+  const submissionIdRef = useRef<string | null>(auctioneer?.clientSubmissionId || null);
+  const supersedesSubmissionIdRef = useRef<string | undefined>(undefined);
+  const recoveryScopeRef = useRef(0);
+  useEffect(() => {
+    recoveryScopeRef.current += 1;
+    return () => { recoveryScopeRef.current += 1; };
+  }, [visible, draftIdToLoad, auctioneer?.workItemId]);
+  const submissionLockRef = useRef(false);
+  // The operation of the upload this form is running, so Pause stops only it.
+  const activeOperationRef = useRef<UploadOperation | null>(null);
+  const handlePauseUpload = () => {
+    // Finalizing is when the server accepts the listing; pausing then only loses
+    // the answer. See beginUploadFinalization in uploadCancellation.ts.
+    if (!submissionLockRef.current || pauseRequestedRef.current || uploadAcceptedRef.current || uploadStatus?.stage === 'complete'
+      || uploadStatus?.stage === 'finalizing') return;
+    pauseRequestedRef.current = true;
+    setPausingUpload(true);
+    // This form's upload only: a background upload of another report keeps
+    // going (2026-10-02). A global pause (Offline mode, sign-out) still stops
+    // this operation as well.
+    pauseUploadOperation(activeOperationRef.current);
+  };
+  // Interrupted uploads always require an explicit Resume, including after reconnect.
   const autoSaveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const loadedDraftIdRef = useRef<string | null>(null);
+  const awaitingDraft = Boolean(draftIdToLoad && loadedDraftIdRef.current !== draftIdToLoad);
   const draftSavePromiseRef = useRef<Promise<unknown> | null>(null);
   const isAuctionManagementMode = Boolean(auctionManagementTask);
   const auctionServices = useMemo(() => {
@@ -119,7 +212,7 @@ const LotListingFormSheet = ({
   };
 
   useEffect(() => {
-    if (!visible || !auctionManagementTask) return;
+    if (!visible || !auctionManagementTask || draftIdToLoad || loadedDraftIdRef.current) return;
     const eventDate = auctionManagementTask.event?.eventDate || new Date().toISOString();
     const taskLocation = normalizeHiddenLocation(
       auctionManagementTask.event?.location ||
@@ -145,6 +238,7 @@ const LotListingFormSheet = ({
     setLatitude(taskLocation.latitude);
     setLongitude(taskLocation.longitude);
     setBankPhotosEnabled(false);
+    setWatermarkImages(DEFAULT_IMAGE_WATERMARK);
     setLots(seedLots.map((seedLot, index) => ({
       ...createNewLot(),
       id: `auctionsoft-${seedLot.id || index}`,
@@ -159,7 +253,7 @@ const LotListingFormSheet = ({
     );
     setDetailsExpanded(true);
     setErrors({});
-  }, [auctionManagementTask, visible]);
+  }, [auctionManagementTask, visible, setLots]);
 
   // Keep legacy single autosave recoverable through the Offline Reports page.
   useEffect(() => {
@@ -194,6 +288,7 @@ const LotListingFormSheet = ({
         if (typeof data.formData.bankPhotosEnabled === 'boolean') {
           setBankPhotosEnabled(data.formData.bankPhotosEnabled);
         }
+        setWatermarkImages(restoreImageWatermarkPreference(data.formData.watermarkImages));
         if (
           data.formData.location ||
           data.formData.latitude !== undefined ||
@@ -253,6 +348,7 @@ const LotListingFormSheet = ({
                     type: 'video/mp4' as const,
                   }
                 : {
+                    ...savedLot.videoFiles[0],
                     uri: savedLot.videoFiles[0].uri,
                     name: savedLot.videoFiles[0].name || 'restored-video.mp4',
                     type: savedLot.videoFiles[0].type || 'video/mp4',
@@ -289,15 +385,25 @@ const LotListingFormSheet = ({
 
   const applyStoredDraftData = useCallback(
     (data: Pick<AutoSaveData, 'formData' | 'lots' | 'activeLotIdx'>) => {
+      if (data.formData.auctionsoftSnapshot) setRecoveredAuctionTask(data.formData.auctionsoftSnapshot as AuctionManagementTaskPayload);
+      if (data.formData.auctionServiceSelections) setAuctionServiceSelections(data.formData.auctionServiceSelections as Record<number, string[]>);
+      if (typeof data.formData.auctionCloseContract === 'boolean') setAuctionCloseContract(data.formData.auctionCloseContract);
+      setCaptureMode(((data as any).captureMode || data.formData.captureMode) === 'offline' ? 'offline' : 'online');
+      setManualSubmissionRequired(Boolean((data as any).manualSubmissionRequired || data.formData.manualSubmissionRequired || (data as any).captureMode === 'offline' || data.formData.captureMode === 'offline'));
+      setUploadPaused(needsExplicitUploadResume((data as any).submissionState));
+      if ((data as any).id) draftIdentityRef.current = (data as any).id;
+      setLocalSavedAt((data as any).updatedAt);
       if (data.formData.contractNo) setContractNo(data.formData.contractNo);
       if (data.formData.clientSubmissionId) {
         submissionIdRef.current = data.formData.clientSubmissionId;
       }
+      supersedesSubmissionIdRef.current = data.formData.supersedesClientSubmissionId;
       if (data.formData.effectiveDate) setSalesDate(data.formData.effectiveDate);
       if (data.formData.salesDate) setSalesDate(data.formData.salesDate);
       if (typeof data.formData.bankPhotosEnabled === 'boolean') {
         setBankPhotosEnabled(data.formData.bankPhotosEnabled);
       }
+      setWatermarkImages(restoreImageWatermarkPreference(data.formData.watermarkImages));
       if (
         data.formData.location ||
         data.formData.latitude !== undefined ||
@@ -314,6 +420,8 @@ const LotListingFormSheet = ({
       }
       const restoredLots: MixedLot[] = data.lots.map((savedLot) => ({
         id: savedLot.id,
+        lotNumber: savedLot.lotNumber,
+        title: savedLot.title,
         mode: savedLot.mode,
         files: savedLot.mainImages.map((file, i) =>
           normalizePhotoFile(
@@ -356,6 +464,7 @@ const LotListingFormSheet = ({
                   type: 'video/mp4' as const,
                 }
               : {
+                  ...savedLot.videoFiles[0],
                   uri: savedLot.videoFiles[0].uri,
                   name: savedLot.videoFiles[0].name || 'restored-video.mp4',
                   type: savedLot.videoFiles[0].type || 'video/mp4',
@@ -364,12 +473,10 @@ const LotListingFormSheet = ({
         coverIndex: savedLot.coverIndex,
       }));
 
-      if (restoredLots.length > 0) {
-        setLots(restoredLots);
-        setActiveLotIdx(data.activeLotIdx >= 0 ? data.activeLotIdx : 0);
-      }
+      setLots(restoredLots);
+      setActiveLotIdx(Math.max(0, Math.min(data.activeLotIdx || 0, restoredLots.length - 1)));
     },
-    []
+    [setLots]
   );
 
   useEffect(() => {
@@ -377,16 +484,31 @@ const LotListingFormSheet = ({
 
     let cancelled = false;
     const loadDraft = async () => {
+      const owner = OfflineCaptureStore.getOwnerId();
+      setDraftLoadError(undefined);
       try {
+        // A draft queued or uploading in the background is not opened here:
+        // edits would change photos and identity under an upload on its way.
+        if (backgroundUploadManager.isBusy(draftIdToLoad)) throw new Error(BACKGROUND_UPLOAD_BUSY_MESSAGE);
+        // A paused or needs-attention background upload belongs to this form now.
+        backgroundUploadManager.forget(draftIdToLoad);
         const draft = await AutoSaveService.getDraft(draftIdToLoad);
-        if (cancelled || !draft || draft.type !== 'lotListing') return;
+        if (cancelled) return;
+        if (!owner || owner !== OfflineCaptureStore.getOwnerId()) throw new Error('The account changed. Reopen this draft from its owner account.');
+        if (!draft || draft.type !== 'lotListing') throw new Error('This saved draft is unavailable. No new report has been created.');
+        const offlineReview = Boolean(draft.captureMode === 'offline' || draft.manualSubmissionRequired || draft.formData.captureMode === 'offline' || draft.formData.manualSubmissionRequired);
+        if (offlineReview) {
+          await OfflineCaptureStore.recordDraftOpened(draft.id, reviewEventRef.current);
+          if (cancelled) return;
+          if (owner !== OfflineCaptureStore.getOwnerId()) throw new Error('The account changed. Reopen this draft from its owner account.');
+        }
         applyStoredDraftData(draft);
         setCurrentDraftId(draft.id);
         loadedDraftIdRef.current = draft.id;
+        setReviewingSavedDraft(offlineReview);
         onDraftLoaded?.();
       } catch (error) {
-        console.error('Error loading offline draft:', error);
-        Alert.alert('Error', 'Failed to open offline draft.');
+        if (!cancelled) setDraftLoadError(error instanceof Error ? error.message : 'Failed to open offline draft. Try again.');
       }
     };
 
@@ -394,13 +516,21 @@ const LotListingFormSheet = ({
     return () => {
       cancelled = true;
     };
-  }, [applyStoredDraftData, draftIdToLoad, onDraftLoaded, visible]);
+  }, [applyStoredDraftData, draftIdToLoad, onDraftLoaded, visible, draftLoadAttempt]);
 
   const buildAutoSaveFormData = useCallback(
     (): AutoSaveFormData => ({
+      captureMode,
+      manualSubmissionRequired,
+      auctioneerSnapshot: auctioneer ? { ...auctioneer } : undefined,
+      auctionsoftSnapshot: auctionManagementTask ? { ...auctionManagementTask } : undefined,
+      auctionServiceSelections,
+      auctionCloseContract,
+      auctioneerWorkItemId: auctioneer?.workItemId,
       clientSubmissionId:
         submissionIdRef.current ||
         (submissionIdRef.current = `ll-mobile-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`),
+      supersedesClientSubmissionId: supersedesSubmissionIdRef.current,
       contractNo,
       effectiveDate: salesDate,
       salesDate,
@@ -408,9 +538,10 @@ const LotListingFormSheet = ({
       latitude,
       longitude,
       bankPhotosEnabled,
+      watermarkImages,
       selectedValuationMethods: LOT_LISTING_VALUATION_METHODS,
     }),
-    [bankPhotosEnabled, contractNo, latitude, location, longitude, salesDate]
+    [auctioneer, auctionManagementTask, auctionServiceSelections, auctionCloseContract, captureMode, manualSubmissionRequired, bankPhotosEnabled, contractNo, latitude, location, longitude, salesDate, watermarkImages]
   );
 
   const hasDraftableWork = useCallback((candidateLots: MixedLot[] = lots) => {
@@ -421,43 +552,125 @@ const LotListingFormSheet = ({
   }, [contractNo, lots]);
 
   const requireContractNumberForDraft = useCallback(() => {
-    if (contractNo.trim()) return true;
+    if (contractNo.trim() || captureMode === 'offline') return true;
     Alert.alert(
       'Contract Number Required',
-      'Enter a unique contract number before adding lots, opening the camera, or saving this offline draft.'
+      'Enter a contract number before continuing, or choose Offline to save incomplete details on this device.'
     );
     return false;
-  }, [contractNo]);
+  }, [contractNo, captureMode]);
 
   const saveCurrentDraftNow = useCallback(async (
     lotsSnapshot: MixedLot[] = lots,
-    activeLotIdxSnapshot: number = activeLotIdx
+    activeLotIdxSnapshot: number = activeLotIdx,
+    draftIdOverride?: string,
+    explicitActivitySave = false
   ) => {
-    if (!hasDraftableWork(lotsSnapshot) || !contractNo.trim()) return null;
+    if (!hasValidAuctioneerLotStructure(auctioneer, lotsSnapshot)) throw new Error('Schedule A lots cannot be added, removed, reordered or regrouped.');
+    if (captureMode !== 'offline' && (!hasDraftableWork(lotsSnapshot) || !contractNo.trim())) return null;
 
     const savePromise = AutoSaveService.saveDraft({
-      id: currentDraftId,
+      explicitActivitySave,
+      id: draftIdOverride || currentDraftId || draftIdentityRef.current,
+      captureMode,
       type: 'lotListing',
       title: contractNo.trim() || 'Lot Listing',
       formData: buildAutoSaveFormData(),
-      lots: lotsSnapshot,
+      lots: lotsSnapshot.map((lot, index) => ({ ...lot,
+        lotNumber: lot.lotNumber || (auctioneer?.kind === 'scheduleA' ? auctioneer.lots[index]?.lotNumber : undefined),
+        title: lot.title || (auctioneer?.kind === 'scheduleA' ? auctioneer.lots[index]?.title : undefined),
+      })),
       activeLotIdx: activeLotIdxSnapshot,
     });
 
     draftSavePromiseRef.current = savePromise;
     try {
       const draft = await savePromise;
+      draftIdentityRef.current = draft.id;
+      setLocalSavedAt(draft.updatedAt); setLocalSaveError(undefined);
       if (currentDraftId !== draft.id) setCurrentDraftId(draft.id);
       return draft;
+    } catch (error) {
+      setLocalSaveError(error instanceof Error ? error.message : 'Could not save. Keep this form open and retry.');
+      throw error;
     } finally {
       if (draftSavePromiseRef.current === savePromise) {
         draftSavePromiseRef.current = null;
       }
     }
-  }, [activeLotIdx, buildAutoSaveFormData, contractNo, currentDraftId, hasDraftableWork, lots]);
+  }, [activeLotIdx, auctioneer, buildAutoSaveFormData, contractNo, currentDraftId, hasDraftableWork, lots, captureMode]);
+
+  const saveExplicitLocalDraft = useCallback(() => saveCurrentDraftNow(lots, activeLotIdx, undefined, true), [saveCurrentDraftNow, lots, activeLotIdx]);
+  const { saving: savingLocal, saveOnDevice, saveLock } = useDeviceDraftSave(saveExplicitLocalDraft, draftSavePromiseRef, autoSaveTimeoutRef);
+
+  const handleSaveDraftPreview = useCallback(async () => {
+    if (awaitingDraft || submitting) return;
+    if (captureMode === 'offline' || manualSubmissionRequired) {
+      try { await saveOnDevice(); } catch (error) { setLocalSaveError(error instanceof Error ? error.message : 'Save failed. Please try again.'); }
+      return;
+    }
+    if (auctioneer || savingDraftPreview || submitting || isAuctionManagementMode) return;
+    if (!requireContractNumberForDraft()) return;
+
+    const imageCount = lots.reduce(
+      (sum, lot) => sum + lot.files.length + (lot.extraFiles?.length || 0),
+      0
+    );
+    if (imageCount === 0) {
+      Alert.alert('Images Required', 'Add at least one image before creating a draft preview.');
+      return;
+    }
+
+    const operation = createUploadOperation();
+    const attemptOwner = OfflineCaptureStore.getOwnerId();
+    setSavingDraftPreview(true);
+    try {
+      // Explicit draft preview creation uploads and verifies media; normal autosave stays local-only.
+      const localDraft = await saveCurrentDraftNow(lots, activeLotIdx, undefined, true);
+      operation.assertActive();
+      if (!localDraft) throw new Error('The draft could not be saved.');
+      const cloudDraft = await reportDraftService.upsertFromLocalDraft(localDraft);
+      operation.assertActive();
+      const cloudDraftId = cloudDraft.id || cloudDraft._id;
+      if (!cloudDraftId) throw new Error('The cloud draft could not be identified.');
+      const duplicateWarning = getDuplicateLotWarning(cloudDraft);
+      if (duplicateWarning) {
+        Alert.alert('Duplicate Lot Detected', duplicateWarning);
+        return;
+      }
+      await reportDraftService.processPreview(cloudDraftId);
+      operation.assertActive();
+      Alert.alert(
+        'Draft Preview Started',
+        'Your draft is safe in cloud storage and is being processed. Track it in Previews > Draft Previews. You can continue editing the original draft later.'
+      );
+    } catch (error: any) {
+      if (OfflineCaptureStore.getOwnerId() !== attemptOwner) return;
+      const duplicateWarning = getDuplicateLotWarning(error);
+      Alert.alert(
+        duplicateWarning ? 'Duplicate Lot Detected' : 'Draft Preview Not Started',
+        duplicateWarning || getSubmissionError(error, 'Save Draft').message
+      );
+    } finally {
+      setSavingDraftPreview(false);
+    }
+  }, [
+    auctioneer,
+    activeLotIdx,
+    captureMode,
+    manualSubmissionRequired,
+    isAuctionManagementMode,
+    lots,
+    requireContractNumberForDraft,
+    saveCurrentDraftNow,
+    saveOnDevice,
+    awaitingDraft,
+    savingDraftPreview,
+    submitting,
+  ]);
 
   useEffect(() => {
-    if (!visible) return;
+    if (!visible || auctioneer) return;
 
     let cancelled = false;
     void getHiddenCurrentLocation().then((snapshot) => {
@@ -472,7 +685,7 @@ const LotListingFormSheet = ({
     return () => {
       cancelled = true;
     };
-  }, [visible]);
+  }, [visible, auctioneer]);
 
   // Auto-save form data and images
   const triggerAutoSave = useCallback(async (
@@ -510,10 +723,11 @@ const LotListingFormSheet = ({
 
   // Trigger auto-save when form fields or lots change after a contract number exists.
   useEffect(() => {
-    if (visible && contractNo.trim() && hasDraftableWork()) {
+    if (visible && !submitting && !savingLocal && !awaitingDraft && (captureMode === 'offline' || (contractNo.trim() && hasDraftableWork()))) {
       triggerAutoSave();
     }
-  }, [contractNo, hasDraftableWork, triggerAutoSave, visible]);
+    return () => { if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current); };
+  }, [contractNo, hasDraftableWork, triggerAutoSave, visible, captureMode, submitting, savingLocal, awaitingDraft]);
 
   // Cleanup timeout on unmount
   useEffect(() => {
@@ -597,6 +811,7 @@ const LotListingFormSheet = ({
 
   // Create a new lot and return its index
   const handleCreateLot = useCallback(() => {
+    if (auctioneer?.kind === 'scheduleA') return -1;
     if (!requireContractNumberForDraft()) return -1;
     const newLot = createNewLot();
     setLots((prev) => [...prev, newLot]);
@@ -606,58 +821,143 @@ const LotListingFormSheet = ({
     }
     setActiveLotIdx(newIdx);
     return newIdx;
-  }, [isAuctionManagementMode, lots.length, requireContractNumberForDraft]);
+  }, [auctioneer?.kind, isAuctionManagementMode, lots.length, requireContractNumberForDraft, setLots]);
 
-  // Open camera for a specific lot
-  const handleOpenCamera = useCallback((lotIdx: number) => {
+  // Open camera for a specific lot. Try again (below) runs the handler from the
+  // latest render, so it saves the form as it is when tapped.
+  const handleOpenCameraRef = useRef<(lotIdx: number) => Promise<void>>(async () => undefined);
+  const handleOpenCamera = useCallback(async (lotIdx: number) => {
     if (!requireContractNumberForDraft()) return;
+    const owner = OfflineCaptureStore.getOwnerId();
+    const scope = recoveryScopeRef.current;
+    try {
+      if (!await saveCurrentDraftNow()) return;
+    } catch (error) {
+      // Say why instead of ignoring the tap, and offer Try again
+      // (cameraOpenFailure.ts). The retry does nothing once the account or
+      // this form changed, like the other delayed alert buttons here.
+      if (OfflineCaptureStore.getOwnerId() !== owner || recoveryScopeRef.current !== scope) return;
+      Alert.alert(CAMERA_NOT_OPENED_TITLE, describeCameraOpenFailure(error), cameraOpenFailureButtons(() => {
+        if (OfflineCaptureStore.getOwnerId() !== owner || recoveryScopeRef.current !== scope) return;
+        void handleOpenCameraRef.current(lotIdx);
+      }));
+      return;
+    }
+    if (OfflineCaptureStore.getOwnerId() !== owner || recoveryScopeRef.current !== scope) return;
     setActiveLotIdx(lotIdx >= 0 ? lotIdx : 0);
     setCameraOpen(true);
-  }, [requireContractNumberForDraft]);
+  }, [requireContractNumberForDraft, saveCurrentDraftNow]);
+  handleOpenCameraRef.current = handleOpenCamera;
 
   const handleCameraClose = useCallback(() => {
     setCameraOpen(false);
     clearError('images');
   }, []);
 
-  const clearCurrentDraft = async () => {
-    try {
-      if (currentDraftId) {
-        await AutoSaveService.deleteDraft(currentDraftId);
-      } else {
-        await AutoSaveService.deleteAutoSave();
-      }
-    } catch (error) {
-      console.error('Error clearing draft:', error);
-    }
-  };
-
   const handleSubmit = async (
     destination: AuctionManagementDestination = 'LottingBoard',
-    options: { forceNew?: boolean } = {}
+    options: { forceNew?: boolean; nextLot?: boolean; replaceSubmissionId?: string; replacementSourceId?: string; newSubmissionFromId?: string } = {}
   ) => {
+    if (submissionLockRef.current || saveLock.current || awaitingDraft || submitting || auctioneerControl?.accepted) return;
+    if (options.nextLot && captureMode === 'offline') return;
+    if (saveOnly) { await handleSaveOfflineAndClose(); return; }
+    if (auctioneer && (options.forceNew || !hasValidAuctioneerLotStructure(auctioneer, lots))) return;
+    if (options.replaceSubmissionId && (auctioneer || submissionIdRef.current !== options.replaceSubmissionId)) return;
+    if (options.newSubmissionFromId && (auctioneer || submissionIdRef.current !== options.newSubmissionFromId)) return;
     if (!validateForm()) {
       Alert.alert('Validation Error', 'Please fix the required fields');
       return;
     }
 
+    const submissionFileCount = lots.reduce(
+      (sum, lot) => sum + lot.files.length + (lot.extraFiles?.length || 0) + (lot.videoFile ? 1 : 0),
+      0
+    );
+    // Background hand-off (2026-10-02, services/backgroundUploadManager.ts):
+    // an ordinary Submit or Resume from the Dashboard is saved, checked and
+    // handed to the upload line, and the form closes. Incoming work and
+    // Auction Management tasks keep waiting here for acceptance, and so do the
+    // explicit separate/replace choices. A draft whose
+    // last background attempt needs a decision runs here once, where the
+    // prompts can appear; this attempt uses up that mark.
+    const plannedDraftId = currentDraftId || draftIdentityRef.current;
+    // Never save over, or send a second time, a draft the line is sending.
+    if (backgroundUploadManager.isBusy(plannedDraftId)) {
+      Alert.alert(ALREADY_UPLOADING_TITLE, ALREADY_UPLOADING_MESSAGE);
+      return;
+    }
+    let background = backgroundUploads && !auctioneer && !isAuctionManagementMode && !options.nextLot && !options.forceNew
+      && !options.replaceSubmissionId && !options.newSubmissionFromId;
+    if (backgroundUploads && backgroundUploadManager.prefersForeground(plannedDraftId)) {
+      background = false;
+      backgroundUploadManager.consumeForegroundMark(plannedDraftId);
+    }
+    // Bind the user's explicit action across local preparation and transport.
+    const operation = createUploadOperation();
+    activeOperationRef.current = operation;
+    const attemptOwner = OfflineCaptureStore.getOwnerId();
+    const attemptRecoveryScope = recoveryScopeRef.current;
+    submissionLockRef.current = true;
+    pauseRequestedRef.current = false;
+    uploadAcceptedRef.current = false;
+    setPausingUpload(false);
     setSubmitting(true);
-    setUploadProgress(0);
+    setUploadProgress(1);
+    setUploadStatus({
+      percent: 1,
+      stage: 'preparing',
+      message: `Preparing ${submissionFileCount} ${submissionFileCount === 1 ? 'file' : 'files'}...`,
+      completedFiles: 0,
+      totalFiles: submissionFileCount,
+      uploadedBytes: 0,
+      totalBytes: 0,
+    });
 
     let details: LotListingDetails | null = null;
     let serviceLots: LotListingLot[] | null = null;
+    let attemptDraftId = currentDraftId || draftIdentityRef.current;
+    let uploadAccepted = false;
+    let draftSaved = false;
+    const previousSubmissionId = submissionIdRef.current;
+    const previousSupersedesId = supersedesSubmissionIdRef.current;
 
     try {
-      if (options.forceNew) submissionIdRef.current = null;
+      if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
+      const separateDraftId = options.forceNew || options.newSubmissionFromId ? randomUUID() : undefined;
+      if (separateDraftId) {
+        submissionIdRef.current = randomUUID();
+        supersedesSubmissionIdRef.current = undefined;
+        setDraftCaptureMode(separateDraftId, captureMode);
+      }
+      if (options.replaceSubmissionId) {
+        supersedesSubmissionIdRef.current = options.replacementSourceId || options.replaceSubmissionId;
+        submissionIdRef.current = randomUUID();
+      }
+      const localDraft = await saveCurrentDraftNow(lots, activeLotIdx, separateDraftId);
+      if (!localDraft) throw new Error('Save this draft before submitting.');
+      // Record the save before checking for a pause. A Pause tapped while the
+      // draft was being saved is a pause: it used to be reported as "Draft not
+      // saved -- check device storage" although the save had succeeded
+      // (2026-10-02).
+      draftSaved = true;
+      attemptDraftId = localDraft.id;
+      operation.assertActive();
+      await prepareOfflineSubmission(localDraft);
+      operation.assertActive();
+      await OfflineCaptureStore.setSubmissionState(localDraft.id, 'ready');
+      operation.assertActive();
+      setUploadPaused(false);
       const jobId =
         submissionIdRef.current ||
         `ll-mobile-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
       submissionIdRef.current = jobId;
 
       // Simple lot mapping for upload
-      const mixedLots = lots.map((lot) => ({
+      const mixedLots = lots.map((lot, index) => ({
+        ...auctioneerLotSource(auctioneer, index),
         count: lot.files.length,
         extra_count: lot.extraFiles?.length || 0,
+        video_count: lot.videoFile ? 1 : 0,
         cover_index: lot.coverIndex || 0,
         mode: lot.mode || 'single_lot',
       }));
@@ -677,6 +977,8 @@ const LotListingFormSheet = ({
       }
 
       details = {
+        capture_id: localDraft.captureId,
+        auctioneer_work_item_id: auctioneer?.workItemId,
         contract_no: contractNo.trim(),
         sales_date: salesDate,
         location: location.trim(),
@@ -684,15 +986,14 @@ const LotListingFormSheet = ({
         longitude,
         include_damage_analysis: true,
         bank_photos_enabled: bankPhotosEnabled,
+        watermark_images: watermarkImages,
         valuation_methods: LOT_LISTING_VALUATION_METHODS,
         mixed_lots: mixedLots,
         focus_boxes: focusBoxes.length > 0 ? focusBoxes : undefined,
         progress_id: jobId,
         client_submission_id: jobId,
+        supersedes_client_submission_id: supersedesSubmissionIdRef.current,
         force_new: options.forceNew === true,
-        ...(auctionManagementTask?.task.auctioneerWorkItemId
-          ? { auctioneer_work_item_id: auctionManagementTask.task.auctioneerWorkItemId }
-          : {}),
         auctionsoft: buildAuctionsoftMetadata(destination),
       };
 
@@ -703,6 +1004,7 @@ const LotListingFormSheet = ({
           uri: getPhotoUploadUri(f),
           name: f.name,
           type: f.type,
+          size: f.size,
           captureOrder: f.captureOrder,
           originalOrder: f.originalOrder,
         })),
@@ -710,44 +1012,83 @@ const LotListingFormSheet = ({
           uri: getPhotoUploadUri(f),
           name: f.name,
           type: f.type,
+          size: f.size,
           captureOrder: f.captureOrder,
           originalOrder: f.originalOrder,
         })),
+        videoFile: lot.videoFile ? {
+          uri: lot.videoFile.uri,
+          name: lot.videoFile.name,
+          type: lot.videoFile.type || 'video/mp4',
+          size: lot.videoFile.size,
+        } : undefined,
         lot_number: idx + 1,
         mode: lot.mode,
         coverIndex: lot.coverIndex,
       }));
 
-      const connectivity = await OfflineQueueService.getConnectivityStatus();
-      if (connectivity.status === 'offline') {
-        const offlineDraft = await saveCurrentDraftNow();
-        const offlineDraftId = offlineDraft?.id || currentDraftId || undefined;
-        await OfflineQueueService.enqueueLotListing(details, serviceLots, {
-          sourceDraftId: offlineDraftId,
+      if (background) {
+        if (!attemptOwner) throw new Error('Sign in to the account that owns this draft.');
+        // The same details and photos this form would send, frozen now.
+        const queuedDetails = details;
+        const queuedLots = serviceLots;
+        const handedOff = backgroundUploadManager.enqueue({
+          draftId: localDraft.id,
+          type: 'lotListing',
+          ownerId: attemptOwner,
+          title: contractNo.trim() || 'Lot listing',
+          totalFiles: submissionFileCount,
+          draft: localDraft,
+          upload: (onProgress, uploadOperation) =>
+            lotListingService.createLotListing(queuedDetails, queuedLots, onProgress, { operation: uploadOperation }),
         });
-
-        if (offlineDraftId) {
-          await AutoSaveService.removeDraftRecordOnly(offlineDraftId);
-          setCurrentDraftId(null);
-          loadedDraftIdRef.current = null;
-        } else {
-          await clearCurrentDraft();
-        }
-
         setSubmitting(false);
-        await resetForm({ clearDraft: false });
+        if (!handedOff) {
+          Alert.alert(ALREADY_UPLOADING_TITLE, ALREADY_UPLOADING_MESSAGE);
+          return;
+        }
+        // No alert: the upload bar shows progress and the outcome from here.
+        await resetForm();
         onClose();
-        Alert.alert(
-          'Saved for Upload',
-          'No internet connection was detected. Your lot listing is safely queued and will upload automatically when the connection returns. You can monitor it in Drafts.'
-        );
-        if (onSuccess) onSuccess();
         return;
       }
 
-      await lotListingService.createLotListing(details, serviceLots, (progress) => {
+      const connectivity = await OfflineQueueService.getConnectivityStatus();
+      operation.assertActive();
+      if (options.nextLot && connectivity.status === 'offline') {
+        setSubmitting(false);
+        Alert.alert('Connection required', 'Keep this lot open and retry when online. A new lot starts only after the server accepts this report.');
+        return;
+      }
+      if (connectivity.status === 'offline') {
+        throw new Error('Saved on this device. Connect and tap Resume upload. Nothing will submit automatically.');
+      }
+
+      const modernDraft = auctioneer ? await saveCurrentDraftNow() : null;
+      operation.assertActive();
+      const acceptedResponse = await lotListingService.createLotListing(details, serviceLots, (progress, detail) => {
+        if (!operation.isActive() || recoveryScopeRef.current !== attemptRecoveryScope || OfflineCaptureStore.getOwnerId() !== attemptOwner) return;
         setUploadProgress(progress);
-      });
+        if (detail) setUploadStatus(detail);
+      }, { operation });
+      operation.assertActive();
+      assertReportUploadAccepted(acceptedResponse);
+      uploadAccepted = true;
+      uploadAcceptedRef.current = true;
+      if (isExistingReportUploadReceipt(acceptedResponse)) {
+        setSubmitting(false);
+        setUploadPaused(true);
+        Alert.alert('Earlier upload accepted', 'The server returned the earlier report, not confirmation of your current edits. This draft and its originals are kept. Open Reports or Previews to review the earlier report before making further changes.');
+        return;
+      }
+      await OfflineCaptureStore.setSubmissionState(localDraft.id, 'accepted', (acceptedResponse as any).reportId);
+
+      if (options.nextLot && auctioneerControl) {
+        if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
+        await auctioneerControl.acceptAndContinue(acceptedResponse, modernDraft?.id);
+        setSubmitting(false);
+        return;
+      }
 
       // Upload complete - close immediately, don't wait for server processing
       setSubmitting(false);
@@ -761,95 +1102,89 @@ const LotListingFormSheet = ({
       if (onSuccess) onSuccess();
     } catch (e: any) {
       console.error('Submit error:', e);
+      if (OfflineCaptureStore.getOwnerId() !== attemptOwner) {
+        setSubmitting(false);
+        return;
+      }
+      if (uploadAccepted) {
+        setSubmitting(false);
+        Alert.alert('Upload accepted', 'The server accepted this report. Open Previews to check its progress; local confirmation could not be refreshed.');
+        return;
+      }
+      if (!draftSaved) {
+        submissionIdRef.current = previousSubmissionId;
+        supersedesSubmissionIdRef.current = previousSupersedesId;
+        setSubmitting(false);
+        Alert.alert('Draft not saved', 'Your latest changes could not be saved on this device. Keep this form and its originals open. Check device storage, then use Save on device before trying again. No upload was started.');
+        return;
+      }
+      const conflictedSubmissionId = submissionIdRef.current;
+      const canAct = () => operation.isActive() && recoveryScopeRef.current === attemptRecoveryScope && OfflineCaptureStore.getOwnerId() === attemptOwner && submissionIdRef.current === conflictedSubmissionId;
 
-      if (e?.response?.status === 409 && e?.response?.data?.code === 'ACTIVE_REPORT_EXISTS') {
+      if (!auctioneer && !supersedesSubmissionIdRef.current && e?.response?.status === 409 && e?.response?.data?.code === 'ACTIVE_REPORT_EXISTS') {
         setSubmitting(false);
         Alert.alert(
           'Report Already Processing',
-          'A report for this contract is already queued or processing.',
+          'A report for this contract is already queued or processing. Keep this draft and review it in Reports or Previews, or explicitly create a separate report with these photos.',
           [
-            {
-              text: 'Resume Existing',
-              onPress: () => {
-                void handleClose();
-                onSuccess?.();
-              },
-            },
+            { text: 'Keep Draft', style: 'cancel' },
             {
               text: 'Create Separate',
-              onPress: () => void handleSubmit(destination, { forceNew: true }),
+              onPress: () => { if (canAct()) void handleSubmit(destination, { forceNew: true }); },
             },
-            { text: 'Cancel', style: 'cancel' },
           ]
         );
         return;
       }
 
-      if (details && serviceLots && (await OfflineQueueService.shouldQueueAfterError(e))) {
-        try {
-          const offlineDraft = await saveCurrentDraftNow();
-          const offlineDraftId = offlineDraft?.id || currentDraftId || undefined;
-          await OfflineQueueService.enqueueLotListing(details, serviceLots, {
-            sourceDraftId: offlineDraftId,
-          });
-
-          if (offlineDraftId) {
-            await AutoSaveService.removeDraftRecordOnly(offlineDraftId);
-            setCurrentDraftId(null);
-            loadedDraftIdRef.current = null;
-          } else {
-            await clearCurrentDraft();
-          }
-
-          setSubmitting(false);
-          await resetForm({ clearDraft: false });
-          onClose();
-          Alert.alert(
-            'Saved for Upload',
-            'The internet connection was lost during upload. Your lot listing is safely queued and will retry automatically when the connection returns.'
-          );
-          if (onSuccess) onSuccess();
-          return;
-        } catch (queueErr: any) {
-          console.error('Queue error:', queueErr);
-          setSubmitting(false);
-          Alert.alert(
-            'Could Not Save Offline Upload',
-            queueErr?.message || 'The lot listing remains open. Check the selected photos, then try again.'
-          );
-          return;
-        }
-      }
-
+      setUploadPaused(true);
+      await OfflineCaptureStore.setSubmissionState(attemptDraftId, 'paused', undefined, e?.message).catch(() => undefined);
       setSubmitting(false);
+      if (showUploadManifestRecovery(e, !auctioneer && conflictedSubmissionId ? {
+        replace: () => {
+          if (canAct()) void handleSubmit(destination, { replaceSubmissionId: conflictedSubmissionId, replacementSourceId: uploadConflictSource(e, conflictedSubmissionId) });
+        },
+        startSeparate: () => {
+          if (canAct()) void handleSubmit(destination, { newSubmissionFromId: conflictedSubmissionId });
+        },
+      } : undefined)) return;
       const feedback = OfflineQueueService.getSubmissionError(e);
       Alert.alert(feedback.title, feedback.message);
+    } finally {
+      submissionLockRef.current = false;
+      if (activeOperationRef.current === operation) activeOperationRef.current = null;
+      setPausingUpload(false);
     }
   };
 
-  const resetForm = async (options: { clearDraft?: boolean } = {}) => {
+  const resetForm = async () => {
+    setRecoveredAuctionTask(undefined);
+    draftIdentityRef.current = randomUUID();
+    setReviewingSavedDraft(false); setDraftLoadError(undefined); reviewEventRef.current = randomUUID();
+    setCaptureMode('online'); setManualSubmissionRequired(false); setLocalSavedAt(undefined); setLocalSaveError(undefined); setUploadPaused(false);
     setContractNo('');
     setSalesDate(isoDate(new Date()));
     setLocation(normalizeHiddenLocation().location);
     setLatitude(undefined);
     setLongitude(undefined);
     setBankPhotosEnabled(false);
+    setWatermarkImages(DEFAULT_IMAGE_WATERMARK);
     setLots([]);
     setActiveLotIdx(0);
     setAuctionCloseContract(false);
     setAuctionServiceSelections({});
     setUploadProgress(0);
+    setUploadStatus(null);
     setErrors({});
-    if (options.clearDraft !== false) {
-      await clearCurrentDraft();
-    }
     setCurrentDraftId(null);
     loadedDraftIdRef.current = null;
     submissionIdRef.current = null;
+    supersedesSubmissionIdRef.current = undefined;
   };
 
   const handleClose = async () => {
-    if (submitting) return;
+    if (submitting || saveLock.current) return;
+    if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
     if (hasDraftableWork() && !requireContractNumberForDraft()) return;
     try {
       if (draftSavePromiseRef.current) {
@@ -858,22 +1193,24 @@ const LotListingFormSheet = ({
       await saveCurrentDraftNow();
     } catch (error) {
       console.error('Error saving draft before close:', error);
+      Alert.alert('Not saved', 'Keep this form open and retry saving. Your latest changes have not been saved.');
+      return;
     }
-    setContractNo('');
-    setSalesDate(isoDate(new Date()));
-    setLocation(normalizeHiddenLocation().location);
-    setLatitude(undefined);
-    setLongitude(undefined);
-    setBankPhotosEnabled(false);
-    setLots([]);
-    setActiveLotIdx(0);
-    setAuctionCloseContract(false);
-    setAuctionServiceSelections({});
-    setUploadProgress(0);
-    setErrors({});
-    setCurrentDraftId(null);
-    loadedDraftIdRef.current = null;
+    await resetForm();
     onClose();
+  };
+
+  const handleSaveOfflineAndClose = async () => {
+    try {
+      await saveOnDevice(() => {
+        void resetForm();
+        onClose();
+        Alert.alert('Saved on this device', 'Open Drafts → Offline captures → Open and submit to review your saved work. Nothing has been uploaded.');
+      });
+    } catch (error) {
+      setLocalSaveError(error instanceof Error ? error.message : 'Save failed. Please try again.');
+      Alert.alert('Not saved', 'Keep this form open and retry saving. Your latest changes have not been saved.');
+    }
   };
 
   const totalImages = lots.reduce((sum, lot) => sum + lot.files.length + (lot.extraFiles?.length || 0), 0);
@@ -881,6 +1218,19 @@ const LotListingFormSheet = ({
     contractNo.trim() &&
     totalImages > 0 &&
     lots.every(lot => lot.mode);
+  const canSaveDraftPreview = Boolean(contractNo.trim()) && totalImages > 0;
+  const uploadTitle = uploadStatus?.stage === 'preparing'
+    ? 'Preparing images'
+    : uploadStatus?.stage === 'creating_session'
+      ? 'Starting secure upload'
+      : uploadStatus?.stage === 'finalizing'
+        ? 'Finalizing report'
+        : uploadStatus?.stage === 'complete'
+          ? 'Upload complete'
+          : 'Uploading images';
+
+  if (visible && (awaitingDraft || savingLocal)) return <DraftStorageStatus saving={savingLocal} error={draftLoadError}
+    onRetry={() => setDraftLoadAttempt(value => value + 1)} onClose={() => { void resetForm(); onClose(); }} />;
 
   return (
     <Modal
@@ -889,9 +1239,12 @@ const LotListingFormSheet = ({
       presentationStyle="fullScreen"
       onRequestClose={handleClose}>
       <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+        {auctioneer && captureMode !== 'offline' ? <AuctioneerFormHeader setup={auctioneer}
+          disabled={!canSubmit || submitting || savingDraftPreview}
+          onPress={() => void handleSubmit('LottingBoard', { nextLot: true })} /> : null}
         {/* Header */}
         <View style={styles.header}>
-          <TouchableOpacity onPress={handleClose} style={styles.closeBtn}>
+          <TouchableOpacity onPress={handleClose} style={styles.closeBtn} accessibilityRole="button" accessibilityLabel="Close lot listing">
             <Feather name="x" size={24} color="#374151" />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>{isAuctionManagementMode ? 'Auction Management' : 'Lot Listing'}</Text>
@@ -899,33 +1252,83 @@ const LotListingFormSheet = ({
             {isAuctionManagementMode ? (
               <View style={styles.headerSpacer} />
             ) : (
-              <TouchableOpacity
-                style={[styles.submitBtn, !canSubmit && styles.submitBtnDisabled]}
-                onPress={() => handleSubmit()}
-                disabled={!canSubmit || submitting}>
-                {submitting ? (
-                  <ActivityIndicator size="small" color="#fff" />
-                ) : (
-                  <Text style={styles.submitBtnText}>Submit</Text>
-                )}
-              </TouchableOpacity>
+              <>
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  accessibilityLabel="Save lot listing draft"
+                  style={[
+                    styles.headerDraftBtn,
+                    (!canSaveDraftPreview || submitting || savingDraftPreview) && styles.submitBtnDisabled,
+                  ]}
+                  onPress={() => void handleSaveDraftPreview()}
+                  disabled={Boolean(auctioneer) || !canSaveDraftPreview || submitting || savingDraftPreview}>
+                  {savingDraftPreview ? (
+                    <ActivityIndicator size="small" color="#6D28D9" />
+                  ) : (
+                    <Feather name="cloud" size={15} color="#6D28D9" />
+                  )}
+                  <Text style={styles.headerDraftBtnText}>Draft</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  accessibilityLabel={saveOnly ? 'Save offline lot listing' : uploadPaused ? 'Resume upload' : 'Submit lot listing'}
+                  style={[styles.submitBtn, ((!saveOnly && !canSubmit) || savingDraftPreview) && styles.submitBtnDisabled]}
+                  onPress={() => void handleSubmit()}
+                  disabled={(!saveOnly && !canSubmit) || submitting || savingDraftPreview}>
+                  {submitting ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Text style={styles.submitBtnText}>{saveOnly ? 'Save' : uploadPaused ? 'Resume upload' : 'Submit'}</Text>
+                  )}
+                </TouchableOpacity>
+              </>
             )}
           </View>
         </View>
 
         {/* Progress Overlay */}
-        {submitting && (
+        <Modal testID="lot-upload-progress" visible={visible && (submitting || savingDraftPreview)} transparent animationType="fade"
+          onRequestClose={submitting ? handlePauseUpload : () => undefined}>
           <View style={styles.progressOverlay}>
-            <View style={styles.progressCard}>
+            <View style={styles.progressCard} accessibilityViewIsModal>
               <ActivityIndicator size="large" color="#8B5CF6" />
-              <Text style={styles.progressText}>Uploading images...</Text>
-              <View style={styles.progressBar}>
-                <View style={[styles.progressFill, { width: `${uploadProgress}%` }]} />
-              </View>
-              <Text style={styles.progressPercent}>{uploadProgress}%</Text>
+              <Text style={styles.progressText}>
+                {savingDraftPreview ? 'Saving Draft to Cloud' : pausingUpload ? 'Pausing upload…' : uploadTitle}
+              </Text>
+              <Text style={styles.progressMessage} accessibilityLiveRegion="polite">
+                {savingDraftPreview
+                  ? `Uploading and verifying ${totalImages} ${totalImages === 1 ? 'image' : 'images'}, then starting preview processing.`
+                  : pausingUpload ? 'Stopping this transfer. Your saved draft will stay available; tap Resume upload when ready.' : uploadStatus?.message || `Preparing ${totalImages} images...`}
+              </Text>
+              {!savingDraftPreview ? (
+                <>
+                  {uploadStatus?.stage !== 'complete' && uploadStatus?.stage !== 'finalizing' && !uploadAcceptedRef.current ? (
+                    <TouchableOpacity accessibilityRole="button" accessibilityLabel={pausingUpload ? 'Pausing upload' : 'Pause upload'}
+                      accessibilityState={{ disabled: pausingUpload }} disabled={pausingUpload} onPress={handlePauseUpload} style={{ minHeight: 44, padding: 12 }}>
+                      <Text style={{ color: '#1D4ED8' }}>{pausingUpload ? 'Pausing upload…' : 'Pause upload'}</Text>
+                    </TouchableOpacity>
+                  ) : null}
+                  <View style={styles.progressBar}>
+                    <View style={[styles.progressFill, { width: `${uploadProgress}%` }]} />
+                  </View>
+                  <View style={styles.progressMetaRow}>
+                    <Text style={styles.progressPercent}>{uploadProgress}%</Text>
+                    {!!uploadStatus?.totalFiles && (
+                      <Text style={styles.progressFileCount}>
+                        {uploadStatus.completedFiles} / {uploadStatus.totalFiles} files
+                      </Text>
+                    )}
+                  </View>
+                  {!!uploadStatus?.activeFileName && (
+                    <Text style={styles.progressFileName} numberOfLines={1}>
+                      {uploadStatus.activeFileName}
+                    </Text>
+                  )}
+                </>
+              ) : null}
             </View>
           </View>
-        )}
+        </Modal>
 
         {/* Restore Draft Modal */}
         <Modal
@@ -965,11 +1368,20 @@ const LotListingFormSheet = ({
         </Modal>
 
         {/* Single scrollable content with details at top */}
+        <KeyboardAvoidingView
+          testID="lot-listing-keyboard-layout"
+          style={styles.keyboardContent}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <ScrollView
           style={styles.scrollContent}
           contentContainerStyle={styles.scrollContentContainer}
           keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
           showsVerticalScrollIndicator={false}>
+          <OfflineCapturePanel mode={captureMode} onChange={changeCaptureMode} lots={lots} savedAt={localSavedAt}
+            manualSubmissionRequired={manualSubmissionRequired} reviewingSavedDraft={reviewingSavedDraft}
+            error={localSaveError} disabled={submitting || savingDraftPreview} paused={uploadPaused}
+            onSave={() => { void handleSaveDraftPreview(); }} />
 
           {isAuctionManagementMode && auctionManagementTask ? (
             <View style={styles.auctionTaskBanner}>
@@ -1025,6 +1437,9 @@ const LotListingFormSheet = ({
           {/* Details Section - Collapsible */}
           <View style={styles.detailsSection}>
             <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Listing details"
+              accessibilityState={{ expanded: detailsExpanded }}
               style={styles.sectionHeader}
               onPress={() => setDetailsExpanded(!detailsExpanded)}
               activeOpacity={0.7}>
@@ -1041,6 +1456,8 @@ const LotListingFormSheet = ({
                 <View style={styles.fieldContainerSmall}>
                   <Text style={styles.fieldLabelSmall}>Contract # *</Text>
                   <TextInput
+                    accessibilityLabel="Contract number, required"
+                    accessibilityHint={isAuctionManagementMode ? 'Provided by the selected contract' : 'Letters, numbers, and split contract suffixes are supported'}
                     style={[
                       styles.inputSmall,
                       errors.contractNo && styles.inputError,
@@ -1053,12 +1470,16 @@ const LotListingFormSheet = ({
                     }}
                     placeholder="Contract no."
                     placeholderTextColor="#9CA3AF"
-                    keyboardType={isAuctionManagementMode ? 'default' : 'number-pad'}
-                    editable={!isAuctionManagementMode}
+                    autoCapitalize="characters"
+                    autoCorrect={false}
+                    editable={!isAuctionManagementMode && !auctioneer}
                   />
                 </View>
                 <TouchableOpacity
                   style={styles.bankToggleRow}
+                  accessibilityRole="switch"
+                  accessibilityLabel="Include all lot photos in the condition report"
+                  accessibilityState={{ checked: bankPhotosEnabled }}
                   activeOpacity={0.8}
                   onPress={() => setBankPhotosEnabled((prev) => !prev)}>
                   <View style={{ flex: 1, paddingRight: 12 }}>
@@ -1067,6 +1488,23 @@ const LotListingFormSheet = ({
                   </View>
                   <View style={[styles.bankCheckbox, bankPhotosEnabled && styles.bankCheckboxActive]}>
                     {bankPhotosEnabled && <Feather name="check" size={14} color="#fff" />}
+                  </View>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.bankToggleRow}
+                  activeOpacity={0.8}
+                  accessibilityRole="switch"
+                  accessibilityLabel="Add the company logo to photos that don’t have it"
+                  accessibilityState={{ checked: watermarkImages }}
+                  onPress={() => setWatermarkImages((prev) => !prev)}>
+                  <View style={{ flex: 1, paddingRight: 12 }}>
+                    <Text style={styles.fieldLabelSmall}>Add logo where missing</Text>
+                    <Text style={styles.bankToggleHelp}>
+                      Adds the company logo to photos that don’t have it. Photos that already show it, like Asset Insight camera photos, are left alone, so no photo gets two. On by default.
+                    </Text>
+                  </View>
+                  <View style={[styles.bankCheckbox, watermarkImages && styles.bankCheckboxActive]}>
+                    {watermarkImages && <Feather name="check" size={14} color="#fff" />}
                   </View>
                 </TouchableOpacity>
               </View>
@@ -1118,6 +1556,8 @@ const LotListingFormSheet = ({
           {/* Photos Section - Embedded LotManager */}
           <View style={styles.photosSection}>
             <LotManager
+              lockedStructure={auctioneer?.kind === 'scheduleA'}
+              sourceLabels={auctioneer?.kind === 'scheduleA' ? auctioneer.lots.map((lot, index) => lot.lotNumber ? `Lot ${lot.lotNumber}` : `Lot ${index + 1}`) : undefined}
               lots={lots}
               setLots={setLots}
               activeLotIdx={activeLotIdx}
@@ -1125,6 +1565,7 @@ const LotListingFormSheet = ({
               onOpenCamera={handleOpenCamera}
               onCreateLot={handleCreateLot}
               hideSummary={true}
+              embedded
             />
           </View>
         </ScrollView>
@@ -1135,7 +1576,7 @@ const LotListingFormSheet = ({
               <Text style={styles.auctionSummaryText}>{lots.length} lot{lots.length === 1 ? '' : 's'}</Text>
               <Text style={styles.auctionSummaryText}>{totalImages} image{totalImages === 1 ? '' : 's'}</Text>
             </View>
-            <TouchableOpacity
+            {!saveOnly && <TouchableOpacity
               style={styles.closeContractRow}
               onPress={() => setAuctionCloseContract((prev) => !prev)}
               activeOpacity={0.85}>
@@ -1143,8 +1584,11 @@ const LotListingFormSheet = ({
                 {auctionCloseContract && <Feather name="check" size={14} color="#fff" />}
               </View>
               <Text style={styles.closeContractText}>Contract Completed & Closed</Text>
-            </TouchableOpacity>
-            <View style={styles.destinationButtons}>
+            </TouchableOpacity>}
+            {saveOnly ? <TouchableOpacity accessibilityRole="button" accessibilityLabel="Save offline lot listing"
+              style={[styles.destinationButton, styles.lottingButton]} onPress={() => void handleSubmit()}>
+              <Text style={styles.destinationButtonText}>Save</Text>
+            </TouchableOpacity> : <View style={styles.destinationButtons}>
               <TouchableOpacity
                 style={[styles.destinationButton, styles.lottingButton, !canSubmit && styles.destinationButtonDisabled]}
                 onPress={() => handleSubmit('LottingBoard')}
@@ -1161,7 +1605,7 @@ const LotListingFormSheet = ({
                 {submitting ? <ActivityIndicator size="small" color="#fff" /> : <Feather name="tool" size={18} color="#fff" />}
                 <Text style={styles.destinationButtonText}>Send to Op To-Do</Text>
               </TouchableOpacity>
-            </View>
+            </View>}
           </View>
         )}
 
@@ -1179,19 +1623,22 @@ const LotListingFormSheet = ({
             </View>
           </View>
         )}
+        </KeyboardAvoidingView>
 
         {/* Camera Modal */}
-        {cameraOpen && (
-          <CameraScreen
+        <CameraScreen
+            captureContext={visible && currentDraftId && OfflineCaptureStore.getOwnerId() ? { ownerId: OfflineCaptureStore.getOwnerId()!, draftId: currentDraftId, sessionId: currentDraftId } : undefined}
+            manualSubmissionRequired={captureMode === 'offline' || manualSubmissionRequired}
             visible={cameraOpen}
+            lockedStructure={auctioneer?.kind === 'scheduleA'}
+            sourceLabels={auctioneer?.kind === 'scheduleA' ? auctioneer.lots.map((lot, index) => lot.lotNumber ? `Lot ${lot.lotNumber}` : `Lot ${index + 1}`) : undefined}
             onClose={handleCameraClose}
             lots={lots}
             setLots={setLots}
             activeLotIdx={activeLotIdx}
             setActiveLotIdx={setActiveLotIdx}
             onAutoSave={triggerAutoSave}
-          />
-        )}
+        />
       </SafeAreaView>
     </Modal>
   );
@@ -1213,8 +1660,8 @@ const styles = StyleSheet.create({
     borderBottomColor: '#E5E7EB',
   },
   closeBtn: {
-    width: 40,
-    height: 40,
+    width: 44,
+    height: 44,
     borderRadius: 20,
     backgroundColor: '#F3F4F6',
     justifyContent: 'center',
@@ -1225,17 +1672,38 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#1F2937',
     flex: 1,
+    minWidth: 0,
+    flexShrink: 1,
     textAlign: 'center',
   },
   headerActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 6,
   },
   headerSpacer: {
     width: 80,
   },
+  headerDraftBtn: {
+    minWidth: 70,
+    minHeight: 44,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#DDD6FE',
+    backgroundColor: '#F5F3FF',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+  },
+  headerDraftBtnText: {
+    color: '#6D28D9',
+    fontSize: 12,
+    fontWeight: '800',
+  },
   submitBtn: {
+    minHeight: 44,
     backgroundColor: '#8B5CF6',
     paddingHorizontal: 16,
     paddingVertical: 10,
@@ -1270,6 +1738,14 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#1F2937',
     marginTop: 16,
+    marginBottom: 4,
+  },
+  progressMessage: {
+    width: '100%',
+    color: '#6B7280',
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: 'center',
     marginBottom: 16,
   },
   progressBar: {
@@ -1286,13 +1762,35 @@ const styles = StyleSheet.create({
   },
   progressPercent: {
     fontSize: 14,
+    fontWeight: '700',
+    color: '#4B5563',
+  },
+  progressMetaRow: {
+    width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  progressFileCount: {
+    fontSize: 13,
     color: '#6B7280',
+  },
+  progressFileName: {
+    width: '100%',
+    fontSize: 12,
+    color: '#9CA3AF',
+    textAlign: 'center',
     marginTop: 8,
   },
   scrollContent: {
     flex: 1,
   },
+  keyboardContent: { flex: 1, minHeight: 0 },
   scrollContentContainer: {
+    width: '100%',
+    maxWidth: 920,
+    alignSelf: 'center',
     paddingBottom: 40,
   },
   auctionTaskBanner: {
@@ -1866,4 +2364,16 @@ const styles = StyleSheet.create({
   },
 });
 
-export default LotListingFormSheet;
+export default function LotListingFormWithAuctioneer(props: LotListingFormSheetProps) {
+  const draftSessionRef = useRef<string | null>(props.draftIdToLoad || null);
+  if (!props.visible) draftSessionRef.current = null;
+  else if (props.draftIdToLoad) draftSessionRef.current = props.draftIdToLoad;
+  const sessionDraftId = draftSessionRef.current;
+  if (!props.auctioneer && !sessionDraftId) return <LotListingFormSheet {...props} />;
+  return <AuctioneerFormBoundary visible={props.visible} type="lotListing" setup={props.auctioneer}
+    draftIdToLoad={sessionDraftId} onClose={props.onClose} onSetupChange={props.onAuctioneerSetupChange}>
+    {(control) => <LotListingFormSheet {...props} auctioneerControl={control}
+      auctionManagementTask={control ? undefined : props.auctionManagementTask}
+      draftIdToLoad={control && !control.restoreDraft ? undefined : sessionDraftId} />}
+  </AuctioneerFormBoundary>;
+}

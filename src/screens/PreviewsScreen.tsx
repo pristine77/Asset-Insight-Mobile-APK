@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -15,11 +15,17 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import api from '../services/api';
 import { assetService } from '../services/assetService';
+import reportDraftService, { type ReportDraft } from '../services/reportDraftService';
 import AssetMergeSheet from '../components/AssetMergeSheet';
 import { useAppTheme, type AppThemeColors } from '../context/ThemeContext';
+import salvageService from '../services/salvageService';
+import { salvageDisplayText } from '../utils/salvageDisplayText';
+import { previewLoadError } from '../services/previewLoadError';
+import { getAuthOperationEpoch } from '../services/authSessionOperation';
 
-type ReportType = 'Asset' | 'RealEstate' | 'LotListing';
+type ReportType = 'Asset' | 'RealEstate' | 'LotListing' | 'Salvage';
 type PreviewMode = 'pending' | 'submitted';
+type PreviewTab = PreviewMode | 'drafts';
 
 type PreviewItem = {
   id: string;
@@ -27,7 +33,7 @@ type PreviewItem = {
   status: string;
   title: string;
   createdAt: string;
-  generationState?: 'queued' | 'processing' | 'ready' | 'error';
+  generationState?: 'queued' | 'processing' | 'ready' | 'error' | 'cancelled';
   workflowStage?: string;
   workflowMessage?: string;
   workflowProgressPercent?: number;
@@ -42,6 +48,15 @@ type PreviewItem = {
   wasTransferred?: boolean;
   isMergedReport?: boolean;
   mergedSourceCount?: number;
+  isDraftPreview?: boolean;
+  draftId?: string;
+  draftPreviewReportId?: string;
+  draftPreviewStatus?: ReportDraft['previewStatus'];
+  draftRevision?: number;
+  draftProcessedRevision?: number;
+  lotCount?: number;
+  imageCount?: number;
+  previewError?: string;
 };
 
 interface PreviewsScreenProps {
@@ -51,6 +66,7 @@ interface PreviewsScreenProps {
   unreadCount?: number;
   onOpenNotifications?: () => void;
   initialMode?: PreviewMode;
+  onOpenDrafts?: () => void;
 }
 
 type BadgeConfig = { bg: string; text: string; label: string; icon: keyof typeof Feather.glyphMap };
@@ -62,6 +78,7 @@ const PreviewsScreen = ({
   unreadCount = 0,
   onOpenNotifications,
   initialMode = 'pending',
+  onOpenDrafts,
 }: PreviewsScreenProps) => {
   const { width } = useWindowDimensions();
   const isTablet = width >= 760;
@@ -69,23 +86,46 @@ const PreviewsScreen = ({
   const styles = useMemo(() => createStyles(colors, isTablet), [colors, isTablet]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [activeTab, setActiveTab] = useState<PreviewMode>(initialMode);
+  const [activeTab, setActiveTab] = useState<PreviewTab>(initialMode);
   const [items, setItems] = useState<PreviewItem[]>([]);
+  const [draftItems, setDraftItems] = useState<ReportDraft[]>([]);
+  const [draftActionId, setDraftActionId] = useState<string | null>(null);
   const [mergeAnchorId, setMergeAnchorId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const loadingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const [lastLoadedAt, setLastLoadedAt] = useState<Date | null>(null);
 
   const fetchItems = useCallback(async () => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    const epoch = getAuthOperationEpoch();
+    const current = () => mountedRef.current && epoch === getAuthOperationEpoch();
     try {
-      setLoadError(null);
-      const [assetReports, realEstateResponse, lotListingResponse] = await Promise.all([
-        assetService.getAssetReports(),
-        api.get('/real-estate'),
-        api.get('/lot-listing').catch(() => ({ data: { data: [] } })),
+      const rows = async (promise: Promise<any>, envelope = false, drafts = false) => {
+        const value = await promise;
+        const data = envelope ? value?.data?.data : value;
+        if (!Array.isArray(data) || data.some(item => !item || typeof item !== 'object' ||
+          (drafts ? typeof (item.id || item._id) !== 'string' : typeof item._id !== 'string' || typeof item.status !== 'string'))) throw new Error('Incomplete preview response');
+        return data;
+      };
+      const results = await Promise.allSettled([
+        rows(assetService.getAssetReports('previews')),
+        rows(api.get('/real-estate', { params: { view: 'previews' } }), true),
+        rows(api.get('/lot-listing', { params: { view: 'previews' } }), true),
+        rows(reportDraftService.list(), false, true),
+        rows(salvageService.list('previews')),
       ]);
+      if (!current()) return;
+      const [assetReports, realEstateReports, lotListingReports, drafts, salvageReports] = results.map(result => result.status === 'fulfilled' ? result.value : []);
+      const labels = ['Asset', 'Real Estate', 'Lot Listing', 'Drafts', 'Salvage'];
+      const kinds = ['Asset', 'RealEstate', 'LotListing', 'Drafts', 'Salvage'];
+      const succeeded = new Set(results.flatMap((result, index) => result.status === 'fulfilled' ? [kinds[index]] : []));
+      const issues = results.flatMap((result, index) => result.status === 'rejected' ? [`${labels[index]}: ${previewLoadError(result.reason)}`] : []);
+      setLoadError(issues.length ? issues.join('\n') : null);
+      if (!issues.length) setLastLoadedAt(new Date());
 
       const next: PreviewItem[] = [];
-      const realEstateReports = realEstateResponse.data?.data || [];
-      const lotListingReports = lotListingResponse.data?.data || [];
 
       for (const report of assetReports) {
         if (!report?._id) continue;
@@ -105,22 +145,22 @@ const PreviewsScreen = ({
           jobError: report.job_error,
           wasSubmitted: Boolean(
             report.status === 'pending_approval' ||
-              report.status === 'approved' ||
+            report.status === 'approved' ||
+              ['approved', 'pending_approval'].includes((report as any).generation_target_status) ||
               (report as any).preview_submitted_at ||
               (report as any).approval_requested_at
           ),
           wasTransferred: Boolean(report.preview_transferred_at),
           isMergedReport: report.is_merged_report === true,
-          mergedSourceCount: Array.isArray(report.merged_from_report_ids)
+          mergedSourceCount: (report as any).merged_source_count ?? (Array.isArray(report.merged_from_report_ids)
             ? report.merged_from_report_ids.length
-            : 0,
+            : 0),
         });
       }
 
       for (const report of realEstateReports) {
         if (!report?._id) continue;
         if (!['processing', 'error', 'preview', 'declined', 'pending_approval', 'approved'].includes(report.status)) continue;
-        if (report.status === 'approved' && report.files_ready === true) continue;
         next.push({
           id: report._id,
           type: 'RealEstate',
@@ -140,6 +180,7 @@ const PreviewsScreen = ({
           wasSubmitted: Boolean(
             report.status === 'pending_approval' ||
               report.status === 'approved' ||
+              ['approved', 'pending_approval'].includes(report.generation_target_status) ||
               report.preview_submitted_at ||
               report.approval_requested_at
           ),
@@ -176,19 +217,35 @@ const PreviewsScreen = ({
         });
       }
 
+      for (const report of salvageReports) {
+        next.push({ id: report._id, type: 'Salvage', status: report.status,
+          title: report.file_number || 'Salvage report', createdAt: report.createdAt || '',
+          generationState: report.generation_state, workflowStage: report.workflow_stage,
+          workflowMessage: salvageDisplayText(report.workflow_message), workflowProgressPercent: report.workflow_progress_percent,
+          jobError: salvageDisplayText(report.job_error), wasSubmitted: ['approved', 'pending_approval'].includes(report.status) || report.workflow_stage === 'generating_files' || report.generation_kind === 'files',
+        });
+      }
       next.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      setItems(next);
+      setItems(previous => [...previous.filter(item => !succeeded.has(item.type)), ...next].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+      if (succeeded.has('Drafts')) setDraftItems(
+        [...drafts].sort(
+          (a, b) =>
+            new Date(b.updatedAt || b.createdAt).getTime() -
+            new Date(a.updatedAt || a.createdAt).getTime()
+        )
+      );
     } catch (error) {
-      console.error('[Previews] Failed to fetch:', error);
-      setLoadError('Previews could not be loaded. Check your connection and try again.');
+      if (current()) setLoadError(previewLoadError(error));
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      loadingRef.current = false;
+      if (current()) { setLoading(false); setRefreshing(false); }
     }
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     void fetchItems();
+    return () => { mountedRef.current = false; };
   }, [fetchItems]);
 
   useEffect(() => {
@@ -201,31 +258,62 @@ const PreviewsScreen = ({
   }, [fetchItems]);
 
   const pendingItems = useMemo(
-    () => items.filter((item) => !item.wasSubmitted && ['processing', 'error', 'preview', 'declined'].includes(item.status)),
+    () => items.filter((item) => !item.wasSubmitted && ['processing', 'error', 'preview', 'declined', 'cancelled'].includes(item.status)),
     [items]
   );
   const submittedItems = useMemo(
     () => items.filter((item) => item.wasSubmitted),
     [items]
   );
-  const visibleItems = activeTab === 'pending' ? pendingItems : submittedItems;
+  const mappedDraftItems = useMemo<PreviewItem[]>(
+    () =>
+      draftItems.map((draft) => ({
+        id: `draft-${draft.id || draft._id}`,
+        type: draft.type === 'asset' ? 'Asset' : 'LotListing',
+        status: 'draft',
+        title:
+          draft.title ||
+          draft.contractNo ||
+          (draft.type === 'asset' ? 'Asset Draft' : 'Lot Listing Draft'),
+        createdAt: draft.updatedAt || draft.createdAt,
+        wasSubmitted: false,
+        isDraftPreview: true,
+        draftId: draft.id || draft._id,
+        draftPreviewReportId: draft.previewReportId,
+        draftPreviewStatus: draft.previewStatus || 'idle',
+        draftRevision: Number(draft.revision || 0),
+        draftProcessedRevision: Number(draft.previewProcessedRevision || 0),
+        lotCount: Array.isArray(draft.lots) ? draft.lots.length : 0,
+        imageCount: Array.isArray(draft.media)
+          ? draft.media.filter((media) => media.slot !== 'video').length
+          : 0,
+        previewError: draft.previewError,
+      })),
+    [draftItems]
+  );
+  const visibleItems =
+    activeTab === 'pending'
+      ? pendingItems
+      : activeTab === 'submitted'
+        ? submittedItems
+        : mappedDraftItems;
   const activeJobCount = items.filter(
     (item) =>
       item.workflowStage === 'preparing_preview' ||
       item.workflowStage === 'generating_files' ||
       item.generationState === 'queued' ||
       item.generationState === 'processing'
-  ).length;
+  ).length + draftItems.filter((draft) => draft.previewStatus === 'queued' || draft.previewStatus === 'processing').length;
 
   useEffect(() => {
     if (activeJobCount === 0) return;
-    const interval = setInterval(() => void fetchItems(), 10_000);
+    const interval = setInterval(() => { if (AppState.currentState === 'active') void fetchItems(); }, 10_000);
     return () => clearInterval(interval);
   }, [activeJobCount, fetchItems]);
 
   useEffect(() => {
     if (activeJobCount > 0) return;
-    const interval = setInterval(() => void fetchItems(), 60_000);
+    const interval = setInterval(() => { if (AppState.currentState === 'active') void fetchItems(); }, 60_000);
     return () => clearInterval(interval);
   }, [activeJobCount, fetchItems]);
 
@@ -236,6 +324,27 @@ const PreviewsScreen = ({
 
   const getStatusBadge = useCallback(
     (item: PreviewItem): BadgeConfig => {
+      if (item.isDraftPreview) {
+        const isStale =
+          item.draftPreviewStatus === 'ready' &&
+          Number(item.draftRevision || 0) !== Number(item.draftProcessedRevision || 0);
+        if (isStale) {
+          return { bg: colors.warningSoft, text: colors.warning, label: 'Draft changed', icon: 'edit-3' };
+        }
+        if (item.draftPreviewStatus === 'ready') {
+          return { bg: colors.successSoft, text: colors.success, label: 'Draft preview ready', icon: 'check-circle' };
+        }
+        if (item.draftPreviewStatus === 'queued') {
+          return { bg: colors.infoSoft, text: colors.info, label: 'Preview queued', icon: 'clock' };
+        }
+        if (item.draftPreviewStatus === 'processing') {
+          return { bg: colors.infoSoft, text: colors.info, label: 'Preparing preview', icon: 'loader' };
+        }
+        if (item.draftPreviewStatus === 'error') {
+          return { bg: colors.dangerSoft, text: colors.danger, label: 'Draft preview failed', icon: 'alert-circle' };
+        }
+        return { bg: colors.surfaceMuted, text: colors.textSecondary, label: 'Draft saved', icon: 'save' };
+      }
       const workflowBadges: Record<string, BadgeConfig> = {
         preparing_preview: { bg: colors.infoSoft, text: colors.info, label: 'Preparing preview', icon: 'loader' },
         preview_ready: { bg: colors.infoSoft, text: colors.info, label: 'Preview ready', icon: 'eye' },
@@ -244,6 +353,7 @@ const PreviewsScreen = ({
         awaiting_release: { bg: colors.warningSoft, text: colors.warning, label: 'Awaiting release', icon: 'clock' },
         ready: { bg: colors.successSoft, text: colors.success, label: 'Ready to download', icon: 'check-circle' },
         error: { bg: colors.dangerSoft, text: colors.danger, label: 'Generation failed', icon: 'alert-circle' },
+        stopped: { bg: colors.warningSoft, text: colors.warning, label: 'Processing stopped', icon: 'pause-circle' },
       };
       if (item.workflowStage && workflowBadges[item.workflowStage]) {
         return workflowBadges[item.workflowStage];
@@ -279,6 +389,7 @@ const PreviewsScreen = ({
       if (type === 'LotListing') {
         return { bg: isDark ? '#2B1D48' : '#F3EFFF', text: isDark ? '#C4A7FF' : '#6D28D9', label: 'Lot Listing', icon: 'list' };
       }
+      if (type === 'Salvage') return { bg: colors.warningSoft, text: colors.warning, label: 'Salvage', icon: 'truck' };
       return { bg: colors.accentSoft, text: colors.accent, label: 'Asset', icon: 'package' };
     },
     [colors, isDark]
@@ -286,6 +397,10 @@ const PreviewsScreen = ({
 
   const handleQuickResubmit = useCallback(
     (item: PreviewItem) => {
+      if (item.type === 'Salvage') {
+        onOpenPreview(item.id, 'Salvage', 'submitted');
+        return;
+      }
       Alert.alert(
         'Resend report',
         'This regenerates the latest files and resends the report for approval.',
@@ -309,11 +424,12 @@ const PreviewsScreen = ({
         ]
       );
     },
-    [fetchItems]
+    [fetchItems, onOpenPreview]
   );
 
   const handleDelete = useCallback(
     (item: PreviewItem) => {
+      if (item.type === 'Salvage') return;
       Alert.alert('Delete preview', 'This preview and its saved data will be permanently deleted.', [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -336,6 +452,25 @@ const PreviewsScreen = ({
     [fetchItems]
   );
 
+  const handleDraftPreview = useCallback(
+    async (item: PreviewItem) => {
+      if (!item.draftId) return;
+      try {
+        setDraftActionId(item.draftId);
+        await reportDraftService.processPreview(item.draftId);
+        await fetchItems();
+      } catch (error: any) {
+        Alert.alert(
+          'Unable to create draft preview',
+          error.response?.data?.message || error.message || 'Please try again.'
+        );
+      } finally {
+        setDraftActionId(null);
+      }
+    },
+    [fetchItems]
+  );
+
   const renderItem = useCallback(
     ({ item }: { item: PreviewItem }) => {
       const statusBadge = getStatusBadge(item);
@@ -349,6 +484,14 @@ const PreviewsScreen = ({
       const progress = Math.max(0, Math.min(100, Number(
         item.workflowProgressPercent ?? item.generationProgress?.progressPercent ?? 0
       )));
+      const draftIsStale =
+        item.isDraftPreview &&
+        item.draftPreviewStatus === 'ready' &&
+        Number(item.draftRevision || 0) !== Number(item.draftProcessedRevision || 0);
+      const draftIsActive =
+        item.isDraftPreview &&
+        (item.draftPreviewStatus === 'queued' || item.draftPreviewStatus === 'processing');
+      const draftActionBusy = Boolean(item.draftId && draftActionId === item.draftId);
 
       return (
         <View style={[styles.card, { borderLeftColor: statusBadge.text }]}>
@@ -380,8 +523,21 @@ const PreviewsScreen = ({
             <View style={styles.metadataDivider} />
             <View style={styles.metadataItem}>
               <Text style={styles.metadataLabel}>QUEUE</Text>
-              <Text style={styles.metadataValue}>{item.wasSubmitted ? 'Submitted' : 'New preview'}</Text>
+              <Text style={styles.metadataValue}>
+                {item.isDraftPreview ? 'Draft preview' : item.wasSubmitted ? 'Submitted' : 'New preview'}
+              </Text>
             </View>
+            {item.isDraftPreview ? (
+              <>
+                <View style={styles.metadataDivider} />
+                <View style={styles.metadataItem}>
+                  <Text style={styles.metadataLabel}>MEDIA</Text>
+                  <Text style={styles.metadataValue}>
+                    {item.lotCount || 0} lots · {item.imageCount || 0} images
+                  </Text>
+                </View>
+              </>
+            ) : null}
             {item.isMergedReport ? (
               <>
                 <View style={styles.metadataDivider} />
@@ -402,7 +558,28 @@ const PreviewsScreen = ({
             ) : null}
           </View>
 
-          {isJobActive ? (
+          {draftIsActive ? (
+            <View style={styles.progressPanel}>
+              <View style={styles.progressHeader}>
+                <View style={styles.progressCopy}>
+                  <ActivityIndicator size="small" color={colors.info} />
+                  <Text style={styles.progressMessage} numberOfLines={1}>
+                    {item.draftPreviewStatus === 'queued'
+                      ? 'Draft preview is queued'
+                      : 'Analyzing the saved draft'}
+                  </Text>
+                </View>
+              </View>
+              <View style={styles.progressTrack}>
+                <View
+                  style={[
+                    styles.progressFill,
+                    { width: item.draftPreviewStatus === 'queued' ? '18%' : '62%' },
+                  ]}
+                />
+              </View>
+            </View>
+          ) : isJobActive ? (
             <View style={styles.progressPanel}>
               <View style={styles.progressHeader}>
                 <View style={styles.progressCopy}>
@@ -431,21 +608,63 @@ const PreviewsScreen = ({
             </View>
           ) : null}
 
-          {activeTab === 'pending' ? (
+          {item.isDraftPreview ? (
+            <View style={styles.actionRow}>
+              {item.draftPreviewStatus === 'ready' && !draftIsStale && item.draftPreviewReportId ? (
+                <TouchableOpacity
+                  style={styles.primaryButton}
+                  activeOpacity={0.78}
+                  onPress={() => onOpenPreview(item.draftPreviewReportId!, item.type, 'pending')}>
+                  <Feather name="eye" size={16} color="#FFFFFF" />
+                  <Text style={styles.primaryButtonText}>Open preview</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity
+                  style={styles.primaryButton}
+                  activeOpacity={0.78}
+                  disabled={draftIsActive || draftActionBusy}
+                  onPress={() => void handleDraftPreview(item)}>
+                  {draftIsActive || draftActionBusy ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Feather name={draftIsStale ? 'refresh-cw' : 'play'} size={16} color="#FFFFFF" />
+                  )}
+                  <Text style={styles.primaryButtonText}>
+                    {draftIsActive || draftActionBusy
+                      ? 'Preparing preview'
+                      : draftIsStale
+                        ? 'Rebuild preview'
+                        : item.draftPreviewStatus === 'error'
+                          ? 'Retry preview'
+                          : 'Create preview'}
+                  </Text>
+                </TouchableOpacity>
+              )}
+              {onOpenDrafts ? (
+                <TouchableOpacity
+                  style={styles.secondaryButton}
+                  activeOpacity={0.75}
+                  onPress={onOpenDrafts}>
+                  <Feather name="edit-2" size={15} color={colors.text} />
+                  <Text style={styles.secondaryButtonText}>Open drafts</Text>
+                </TouchableOpacity>
+              ) : null}
+            </View>
+          ) : activeTab === 'pending' ? (
             <View style={styles.actionRow}>
               <TouchableOpacity
                 style={[styles.primaryButton, isDeclined && styles.declinedButton]}
                 activeOpacity={0.78}
                 onPress={() => onOpenPreview(item.id, item.type, 'pending')}>
                 <Feather name={isDeclined ? 'rotate-ccw' : 'edit-3'} size={16} color="#FFFFFF" />
-                <Text style={styles.primaryButtonText}>{isDeclined ? 'Edit & resubmit' : 'Review & submit'}</Text>
+                <Text style={styles.primaryButtonText}>{item.type === 'Salvage' ? 'Open report & progress' : isDeclined ? 'Edit & resubmit' : 'Review & submit'}</Text>
               </TouchableOpacity>
-              <TouchableOpacity
+              {item.type !== 'Salvage' && <TouchableOpacity
                 style={styles.iconDangerButton}
                 activeOpacity={0.75}
                 onPress={() => handleDelete(item)}>
                 <Feather name="trash-2" size={17} color={colors.danger} />
-              </TouchableOpacity>
+              </TouchableOpacity>}
             </View>
           ) : (
             <View style={styles.actionRow}>
@@ -474,16 +693,16 @@ const PreviewsScreen = ({
                   </TouchableOpacity>
                 </>
               )}
-              <TouchableOpacity
+              {item.type !== 'Salvage' && <TouchableOpacity
                 style={styles.iconDangerButton}
                 activeOpacity={0.75}
                 onPress={() => handleDelete(item)}>
                 <Feather name="trash-2" size={17} color={colors.danger} />
-              </TouchableOpacity>
+              </TouchableOpacity>}
             </View>
           )}
 
-          {item.type === 'Asset' && !isJobActive ? (
+          {item.type === 'Asset' && !item.isDraftPreview && !isJobActive ? (
             <TouchableOpacity
               style={styles.mergeButton}
               activeOpacity={0.75}
@@ -502,8 +721,11 @@ const PreviewsScreen = ({
       getStatusBadge,
       getTypeBadge,
       handleDelete,
+      handleDraftPreview,
       handleQuickResubmit,
       onOpenPreview,
+      onOpenDrafts,
+      draftActionId,
       styles,
     ]
   );
@@ -536,20 +758,18 @@ const PreviewsScreen = ({
 
         <View style={styles.queueSummary}>
           <View style={styles.queueSummaryItem}>
-            <Text style={styles.queueSummaryValue}>{pendingItems.length}</Text>
+            <Text style={styles.queueSummaryValue}>{loading || loadError ? (pendingItems.length ? `${pendingItems.length}*` : '—') : pendingItems.length}</Text>
             <Text style={styles.queueSummaryLabel}>New previews</Text>
           </View>
           <View style={styles.queueSummaryDivider} />
           <View style={styles.queueSummaryItem}>
-            <Text style={styles.queueSummaryValue}>{submittedItems.length}</Text>
+            <Text style={styles.queueSummaryValue}>{loading || loadError ? (submittedItems.length ? `${submittedItems.length}*` : '—') : submittedItems.length}</Text>
             <Text style={styles.queueSummaryLabel}>Submitted</Text>
           </View>
           <View style={styles.queueSummaryDivider} />
           <View style={styles.queueSummaryItem}>
-            <Text style={[styles.queueSummaryValue, activeJobCount > 0 && { color: '#78A7FF' }]}>
-              {activeJobCount}
-            </Text>
-            <Text style={styles.queueSummaryLabel}>Processing</Text>
+            <Text style={styles.queueSummaryValue}>{loading || loadError ? (draftItems.length ? `${draftItems.length}*` : '—') : draftItems.length}</Text>
+            <Text style={styles.queueSummaryLabel}>Draft previews</Text>
           </View>
         </View>
       </View>
@@ -560,6 +780,8 @@ const PreviewsScreen = ({
           <Text style={styles.backButtonText}>Dashboard</Text>
         </TouchableOpacity>
         <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="Refresh previews"
           onPress={onRefresh}
           disabled={refreshing || loading}
           style={styles.refreshButton}
@@ -580,7 +802,7 @@ const PreviewsScreen = ({
           <Text style={[styles.segmentText, activeTab === 'pending' && styles.segmentTextActive]}>New</Text>
           <View style={[styles.segmentCount, activeTab === 'pending' && styles.segmentCountActive]}>
             <Text style={[styles.segmentCountText, activeTab === 'pending' && styles.segmentCountTextActive]}>
-              {pendingItems.length}
+              {loading || loadError ? (pendingItems.length ? `${pendingItems.length}*` : '—') : pendingItems.length}
             </Text>
           </View>
         </TouchableOpacity>
@@ -591,7 +813,18 @@ const PreviewsScreen = ({
           <Text style={[styles.segmentText, activeTab === 'submitted' && styles.segmentTextActive]}>Submitted</Text>
           <View style={[styles.segmentCount, activeTab === 'submitted' && styles.segmentCountActive]}>
             <Text style={[styles.segmentCountText, activeTab === 'submitted' && styles.segmentCountTextActive]}>
-              {submittedItems.length}
+              {loading || loadError ? (submittedItems.length ? `${submittedItems.length}*` : '—') : submittedItems.length}
+            </Text>
+          </View>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.segment, activeTab === 'drafts' && styles.segmentActive]}
+          activeOpacity={0.8}
+          onPress={() => setActiveTab('drafts')}>
+          <Text style={[styles.segmentText, activeTab === 'drafts' && styles.segmentTextActive]}>Drafts</Text>
+          <View style={[styles.segmentCount, activeTab === 'drafts' && styles.segmentCountActive]}>
+            <Text style={[styles.segmentCountText, activeTab === 'drafts' && styles.segmentCountTextActive]}>
+              {loading || loadError ? (draftItems.length ? `${draftItems.length}*` : '—') : draftItems.length}
             </Text>
           </View>
         </TouchableOpacity>
@@ -599,13 +832,14 @@ const PreviewsScreen = ({
 
       {loadError ? (
         <View style={styles.loadErrorPanel}>
-          <Feather name="wifi-off" size={17} color={colors.danger} />
-          <Text style={styles.loadErrorText}>{loadError}</Text>
-          <TouchableOpacity onPress={onRefresh} style={styles.retryButton}>
+          <Feather name="alert-circle" size={17} color={colors.danger} />
+          <Text accessibilityRole="alert" style={styles.loadErrorText}>{loadError}{'\n'}Available previews remain below. Counts marked * are last loaded and may be out of date.</Text>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Retry loading previews" onPress={onRefresh} disabled={refreshing || loading} style={styles.retryButton}>
             <Text style={styles.retryButtonText}>Retry</Text>
           </TouchableOpacity>
         </View>
       ) : null}
+      {lastLoadedAt ? <Text style={styles.emptySubtitle}>Last complete refresh: {lastLoadedAt.toLocaleTimeString()}</Text> : null}
     </>
   );
 
@@ -631,16 +865,29 @@ const PreviewsScreen = ({
           ListEmptyComponent={
             <View style={styles.emptyState}>
               <View style={styles.emptyIcon}>
-                <Feather name={activeTab === 'pending' ? 'inbox' : 'send'} size={25} color={colors.textMuted} />
+                <Feather
+                  name={activeTab === 'pending' ? 'inbox' : activeTab === 'submitted' ? 'send' : 'save'}
+                  size={25}
+                  color={colors.textMuted}
+                />
               </View>
               <Text style={styles.emptyTitle}>
-                {activeTab === 'pending' ? 'No new previews' : 'No submitted previews'}
+                {loadError ? 'Preview list unavailable' : activeTab === 'pending'
+                  ? 'No new previews'
+                  : activeTab === 'submitted'
+                    ? 'No submitted previews'
+                    : 'No saved draft previews'}
               </Text>
               <Text style={styles.emptySubtitle}>
-                {activeTab === 'pending'
+                {loadError ? 'Retry loading above. Your saved reports and photos are unchanged.' : activeTab === 'pending'
                   ? 'New report previews and processing updates will appear here.'
-                  : 'Reports move here as soon as they are submitted.'}
+                  : activeTab === 'submitted'
+                    ? 'Reports move here as soon as they are submitted.'
+                    : 'Use Save Draft & Create Preview in an Asset or Lot Listing form.'}
               </Text>
+              {activeTab === 'pending' && submittedItems.length > 0 ? <TouchableOpacity accessibilityRole="button" onPress={() => setActiveTab('submitted')} style={styles.backButton}>
+                <Text style={styles.backButtonText}>View submitted previews ({submittedItems.length})</Text>
+              </TouchableOpacity> : null}
             </View>
           }
           contentContainerStyle={styles.listContent}

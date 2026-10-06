@@ -7,6 +7,7 @@ import {
   type RestrictedDeviceAccess,
 } from "./deviceAccessStorage";
 import { collectVerifiedNativeDeviceContext } from "./deviceMetadataService";
+import { captureAuthOperation, mutateAuthSession } from './authSessionOperation';
 
 async function headers() {
   const [state, deviceKey] = await Promise.all([
@@ -23,8 +24,9 @@ async function headers() {
 }
 
 class DeviceAccessService {
-  async register() {
+  async register(assertCurrent = captureAuthOperation()) {
     const context = await collectVerifiedNativeDeviceContext();
+    assertCurrent();
     const { data } = await api.post(
       "/auth/device-requests/register",
       {
@@ -36,16 +38,18 @@ class DeviceAccessService {
       },
       { headers: await headers() }
     );
-    await persistDeviceAccess(data as RestrictedDeviceAccess);
+    assertCurrent();
+    if (data?.authState !== 'approved') await mutateAuthSession(assertCurrent, () => persistDeviceAccess(data as RestrictedDeviceAccess, assertCurrent));
     return data as RestrictedDeviceAccess & { authState?: string };
   }
 
-  async status() {
+  async status(assertCurrent = captureAuthOperation()) {
     const current = await getPersistedDeviceAccess();
     const { data } = await api.get("/auth/device-requests/status", {
       headers: await headers(),
     });
     const status = String(data?.status || data?.authState || "");
+    assertCurrent();
     if (status && status !== "approved") {
       const next = {
         ...current,
@@ -54,23 +58,25 @@ class DeviceAccessService {
         challengeToken: data?.challengeToken || current?.challengeToken,
         challengeExpiresAt: data?.challengeExpiresAt || current?.challengeExpiresAt,
       } as RestrictedDeviceAccess;
-      await persistDeviceAccess(next);
+      await mutateAuthSession(assertCurrent, () => persistDeviceAccess(next, assertCurrent));
       return next;
     }
     return data as RestrictedDeviceAccess & { status?: string };
   }
 
-  async exchange() {
+  async exchange(assertCurrent = captureAuthOperation()) {
     const { data } = await api.post(
       "/auth/device-requests/exchange",
       {},
       { headers: await headers() }
     );
-    return authService.acceptAuthenticatedResponse(data as LoginResponse);
+    assertCurrent();
+    return authService.acceptAuthenticatedResponse(data as LoginResponse, assertCurrent);
   }
 
-  async rerequest() {
+  async rerequest(assertCurrent = captureAuthOperation()) {
     const context = await collectVerifiedNativeDeviceContext();
+    assertCurrent();
     const { data } = await api.post(
       "/auth/device-requests/rerequest",
       {
@@ -82,7 +88,8 @@ class DeviceAccessService {
       },
       { headers: await headers() }
     );
-    await persistDeviceAccess(data as RestrictedDeviceAccess);
+    assertCurrent();
+    await mutateAuthSession(assertCurrent, () => persistDeviceAccess(data as RestrictedDeviceAccess, assertCurrent));
     return data as RestrictedDeviceAccess;
   }
 }

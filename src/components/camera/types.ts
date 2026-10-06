@@ -12,12 +12,20 @@ export interface ImageAdjustments {
 }
 
 export interface PhotoFile {
+  captureOrigin?: 'camera' | 'import';
+  captureTimestamp?: number;
+  ownership?: import('../../services/offlineCaptureTypes').MediaOwnership;
+  availability?: 'available' | 'missing';
+  missing?: boolean;
   uri: string;
   originalUri?: string;
   editedUri?: string;
   displayUri?: string;
   name: string;
   type: string;
+  // Stable cloud identities survive lot reordering and draft reopen cycles.
+  clientFileId?: string;
+  localKey?: string;
   width?: number;
   height?: number;
   megapixels?: number;
@@ -39,6 +47,8 @@ export interface PhotoFile {
 
 export interface MixedLot {
   id: string;
+  lotNumber?: string;
+  title?: string;
   mode?: CaptureMode;
   files: PhotoFile[];
   extraFiles: PhotoFile[];

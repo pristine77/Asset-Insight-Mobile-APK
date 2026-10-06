@@ -2,10 +2,8 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  KeyboardAvoidingView,
   Linking,
   Modal,
-  Platform,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -16,6 +14,7 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import CrmModalFrame, { crmTouchTarget } from '../components/crm/CrmModalFrame';
 import { Feather } from '@expo/vector-icons';
 import crmTaskApi, {
   CRM_OPEN_STATUSES,
@@ -432,11 +431,8 @@ export default function CrmOutlookCalendarScreen({
         transparent
         animationType="fade"
         onRequestClose={closeCalendarSyncModal}>
-        <KeyboardAvoidingView
-          style={[styles.centerModalOverlay, isVeryCompact && styles.centerModalOverlayVeryCompact]}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}>
-          <View style={[styles.calendarSyncModalCard, isVeryCompact && styles.calendarSyncModalCardVeryCompact]}>
+        <CrmModalFrame label="Calendar task selection" onClose={closeCalendarSyncModal}
+          cardStyle={[styles.calendarSyncModalCard, isVeryCompact && styles.calendarSyncModalCardVeryCompact]}>
             <View style={styles.modalHeader}>
               <View style={styles.calendarSyncHeaderTextWrap}>
                 <Text style={styles.modalTitle}>Sync Tasks to Calendar</Text>
@@ -444,7 +440,7 @@ export default function CrmOutlookCalendarScreen({
                   {calendarSyncSelectedCount} selected of {tasks.length}
                 </Text>
               </View>
-              <TouchableOpacity onPress={closeCalendarSyncModal} disabled={outlookBulkSyncing}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close calendar sync" accessibilityState={{ disabled: outlookBulkSyncing }} style={crmTouchTarget} onPress={closeCalendarSyncModal} disabled={outlookBulkSyncing}>
                 <Feather name="x" size={20} color="#6B7280" />
               </TouchableOpacity>
             </View>
@@ -454,6 +450,7 @@ export default function CrmOutlookCalendarScreen({
               <TextInput
                 style={styles.calendarSyncSearchInput}
                 value={calendarSyncSearchText}
+                accessibilityLabel="Search calendar tasks"
                 onChangeText={setCalendarSyncSearchText}
                 placeholder="Search client, company, email, phone"
                 placeholderTextColor="#9CA3AF"
@@ -470,8 +467,12 @@ export default function CrmOutlookCalendarScreen({
                 return (
                   <TouchableOpacity
                     key={`calendar-sync-${option.key}`}
+                    accessibilityRole="radio"
+                    accessibilityLabel={option.label}
+                    accessibilityState={{ selected: active, disabled: outlookBulkSyncing }}
                     style={[
                       styles.calendarSyncFilterChip,
+                      crmTouchTarget,
                       active && styles.calendarSyncFilterChipActive,
                     ]}
                     onPress={() => setCalendarSyncStatusFilter(option.key)}
@@ -491,12 +492,16 @@ export default function CrmOutlookCalendarScreen({
             <View style={styles.calendarSyncQuickActions}>
               <TouchableOpacity
                 style={styles.calendarSyncQuickBtn}
+                accessibilityRole="button"
+                accessibilityLabel="Mark filtered calendar tasks"
                 onPress={markFilteredCalendarSyncTasks}
                 disabled={outlookBulkSyncing || calendarSyncFilteredTasks.length === 0}>
                 <Text style={styles.calendarSyncQuickBtnText}>Mark Filtered</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.calendarSyncQuickBtn, styles.calendarSyncQuickBtnClear]}
+                accessibilityRole="button"
+                accessibilityLabel="Clear filtered calendar tasks"
                 onPress={clearFilteredCalendarSyncTasks}
                 disabled={outlookBulkSyncing || calendarSyncFilteredTasks.length === 0}>
                 <Text style={styles.calendarSyncQuickBtnText}>Clear Filtered</Text>
@@ -509,13 +514,16 @@ export default function CrmOutlookCalendarScreen({
                 <Text style={styles.emptySubtitle}>No tasks match the current search or filter.</Text>
               </View>
             ) : (
-              <ScrollView style={styles.calendarSyncTaskList} nestedScrollEnabled>
+              <ScrollView style={styles.calendarSyncTaskList} nestedScrollEnabled keyboardShouldPersistTaps="handled">
                 {calendarSyncFilteredTasks.map((task) => {
                   const selected = calendarSyncSelectedTaskIds.includes(task._id);
                   const badge = getStatusBadge(task.status);
                   return (
                     <TouchableOpacity
                       key={`calendar-sync-row-${task._id}`}
+                      accessibilityRole="checkbox"
+                      accessibilityLabel={task.clientName || 'Client'}
+                      accessibilityState={{ checked: selected, disabled: outlookBulkSyncing }}
                       style={[
                         styles.calendarSyncTaskRow,
                         selected && styles.calendarSyncTaskRowSelected,
@@ -556,11 +564,16 @@ export default function CrmOutlookCalendarScreen({
             <View style={styles.modalFooterRow}>
               <TouchableOpacity
                 style={styles.cancelBtn}
+                accessibilityRole="button"
+                accessibilityLabel="Cancel calendar sync"
                 onPress={closeCalendarSyncModal}
                 disabled={outlookBulkSyncing}>
                 <Text style={styles.cancelBtnText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="Sync selected tasks"
+                accessibilityState={{ disabled: !outlookStatus.connected || outlookBulkSyncing || calendarSyncSelectedCount === 0, busy: outlookBulkSyncing }}
                 style={[
                   styles.submitBtn,
                   (!outlookStatus.connected || calendarSyncSelectedCount === 0) &&
@@ -575,8 +588,7 @@ export default function CrmOutlookCalendarScreen({
                 )}
               </TouchableOpacity>
             </View>
-          </View>
-        </KeyboardAvoidingView>
+        </CrmModalFrame>
       </Modal>
     </SafeAreaView>
   );
@@ -865,6 +877,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   modalTitle: {
+    flexShrink: 1,
     fontSize: 18,
     fontWeight: '900',
     color: '#111827',
@@ -927,8 +940,8 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   calendarSyncQuickBtn: {
+    minHeight: 44,
     flex: 1,
-    minHeight: 38,
     borderRadius: 12,
     backgroundColor: '#0284C7',
     alignItems: 'center',
@@ -1019,10 +1032,14 @@ const styles = StyleSheet.create({
   modalFooterRow: {
     marginTop: 16,
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 10,
   },
   cancelBtn: {
     flex: 1,
+    minHeight: 44,
+    minWidth: 100,
+    paddingHorizontal: 10,
     borderWidth: 1,
     borderColor: '#D1D5DB',
     borderRadius: 12,
@@ -1036,6 +1053,9 @@ const styles = StyleSheet.create({
   },
   submitBtn: {
     flex: 1,
+    minHeight: 44,
+    minWidth: 100,
+    paddingHorizontal: 10,
     borderRadius: 12,
     backgroundColor: '#16A34A',
     paddingVertical: 12,

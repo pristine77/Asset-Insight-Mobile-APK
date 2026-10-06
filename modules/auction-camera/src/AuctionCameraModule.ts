@@ -12,3 +12,18 @@ const AuctionCamera = requireNativeModule('AuctionCameraModule');
 export async function openAuctionCamera(initialPayload?: string): Promise<string> {
   return AuctionCamera.openAuctionCamera(initialPayload ?? '');
 }
+
+export const getPendingCapture = (ownerId: string, draftId: string): Promise<string | null> => AuctionCamera.getPendingCapture(ownerId, draftId);
+export const getContentUriInfo = (uri: string): Promise<{ exists: boolean; size?: number; type?: string }> => AuctionCamera.getContentUriInfo(uri);
+export const acknowledgeCapture = (ownerId: string, draftId: string, sessionId: string, revision: number): Promise<boolean> => AuctionCamera.acknowledgeCapture(ownerId, draftId, sessionId, revision);
+export const cancelContentUriUpload = (id: string): Promise<void> => AuctionCamera.cancelContentUriUpload(id);
+export async function streamContentUriUpload(args: {
+  id: string; uri: string; url: string; headers: Record<string, string>; size: number;
+  onProgress?: (bytesSent: number, totalBytes: number) => void;
+}): Promise<{ status: number; body: string; headers: Record<string, string> }> {
+  const subscription = args.onProgress ? AuctionCamera.addListener('uploadProgress', (event: { id: string; bytesSent: number; totalBytes: number }) => {
+    if (event.id === args.id) args.onProgress?.(event.bytesSent, event.totalBytes);
+  }) : undefined;
+  try { return await AuctionCamera.uploadContentUri(args.id, args.uri, args.url, args.headers, args.size); }
+  finally { subscription?.remove(); }
+}

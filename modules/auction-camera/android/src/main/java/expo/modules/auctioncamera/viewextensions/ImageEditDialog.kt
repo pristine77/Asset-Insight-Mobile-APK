@@ -220,6 +220,7 @@ class ImageEditDialog(
             val savedUri = withContext(Dispatchers.IO) {
                 try {
                     val processed    = applyEffects(full.copy(full.config ?: Bitmap.Config.ARGB_8888, false), c, col, sh)
+                    val alreadyStamped = expo.modules.auctioncamera.utils.PhotoWatermarkReceipt.has(File(filePath).readBytes())
                     val originalExif = androidx.exifinterface.media.ExifInterface(filePath)
                     val outputFile   = File(filePath)
                     var quality      = 90
@@ -239,6 +240,9 @@ class ImageEditDialog(
                             androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL.toString()
                         )
                         newExif.saveAttributes()
+                    }
+                    if (alreadyStamped) {
+                        outputFile.writeBytes(expo.modules.auctioncamera.utils.PhotoWatermarkReceipt.add(outputFile.readBytes()))
                     }
                     imageUri
                 } catch (e: Exception) {

@@ -1,4 +1,5 @@
 import * as FileSystem from 'expo-file-system/legacy';
+import { addPhotoWatermarkReceipt, hasPhotoWatermarkReceipt, photoBytesFromBase64, photoBytesToBase64 } from '../utils/photoWatermarkReceipt';
 
 const getImageEditsDir = (): string => `${FileSystem.documentDirectory || ''}image_edits/`;
 
@@ -28,7 +29,20 @@ export const ImageEditService = {
     return isManagedLocalUri(uri);
   },
 
-  async saveEditedImageBase64(base64: string, lotId: string, imageName?: string): Promise<string> {
+  async saveEditedImageBase64(base64: string, lotId: string, imageName?: string, sourceUri?: string): Promise<string> {
+    if (sourceUri) {
+      let source: Uint8Array;
+      if (/^https?:\/\//i.test(sourceUri)) {
+        const response = await fetch(sourceUri);
+        if (!response.ok) throw new Error('Unable to verify the original photo. Please retry saving.');
+        source = new Uint8Array(await response.arrayBuffer());
+      } else {
+        source = photoBytesFromBase64(await FileSystem.readAsStringAsync(sourceUri, { encoding: FileSystem.EncodingType.Base64 }));
+      }
+      if (await hasPhotoWatermarkReceipt(source)) {
+        base64 = photoBytesToBase64(await addPhotoWatermarkReceipt(photoBytesFromBase64(base64)));
+      }
+    }
     await ensureImageEditsDirExists();
 
     const fileName = `${getSafeBaseName(lotId)}_${getSafeBaseName(imageName)}_${Date.now()}.jpg`;

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Vibration } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { CaptureMode, MODE_CONFIG } from './types';
@@ -7,20 +7,32 @@ interface CaptureButtonsProps {
   onCapture: (mode: CaptureMode, isExtra: boolean) => void;
   disabled?: boolean;
   isLandscape?: boolean;
+  lockedStructure?: boolean;
+  currentMode?: CaptureMode;
 }
 
 export const CaptureButtons: React.FC<CaptureButtonsProps> = ({
   onCapture,
   disabled = false,
   isLandscape = false,
+  lockedStructure = false,
+  currentMode,
 }) => {
+  const policyRef = useRef({ disabled, lockedStructure, currentMode });
+  useEffect(() => {
+    policyRef.current = { disabled, lockedStructure, currentMode };
+  }, [disabled, lockedStructure, currentMode]);
+
   const handleCapture = (mode: CaptureMode, isExtra: boolean) => {
-    if (disabled) return;
+    const policy = policyRef.current;
+    if (policy.disabled || (policy.lockedStructure && mode !== policy.currentMode)) return;
     Vibration.vibrate(50);
     onCapture(mode, isExtra);
   };
 
-  const modes: CaptureMode[] = ['single_lot', 'per_item', 'per_photo'];
+  const modes: CaptureMode[] = lockedStructure
+    ? currentMode ? [currentMode] : []
+    : ['single_lot', 'per_item', 'per_photo'];
 
   if (isLandscape) {
     return (
@@ -28,14 +40,18 @@ export const CaptureButtons: React.FC<CaptureButtonsProps> = ({
         {modes.map((mode) => (
           <View key={mode} style={styles.landscapeRow}>
             <TouchableOpacity
-              style={[styles.captureBtn, styles.captureBtnMain, styles.captureBtnLandscape]}
+              accessibilityRole="button"
+              accessibilityLabel={`Capture ${MODE_CONFIG[mode].label} photo`}
+              style={[styles.captureBtn, styles.captureBtnMain, styles.captureBtnLandscape, lockedStructure && styles.lockedCaptureBtn]}
               onPress={() => handleCapture(mode, false)}
               disabled={disabled}>
               <Feather name="camera" size={14} color="#fff" />
               <Text style={styles.captureBtnText}>{MODE_CONFIG[mode].shortLabel}</Text>
             </TouchableOpacity>
             <TouchableOpacity
-              style={[styles.captureBtn, styles.captureBtnExtra, styles.captureBtnLandscape]}
+              accessibilityRole="button"
+              accessibilityLabel={`Capture extra ${MODE_CONFIG[mode].label} photo`}
+              style={[styles.captureBtn, styles.captureBtnExtra, styles.captureBtnLandscape, lockedStructure && styles.lockedCaptureBtn]}
               onPress={() => handleCapture(mode, true)}
               disabled={disabled}>
               <Text style={styles.captureBtnTextSmall}>Extra</Text>
@@ -53,7 +69,9 @@ export const CaptureButtons: React.FC<CaptureButtonsProps> = ({
         {modes.map((mode) => (
           <TouchableOpacity
             key={mode}
-            style={[styles.captureBtn, styles.captureBtnMain, styles.captureBtnPortrait]}
+            accessibilityRole="button"
+            accessibilityLabel={`Capture ${MODE_CONFIG[mode].label} photo`}
+            style={[styles.captureBtn, styles.captureBtnMain, styles.captureBtnPortrait, lockedStructure && styles.lockedCaptureBtn]}
             onPress={() => handleCapture(mode, false)}
             disabled={disabled}>
             <Feather name="camera" size={12} color="#fff" />
@@ -66,7 +84,9 @@ export const CaptureButtons: React.FC<CaptureButtonsProps> = ({
         {modes.map((mode) => (
           <TouchableOpacity
             key={`${mode}-extra`}
-            style={[styles.captureBtn, styles.captureBtnExtra, styles.captureBtnPortrait]}
+            accessibilityRole="button"
+            accessibilityLabel={`Capture extra ${MODE_CONFIG[mode].label} photo`}
+            style={[styles.captureBtn, styles.captureBtnExtra, styles.captureBtnPortrait, lockedStructure && styles.lockedCaptureBtn]}
             onPress={() => handleCapture(mode, true)}
             disabled={disabled}>
             <Text style={styles.captureBtnTextSmall}>+{MODE_CONFIG[mode].shortLabel}</Text>
@@ -116,6 +136,9 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingVertical: 7,
     paddingHorizontal: 4,
+  },
+  lockedCaptureBtn: {
+    minHeight: 44,
   },
   captureBtnMain: {
     backgroundColor: 'rgba(244, 63, 94, 0.9)',

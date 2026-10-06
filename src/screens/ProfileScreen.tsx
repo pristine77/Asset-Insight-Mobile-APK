@@ -16,6 +16,7 @@ import { Feather } from "@expo/vector-icons";
 import { useAuth } from "../context/AuthContext";
 import { useAppTheme, type AppThemeColors } from "../context/ThemeContext";
 import api from "../services/api";
+import AccountPrivacyLinks from "../components/AccountPrivacyLinks";
 
 interface ProfileScreenProps {
   onOpenDrawer: () => void;
@@ -393,6 +394,7 @@ const ProfileScreen = ({ onOpenDrawer, onBack }: ProfileScreenProps) => {
               </TouchableOpacity>
             </View>
           )}
+          <AccountPrivacyLinks />
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>

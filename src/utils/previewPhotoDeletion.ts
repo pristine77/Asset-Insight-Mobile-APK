@@ -1,3 +1,5 @@
+import { parsePreviewPhotoIndex } from "./previewLotPhotos";
+
 export type LotPhotoReference = {
   globalIndex: number | null;
   url: string;
@@ -21,35 +23,44 @@ export const removeLotPhotoReference = <T>(
     return previewData as T & PhotoDeletionState;
   }
 
-  const { globalIndex, url: imageUrl } = photo;
-  const hasGlobalIndex =
-    Number.isInteger(globalIndex) && Number(globalIndex) >= 0;
+  const globalIndex = parsePreviewPhotoIndex(photo.globalIndex);
+  const imageUrl = photo.url.trim();
+  const hasGlobalIndex = globalIndex !== null;
   const lots = [...data.lots];
   const lot = { ...lots[lotIndex] };
-  const removeIndex = (values: unknown) =>
-    hasGlobalIndex && Array.isArray(values)
-      ? values.filter((value) => Number(value) !== globalIndex)
-      : values;
-
-  lot.image_indexes = removeIndex(lot.image_indexes);
-  lot.extra_image_indexes = removeIndex(lot.extra_image_indexes);
-  if (hasGlobalIndex && Number(lot.image_index) === globalIndex) {
+  const cleanUrl = (value: unknown) => typeof value === "string" ? value.trim() : "";
+  const removeRepresentation = (indexKey: string, urlKey: string) => {
+    const indexes = Array.isArray(lot[indexKey]) ? lot[indexKey] : [];
+    const urls = Array.isArray(lot[urlKey]) ? lot[urlKey] : [];
+    const removedPositions = new Set<number>();
+    for (let position = 0; position < Math.max(indexes.length, urls.length); position += 1) {
+      const pairedUrl = cleanUrl(urls[position]);
+      if ((imageUrl && pairedUrl === imageUrl) ||
+        (!pairedUrl && hasGlobalIndex && parsePreviewPhotoIndex(indexes[position]) === globalIndex)) {
+        removedPositions.add(position);
+      }
+    }
+    if (Array.isArray(lot[indexKey])) {
+      lot[indexKey] = indexes.filter((_value: unknown, position: number) => !removedPositions.has(position));
+    }
+    if (Array.isArray(lot[urlKey])) {
+      lot[urlKey] = urls.filter((_value: unknown, position: number) => !removedPositions.has(position));
+    }
+  };
+  removeRepresentation("image_indexes", "image_urls");
+  removeRepresentation("extra_image_indexes", "extra_image_urls");
+  const removesScalarUrl = Boolean(imageUrl && cleanUrl(lot.image_url) === imageUrl);
+  if (removesScalarUrl || (!cleanUrl(lot.image_url) && hasGlobalIndex && parsePreviewPhotoIndex(lot.image_index) === globalIndex)) {
     delete lot.image_index;
   }
-  if (hasGlobalIndex && Number(lot.cover_index) === globalIndex) {
+  if ((imageUrl && cleanUrl(lot.cover_url) === imageUrl) ||
+    (!cleanUrl(lot.cover_url) && (removesScalarUrl ||
+      (hasGlobalIndex && parsePreviewPhotoIndex(lot.cover_index) === globalIndex)))) {
     delete lot.cover_index;
   }
   if (imageUrl) {
-    if (Array.isArray(lot.image_urls)) {
-      lot.image_urls = lot.image_urls.filter((url: unknown) => url !== imageUrl);
-    }
-    if (Array.isArray(lot.extra_image_urls)) {
-      lot.extra_image_urls = lot.extra_image_urls.filter(
-        (url: unknown) => url !== imageUrl
-      );
-    }
-    if (lot.image_url === imageUrl) delete lot.image_url;
-    if (lot.cover_url === imageUrl) delete lot.cover_url;
+    if (removesScalarUrl) delete lot.image_url;
+    if (cleanUrl(lot.cover_url) === imageUrl) delete lot.cover_url;
   }
   lots[lotIndex] = lot;
 
@@ -72,15 +83,15 @@ export const removeLotPhotoReference = <T>(
     ].filter(Boolean);
     return (
       (hasGlobalIndex &&
-        indexRefs.some((value) => Number(value) === globalIndex)) ||
-      urlRefs.some((value) => value === imageUrl)
+        indexRefs.some((value) => parsePreviewPhotoIndex(value) === globalIndex)) ||
+      urlRefs.some((value) => cleanUrl(value) === imageUrl)
     );
   });
 
   const deletedIndexes = Array.isArray(data.deleted_image_indexes)
     ? data.deleted_image_indexes
-        .map((value: unknown) => Number(value))
-        .filter((value: number) => Number.isInteger(value) && value >= 0)
+        .map(parsePreviewPhotoIndex)
+        .filter((value: number | null): value is number => value !== null)
     : [];
   const nextDeletedIndexes =
     !hasGlobalIndex ||

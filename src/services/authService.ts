@@ -2,6 +2,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import api, { STORAGE_KEYS } from "./api";
 import { API_ENDPOINTS } from "../config/api";
 import { buildNativeDeviceContext } from "./deviceMetadataService";
+import { captureAuthOperation, mutateAuthSession } from './authSessionOperation';
 import {
   clearDeviceAccess,
   clearSecureSession,
@@ -80,47 +81,59 @@ export interface ResetPasswordCodePayload {
 }
 
 class AuthService {
-  private async persistSession(accessToken: string, refreshToken: string, user?: User | null) {
+  private async persistSession(accessToken: string, refreshToken: string, user: User, assertCurrent: () => void) {
+    assertCurrent();
     await AsyncStorage.multiRemove([STORAGE_KEYS.SESSION_EXPIRED]);
+    assertCurrent();
     setMemoryAccessToken(accessToken);
     await setRefreshToken(refreshToken);
-    await clearDeviceAccess();
+    assertCurrent();
+    await clearDeviceAccess(assertCurrent);
+    assertCurrent();
 
-    if (user) {
-      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(user));
-      return user;
-    }
-
-    const refreshedUser = await this.refreshCurrentUser();
-    if (refreshedUser) {
-      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(refreshedUser));
-      return refreshedUser;
-    }
-
-    return null;
+    await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(user));
+    assertCurrent();
+    return user;
   }
 
-  private async applyAuthResponse(data: AuthResponse): Promise<AuthResponse> {
-    if (data.authState === "authenticated") {
-      const user = await this.persistSession(data.accessToken, data.refreshToken, data.user);
-      return { ...data, user: user || data.user };
+  private async applyAuthResponse(data: AuthResponse, assertCurrent = captureAuthOperation()): Promise<AuthResponse> {
+    const nonblank = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+    if (!data || !['authenticated', 'registration_required', 'pending', 'rerequest_pending', 'rejected', 'revoked', 'ip_blocked'].includes(data.authState)) {
+      throw new Error('The sign-in response was incomplete. Please try signing in again.');
     }
-    await clearSecureSession();
-    await AsyncStorage.multiRemove([STORAGE_KEYS.USER, STORAGE_KEYS.SESSION_EXPIRED]);
-    await persistDeviceAccess(data);
-    return data;
+    if (data.authState === 'authenticated') {
+      if (!data.user || !nonblank(data.user._id || (data.user as any).id) || !nonblank(data.accessToken) || !nonblank(data.refreshToken)) {
+        throw new Error('The sign-in response was incomplete. Please sign in again.');
+      }
+    } else if (data.authState !== 'ip_blocked' && !nonblank(data.challengeToken)) {
+      throw new Error('The device approval response was incomplete. Please sign in again.');
+    }
+    return mutateAuthSession(assertCurrent, async () => {
+      if (data.authState === "authenticated") {
+        const user = await this.persistSession(data.accessToken, data.refreshToken, data.user, assertCurrent);
+        return { ...data, user };
+      }
+      await clearSecureSession();
+      assertCurrent();
+      await AsyncStorage.multiRemove([STORAGE_KEYS.USER, STORAGE_KEYS.SESSION_EXPIRED]);
+      assertCurrent();
+      await persistDeviceAccess(data, assertCurrent);
+      return data;
+    });
   }
 
-  async acceptAuthenticatedResponse(data: LoginResponse): Promise<LoginResponse> {
-    return (await this.applyAuthResponse(data)) as LoginResponse;
+  async acceptAuthenticatedResponse(data: LoginResponse, assertCurrent = captureAuthOperation()): Promise<LoginResponse> {
+    return (await this.applyAuthResponse(data, assertCurrent)) as LoginResponse;
   }
 
-  async login(credentials: LoginCredentials): Promise<AuthResponse> {
+  async login(credentials: LoginCredentials, assertCurrent = captureAuthOperation()): Promise<AuthResponse> {
+    const deviceContext = await buildNativeDeviceContext();
+    assertCurrent();
     const { data } = (await api.post(API_ENDPOINTS.LOGIN, {
       ...credentials,
-      deviceContext: await buildNativeDeviceContext(),
+      deviceContext,
     })) as { data: AuthResponse };
-    return this.applyAuthResponse(data);
+    return this.applyAuthResponse(data, assertCurrent);
   }
 
   async signup(payload: SignupPayload): Promise<AuthMessageResponse> {
@@ -129,13 +142,16 @@ class AuthService {
   }
 
   async verifyEmail(payload: VerifyEmailPayload): Promise<AuthResponse & AuthMessageResponse> {
+    const assertCurrent = captureAuthOperation();
+    const deviceContext = await buildNativeDeviceContext();
+    assertCurrent();
     const { data } = await api.post(API_ENDPOINTS.VERIFY_EMAIL, {
       ...payload,
-      deviceContext: await buildNativeDeviceContext(),
+      deviceContext,
     }) as {
       data: AuthResponse & AuthMessageResponse;
     };
-    return this.applyAuthResponse(data) as Promise<AuthResponse & AuthMessageResponse>;
+    return this.applyAuthResponse(data, assertCurrent) as Promise<AuthResponse & AuthMessageResponse>;
   }
 
   async resendVerificationCode(email: string): Promise<AuthMessageResponse> {
@@ -154,36 +170,46 @@ class AuthService {
   }
 
   async resetPassword(payload: ResetPasswordPayload): Promise<AuthResponse & AuthMessageResponse> {
+    const assertCurrent = captureAuthOperation();
     const { token, password } = payload;
+    const deviceContext = await buildNativeDeviceContext();
+    assertCurrent();
     const { data } = await api.post(
       `${API_ENDPOINTS.RESET_PASSWORD}/${encodeURIComponent(token)}`,
-      { password, deviceContext: await buildNativeDeviceContext() }
+      { password, deviceContext }
     ) as {
       data: AuthResponse & AuthMessageResponse;
     };
-    return this.applyAuthResponse(data) as Promise<AuthResponse & AuthMessageResponse>;
+    return this.applyAuthResponse(data, assertCurrent) as Promise<AuthResponse & AuthMessageResponse>;
   }
 
   async resetPasswordByCode(payload: ResetPasswordCodePayload): Promise<AuthResponse & AuthMessageResponse> {
+    const assertCurrent = captureAuthOperation();
+    const deviceContext = await buildNativeDeviceContext();
+    assertCurrent();
     const { data } = await api.post(API_ENDPOINTS.RESET_PASSWORD_CODE, {
       ...payload,
-      deviceContext: await buildNativeDeviceContext(),
+      deviceContext,
     }) as {
       data: AuthResponse & AuthMessageResponse;
     };
-    return this.applyAuthResponse(data) as Promise<AuthResponse & AuthMessageResponse>;
+    return this.applyAuthResponse(data, assertCurrent) as Promise<AuthResponse & AuthMessageResponse>;
   }
 
   async logout(): Promise<void> {
+    const assertCurrent = captureAuthOperation();
     try {
       const refreshToken = await getRefreshToken();
+      assertCurrent();
       if (refreshToken) {
         await api.post(API_ENDPOINTS.LOGOUT, { token: refreshToken }).catch(() => {});
       }
     } finally {
-      await clearSecureSession();
-      await clearDeviceAccess();
-      await AsyncStorage.multiRemove([STORAGE_KEYS.USER, STORAGE_KEYS.SESSION_EXPIRED]);
+      await mutateAuthSession(assertCurrent, async () => {
+        await clearSecureSession(); assertCurrent();
+        await clearDeviceAccess(assertCurrent); assertCurrent();
+        await AsyncStorage.multiRemove([STORAGE_KEYS.USER, STORAGE_KEYS.SESSION_EXPIRED]);
+      });
     }
   }
 
@@ -199,11 +225,14 @@ class AuthService {
     }
   }
 
-  async refreshCurrentUser(): Promise<User | null> {
+  async refreshCurrentUser(assertCurrent = captureAuthOperation()): Promise<User | null> {
     try {
       const { data } = await api.get(API_ENDPOINTS.ME);
+      assertCurrent();
       if (!data) return null;
-      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(data));
+      await mutateAuthSession(assertCurrent, async () => {
+        await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(data)); assertCurrent();
+      });
       return data as User;
     } catch {
       return null;

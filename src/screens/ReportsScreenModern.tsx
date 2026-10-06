@@ -19,12 +19,16 @@ import api from '../services/api';
 import { assetService } from '../services/assetService';
 import AssetMergeSheet from '../components/AssetMergeSheet';
 import { useAppTheme, type AppThemeColors } from '../context/ThemeContext';
+import salvageService from '../services/salvageService';
+import { salvageDisplayText } from '../utils/salvageDisplayText';
+import { downloadApprovedReportFile } from '../services/reportDownloadTransport';
 
 // Expo SDK 54 keeps downloadAsync in the legacy file-system surface.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const FileSystem = require('expo-file-system/legacy');
 
-type ReportType = 'Asset' | 'RealEstate' | 'LotListing';
+type PreviewReportType = 'Asset' | 'RealEstate' | 'LotListing' | 'Salvage';
+type ReportType = PreviewReportType;
 type ReportTab = 'all' | 'pending' | 'approved';
 
 type ReportFileKey = 'pdf' | 'conditionalReport' | 'crDocx' | 'docx' | 'excel' | 'images';
@@ -42,7 +46,7 @@ type ReportItem = {
   thumbnail?: string;
   releaseStatus?: 'pending_release' | 'released';
   downloadable: boolean;
-  generationState?: 'queued' | 'processing' | 'ready' | 'error';
+  generationState?: 'queued' | 'processing' | 'ready' | 'error' | 'cancelled';
   workflowStage?: string;
   workflowMessage?: string;
   workflowProgressPercent?: number;
@@ -63,7 +67,7 @@ interface ReportsScreenProps {
   onBack: () => void;
   unreadCount?: number;
   onOpenNotifications?: () => void;
-  onOpenPreview?: (reportId: string, reportType: ReportType) => void;
+  onOpenPreview?: (reportId: string, reportType: PreviewReportType) => void;
   onMergeCreated?: (reportId: string) => void;
 }
 
@@ -106,6 +110,7 @@ const getStatus = (report: ReportItem, colors: AppThemeColors) => {
     awaiting_release: { label: 'Awaiting release', text: colors.warning, bg: colors.warningSoft, icon: 'clock' },
     ready: { label: 'Ready to download', text: colors.success, bg: colors.successSoft, icon: 'check-circle' },
     error: { label: 'Generation failed', text: colors.danger, bg: colors.dangerSoft, icon: 'alert-circle' },
+    stopped: { label: 'Processing stopped', text: colors.warning, bg: colors.warningSoft, icon: 'pause-circle' },
   };
   if (report.workflowStage && workflowStatuses[report.workflowStage]) {
     return workflowStatuses[report.workflowStage];
@@ -158,10 +163,11 @@ const ReportsScreenModern = ({
   const fetchReports = useCallback(async () => {
     try {
       setLoadError(null);
-      const [assetReports, realEstateResponse, lotListingResponse] = await Promise.all([
+      const [assetReports, realEstateResponse, lotListingResponse, salvageReports] = await Promise.all([
         assetService.getAssetReports(),
         api.get('/real-estate').catch(() => ({ data: { data: [] } })),
         api.get('/lot-listing').catch(() => ({ data: { data: [] } })),
+        salvageService.list(),
       ]);
       const next: ReportItem[] = [];
       const visibleStatuses = ['approved', 'pending_approval', 'preview', 'declined', 'processing', 'error'];
@@ -233,7 +239,7 @@ const ReportsScreenModern = ({
           createdAt: report.createdAt,
           lotCount: 1,
           lotSummary: 'Property',
-          thumbnail: previewData.image_urls?.[0] || report.image_urls?.[0],
+          thumbnail: report.imageUrls?.[0] || previewData.imageUrls?.[0] || previewData.image_urls?.[0] || report.image_urls?.[0],
           releaseStatus: report.release_status,
           downloadable: report.downloadable !== false,
           generationState: report.generation_state,
@@ -281,6 +287,18 @@ const ReportsScreenModern = ({
             excel: report.preview_files?.excel || report.files?.excel,
             images: report.preview_files?.images || report.files?.images,
           },
+        });
+      }
+
+      for (const report of salvageReports) {
+        next.push({ id: report._id, name: report.file_number || 'Salvage report', type: 'Salvage',
+          status: report.status, contract: report.file_number || '', lotCount: 1, lotSummary: 'Salvage appraisal',
+          createdAt: report.createdAt || '', fmv: formatMoney(Number(report.preview_data?.actual_cash_value || 0), report.currency || 'CAD'),
+          thumbnail: report.imageUrls?.[0], downloadable: report.downloadable === true,
+          generationState: report.generation_state, workflowStage: report.workflow_stage,
+          workflowMessage: salvageDisplayText(report.workflow_message), workflowProgressPercent: report.workflow_progress_percent,
+          jobError: salvageDisplayText(report.job_error),
+          files: report.downloadable ? { pdf: report.files?.pdf, docx: report.files?.docx, excel: report.files?.xlsx, images: report.files?.images } : {},
         });
       }
 
@@ -338,7 +356,7 @@ const ReportsScreenModern = ({
     void fetchReports();
   }, [fetchReports]);
 
-  const download = useCallback(async (url: string, filename: string, reportId: string) => {
+  const download = useCallback(async (url: string, filename: string, reportId: string, protectedFile = false) => {
     const documentDirectory = FileSystem.documentDirectory as string | null;
     if (!documentDirectory) {
       Alert.alert('Storage unavailable', 'The app cannot access its download directory.');
@@ -347,7 +365,9 @@ const ReportsScreenModern = ({
     setDownloadingId(reportId);
     try {
       const path = `${documentDirectory}${Date.now()}_${sanitizeFilename(filename)}`;
-      const result = await FileSystem.downloadAsync(url, path);
+      const result = protectedFile
+        ? await downloadApprovedReportFile(url, path)
+        : await FileSystem.downloadAsync(url, path);
       if (result.status < 200 || result.status >= 300) throw new Error(`Server returned ${result.status}`);
       if (!(await Sharing.isAvailableAsync())) throw new Error('Sharing is not available on this device.');
       await Sharing.shareAsync(result.uri, { dialogTitle: `Save ${filename}` });
@@ -380,7 +400,8 @@ const ReportsScreenModern = ({
             void download(
               url,
               `${report.contract || report.name}-${filenameLabel}.${extension}`,
-              report.id
+              report.id,
+              report.type === 'Salvage'
             )
           }>
           {downloadingId === report.id ? (
@@ -416,7 +437,7 @@ const ReportsScreenModern = ({
             ) : (
               <View style={styles.thumbnailFallback}>
                 <Feather
-                  name={report.type === 'Asset' ? 'package' : report.type === 'LotListing' ? 'list' : 'home'}
+                  name={report.type === 'Asset' ? 'package' : report.type === 'LotListing' ? 'list' : report.type === 'Salvage' ? 'truck' : 'home'}
                   size={23}
                   color={colors.textMuted}
                 />
@@ -424,7 +445,7 @@ const ReportsScreenModern = ({
             )}
             <View style={styles.reportIdentity}>
               <Text style={styles.reportName} numberOfLines={2}>
-                {report.type === 'LotListing' ? 'Lot Listing' : report.type === 'RealEstate' ? 'Real Estate' : 'Asset'}
+                {report.type === 'LotListing' ? 'Lot Listing' : report.type === 'RealEstate' ? 'Real Estate' : report.type}
                 {report.contract ? ` - ${report.contract}` : ''}
               </Text>
               <Text style={styles.reportClient} numberOfLines={1}>{report.name}</Text>
@@ -477,14 +498,16 @@ const ReportsScreenModern = ({
             </View>
           ) : null}
 
-          {report.status === 'preview' || report.status === 'declined' ? (
+          {(report.status === 'preview' || report.status === 'declined' || (report.type === 'Salvage' && !report.downloadable)) ? (
             <TouchableOpacity
               style={styles.reviewButton}
               activeOpacity={0.75}
-              onPress={() => onOpenPreview?.(report.id, report.type)}>
+              onPress={() => {
+                onOpenPreview?.(report.id, report.type);
+              }}>
               <Feather name="edit-3" size={16} color="#FFFFFF" />
               <Text style={styles.reviewButtonText}>
-                {report.status === 'declined' ? 'Edit & resubmit' : 'Preview & submit'}
+                {report.type === 'Salvage' ? 'Open report & progress' : report.status === 'declined' ? 'Edit & resubmit' : 'Preview & submit'}
               </Text>
             </TouchableOpacity>
           ) : report.status === 'approved' && report.downloadable && hasFiles ? (
@@ -519,7 +542,11 @@ const ReportsScreenModern = ({
             <View style={styles.waitingPanel}>
               <Feather name="lock" size={15} color={colors.textMuted} />
               <Text style={styles.waitingText}>
-                {report.status === 'approved' && !report.downloadable
+                {report.type === 'Salvage' && report.status === 'declined'
+                  ? 'Changes were requested. Contact your assigned approver for the required corrections.'
+                  : report.type === 'Salvage' && report.status !== 'approved'
+                    ? 'Your salvage report is awaiting approval.'
+                    : report.status === 'approved' && !report.downloadable
                   ? 'Files are ready and awaiting release.'
                   : report.workflowStage === 'awaiting_approval'
                     ? 'Files are ready and awaiting approval.'
@@ -656,6 +683,8 @@ const ReportsScreenModern = ({
             </View>
           }
           contentContainerStyle={styles.listContent}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
           showsVerticalScrollIndicator={false}
           refreshControl={
             <RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={colors.accent} colors={[colors.accent]} progressBackgroundColor={colors.surface} />

@@ -17,9 +17,11 @@ const BrandIcon = require('../../assets/assetInsightLogo.png');
 
 export type ScreenName =
   | 'dashboard'
+  | 'auctionManagement'
   | 'savedInputs'
   | 'offlineReports'
   | 'profile'
+  | 'support'
   | 'reports'
   | 'approvals'
   | 'releases'
@@ -61,6 +63,9 @@ function NavigationRow({
 }) {
   return (
     <TouchableOpacity
+      accessibilityRole="button"
+      accessibilityLabel={item.label}
+      accessibilityState={{ selected: Boolean(item.active) }}
       onPress={item.action}
       activeOpacity={0.72}
       style={[styles.navRow, item.active && styles.navRowActive]}>
@@ -112,15 +117,16 @@ const DrawerContent = ({
 
     const items: NavigationItem[] = [
       { icon: 'home', label: 'Dashboard', screen: 'dashboard' },
+      { icon: 'inbox', label: 'Incoming', screen: 'auctionManagement' },
       { icon: 'file-text', label: 'My Reports', screen: 'reports' },
       { icon: 'eye', label: 'Previews', screen: 'preview' },
       { icon: 'hard-drive', label: 'Drafts', screen: 'offlineReports' },
     ];
     if (user?.isReportApprover) {
-      items.splice(3, 0, { icon: 'check-circle', label: 'Approvals', screen: 'approvals' });
+      items.splice(4, 0, { icon: 'check-circle', label: 'Approvals', screen: 'approvals' });
     }
     if (user?.isReleaseManager) {
-      items.splice(4, 0, { icon: 'unlock', label: 'Releases', screen: 'releases' });
+      items.splice(5, 0, { icon: 'unlock', label: 'Releases', screen: 'releases' });
     }
     return items.map((item) => ({
       ...item,
@@ -200,6 +206,17 @@ const DrawerContent = ({
         ) : null}
 
         <Text style={styles.sectionLabel}>ACCOUNT</Text>
+        <NavigationRow
+          item={{
+            icon: 'help-circle',
+            label: 'Help & Support',
+            active: activeScreen === 'support',
+            action: () => navigate('support'),
+          }}
+          accent={accent}
+          colors={colors}
+          styles={styles}
+        />
         <NavigationRow
           item={{
             icon: 'user',

@@ -3,9 +3,14 @@ import authService, { User, LoginCredentials, type AuthResponse } from "../servi
 import offlineQueueService from "../services/offlineQueueService";
 import { unregisterStoredPushTokenFromServer } from "../services/notificationService";
 import deviceAccessService from "../services/deviceAccessService";
+import NetInfo from '@react-native-community/netinfo';
+import OfflineCaptureStore from '../services/offlineCaptureStore';
+import AutoSaveService from '../services/autoSaveService';
+import OfflineCaptureSync from '../services/offlineCaptureSync';
+import { pauseActiveUploads } from '../services/uploadCancellation';
+import { captureAuthOperation, invalidateAuthOperations, staleAuthOperation } from '../services/authSessionOperation';
 import {
   getPersistedDeviceAccess,
-  persistDeviceAccess,
   subscribeDeviceAccess,
   subscribeSessionInvalidated,
   type RestrictedDeviceAccess,
@@ -34,44 +39,75 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [error, setError] = useState<string | null>(null);
   const [deviceAccess, setDeviceAccess] = useState<RestrictedDeviceAccess | null>(null);
   const statusRequest = useRef<Promise<void> | null>(null);
-
-  const refreshUser = useCallback(async () => {
-    const currentUser =
-      (await authService.refreshCurrentUser()) ||
-      (await authService.getCurrentUser());
-    setUser(currentUser);
+  const authEpoch = useRef(0);
+  const bindUser = useCallback(async (next: User | null, assertCurrent: () => void = () => undefined) => {
+    assertCurrent();
+    const owner = next ? String(next._id || (next as any).id || '') : null;
+    if (OfflineCaptureStore.getOwnerId() !== owner) {
+      pauseActiveUploads();
+      OfflineCaptureSync.cleanup();
+      offlineQueueService.cleanup();
+    }
+    AutoSaveService.setOwner(owner);
+    if (owner) await OfflineCaptureStore.initialize();
+    assertCurrent();
+    if (OfflineCaptureStore.getOwnerId() !== owner) return;
+    setUser(next);
   }, []);
 
+  const refreshUser = useCallback(async () => {
+    const generation = authEpoch.current;
+    const assertCurrent = captureAuthOperation();
+    const connectivity = await NetInfo.fetch();
+    assertCurrent();
+    const currentUser =
+      (connectivity.isConnected === false || connectivity.isInternetReachable === false ? null : await authService.refreshCurrentUser(assertCurrent)) ||
+      (await authService.getCurrentUser());
+    if (generation === authEpoch.current) await bindUser(currentUser, assertCurrent);
+  }, [bindUser]);
+
   const checkAuth = useCallback(async () => {
+    const generation = authEpoch.current;
     try {
       setLoading(true);
       const restricted = await getPersistedDeviceAccess();
+      if (generation !== authEpoch.current) return;
       if (restricted) {
         setDeviceAccess(restricted);
         setUser(null);
+        AutoSaveService.setOwner(null);
         offlineQueueService.cleanup();
         return;
       }
       const isAuth = await authService.isAuthenticated();
+      if (generation !== authEpoch.current) return;
       if (isAuth) {
         await refreshUser();
-        offlineQueueService.init();
+        if (generation === authEpoch.current && OfflineCaptureStore.getOwnerId()) offlineQueueService.init();
       }
     } catch (err) {
       console.error("Auth check failed:", err);
     } finally {
-      setLoading(false);
+      if (generation === authEpoch.current) setLoading(false);
     }
   }, [refreshUser]);
 
   useEffect(() => {
     void checkAuth();
+    return () => { authEpoch.current++; invalidateAuthOperations(); };
   }, [checkAuth]);
 
   useEffect(() => {
     return subscribeDeviceAccess((state) => {
       setDeviceAccess(state);
       if (state) {
+        authEpoch.current++;
+        invalidateAuthOperations();
+        setLoading(false);
+        statusRequest.current = null;
+        pauseActiveUploads();
+        OfflineCaptureSync.cleanup();
+        AutoSaveService.setOwner(null);
         setUser(null);
         offlineQueueService.cleanup();
       }
@@ -80,6 +116,13 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   useEffect(() => {
     return subscribeSessionInvalidated(() => {
+      authEpoch.current++;
+      invalidateAuthOperations();
+      setLoading(false);
+      statusRequest.current = null;
+      pauseActiveUploads();
+      OfflineCaptureSync.cleanup();
+      AutoSaveService.setOwner(null);
       setUser(null);
       setDeviceAccess(null);
       setError("Your device session is no longer valid. Sign in again to continue.");
@@ -88,88 +131,111 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const login = async (credentials: LoginCredentials) => {
+    const generation = ++authEpoch.current;
+    invalidateAuthOperations();
+    const assertCurrent = captureAuthOperation();
     try {
       setLoading(true);
       setError(null);
-      const response = await authService.login(credentials);
+      const response = await authService.login(credentials, assertCurrent);
+      // A restricted response publishes its own device event, which deliberately
+      // invalidates this operation. Do not overwrite that authoritative event.
+      if (response.authState !== 'authenticated' && generation !== authEpoch.current) return response;
+      assertCurrent();
       if (response.authState === "authenticated") {
-        setUser(response.user);
+        await bindUser(response.user, assertCurrent);
         setDeviceAccess(null);
         offlineQueueService.init();
       } else {
-        setUser(null);
+        await bindUser(null, assertCurrent);
         setDeviceAccess(response);
         offlineQueueService.cleanup();
       }
       return response;
     } catch (err: any) {
+      if (generation !== authEpoch.current) throw staleAuthOperation();
       const message = err.response?.data?.message || err.message || "Login failed";
       setError(message);
-      throw new Error(message);
+      throw Object.assign(new Error(message), { code: err.response?.data?.code || err.code });
     } finally {
-      setLoading(false);
+      if (generation === authEpoch.current) setLoading(false);
     }
   };
 
-  const exchangeApproval = useCallback(async () => {
-    const response = await deviceAccessService.exchange();
-    setUser(response.user);
+  const exchangeApproval = useCallback(async (assertCurrent = captureAuthOperation()) => {
+    assertCurrent();
+    const response = await deviceAccessService.exchange(assertCurrent);
+    assertCurrent();
+    await bindUser(response.user, assertCurrent);
     setDeviceAccess(null);
     setError(null);
     offlineQueueService.init();
-  }, []);
+  }, [bindUser]);
 
   const registerDevice = useCallback(async () => {
-    const response = await deviceAccessService.register();
+    const generation = authEpoch.current;
+    const assertCurrent = captureAuthOperation();
+    const response = await deviceAccessService.register(assertCurrent);
     if ((response as unknown as { authState?: string }).authState === "approved") {
-      await exchangeApproval();
+      assertCurrent();
+      await exchangeApproval(assertCurrent);
       return;
     }
-    setDeviceAccess(response);
+    if (generation === authEpoch.current) setDeviceAccess(response);
   }, [exchangeApproval]);
 
   const refreshDeviceStatus = useCallback(() => {
     if (statusRequest.current) return statusRequest.current;
+    const generation = authEpoch.current;
+    const assertCurrent = captureAuthOperation();
     const request = (async () => {
-      const response = await deviceAccessService.status();
+      const response = await deviceAccessService.status(assertCurrent);
       const status = response.status || response.authState;
       if (status === "approved") {
-        await exchangeApproval();
+        assertCurrent();
+        await exchangeApproval(assertCurrent);
         return;
       }
       const next = { ...response, authState: status } as RestrictedDeviceAccess;
-      await persistDeviceAccess(next);
-      setDeviceAccess(next);
+      if (generation === authEpoch.current) setDeviceAccess(next);
     })().finally(() => {
-      statusRequest.current = null;
+      if (statusRequest.current === request) statusRequest.current = null;
     });
     statusRequest.current = request;
     return request;
   }, [exchangeApproval]);
 
   const rerequestDevice = useCallback(async () => {
-    const response = await deviceAccessService.rerequest();
-    setDeviceAccess(response);
+    const generation = authEpoch.current;
+    const response = await deviceAccessService.rerequest(captureAuthOperation());
+    if (generation === authEpoch.current) setDeviceAccess(response);
   }, []);
 
   const logout = async () => {
+    const generation = ++authEpoch.current;
+    invalidateAuthOperations();
+    const assertCurrent = captureAuthOperation();
+    statusRequest.current = null;
     try {
+      await bindUser(null, assertCurrent);
       setLoading(true);
       offlineQueueService.cleanup();
       await unregisterStoredPushTokenFromServer().catch((error) => {
         console.error("Notification token cleanup failed:", error);
       });
+      assertCurrent();
       await authService.logout();
+      assertCurrent();
       setUser(null);
       setDeviceAccess(null);
     } catch (err) {
       console.error("Logout failed:", err);
     } finally {
-      setLoading(false);
+      if (generation === authEpoch.current) setLoading(false);
     }
   };
 
-  const clearError = () => setError(null);
+  const clearError = useCallback(() => setError(null), []);
 
   return (
     <AuthContext.Provider

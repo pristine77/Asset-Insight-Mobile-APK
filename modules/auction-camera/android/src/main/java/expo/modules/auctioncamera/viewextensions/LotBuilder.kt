@@ -212,9 +212,10 @@ class LotBuilder(
         val filePath = uri.path ?: ""
         val fileUri = if (uri.scheme == "file") android.net.Uri.fromFile(java.io.File(filePath)).toString() else uri.toString()
 
+        val providerMime = if (uri.scheme == "content") context.contentResolver.getType(uri) else null
         val extension = when {
-            fileUri.endsWith(".webp", ignoreCase = true) -> "webp"
-            fileUri.endsWith(".avif", ignoreCase = true) -> "avif"
+            providerMime == "image/webp" || fileUri.endsWith(".webp", ignoreCase = true) -> "webp"
+            providerMime == "image/avif" || fileUri.endsWith(".avif", ignoreCase = true) -> "avif"
             else -> "jpg"
         }
         val mimeType = when (extension) {
@@ -238,6 +239,7 @@ class LotBuilder(
             sourceUri  = fileUri,
             cacheUri   = fileUri,
             originalUri = fileUri,
+            captureOrigin = "camera",
             displayUri = fileUri
         )
     }

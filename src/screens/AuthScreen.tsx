@@ -17,9 +17,10 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuth } from '../context/AuthContext';
-import authService, { SignupPayload } from '../services/authService';
+import authService, { SignupPayload, type AuthResponse } from '../services/authService';
 import { Feather } from '@expo/vector-icons';
 import { useAppTheme, type AppThemeColors } from '../context/ThemeContext';
+import AccountPrivacyLinks from '../components/AccountPrivacyLinks';
 
 const BrandIcon = require('../../assets/icon.png');
 const EquipmentArtwork = require('../../assets/auth-equipment-yard.png');
@@ -76,6 +77,7 @@ const AuthScreen: React.FC = () => {
   const [localLoading, setLocalLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const actionPending = useRef(false);
 
   // Animations
   const heroAnim = useRef(new Animated.Value(0)).current;
@@ -98,12 +100,15 @@ const AuthScreen: React.FC = () => {
     const handleUrl = (event: { url: string }) => {
       if (event.url?.includes('reset-password')) {
         const match = event.url.match(/[?&]token=([^&]+)/);
-        if (match) {
+        if (match && !actionPending.current) {
+          let token: string;
+          try { token = decodeURIComponent(match[1]); } catch { return; }
+          if (!token.trim()) return;
           setLocalError(null);
           setSuccessMsg(null);
           clearError();
           setResetCode('');
-          setResetToken(decodeURIComponent(match[1]));
+          setResetToken(token);
           setSuccessMsg('Secure reset link opened. Choose a new password below.');
           setView('resetPassword');
         }
@@ -133,6 +138,7 @@ const AuthScreen: React.FC = () => {
 
   const navigateTo = useCallback(
     (target: AuthView) => {
+      if (actionPending.current) return;
       clearLocal();
       transitionToView(target);
     },
@@ -142,13 +148,27 @@ const AuthScreen: React.FC = () => {
   /* ---------- Handlers ---------- */
 
   const handleSignIn = async () => {
+    if (actionPending.current) return;
     clearLocal();
     if (!signInEmail.trim()) { setLocalError('Please enter your email.'); return; }
     if (!signInPassword) { setLocalError('Please enter your password.'); return; }
+    actionPending.current = true;
+    setLocalLoading(true);
     try {
       await login({ email: signInEmail.trim().toLowerCase(), password: signInPassword });
     } catch (err: any) {
+      if (err.code === 'EMAIL_NOT_VERIFIED' || err.message === 'Please verify your email before logging in.') {
+        setVerifyEmailAddr(signInEmail.trim().toLowerCase());
+        setVerifyCode('');
+        clearError();
+        setLocalError(null);
+        transitionToView('verify');
+        return;
+      }
       setLocalError(err.message || 'Login failed. Please try again.');
+    } finally {
+      actionPending.current = false;
+      setLocalLoading(false);
     }
   };
 
@@ -163,7 +183,9 @@ const AuthScreen: React.FC = () => {
   };
 
   const handleSignUpSubmit = async () => {
+    if (actionPending.current) return;
     clearLocal();
+    actionPending.current = true;
     setLocalLoading(true);
     try {
       const payload: SignupPayload = {
@@ -179,30 +201,36 @@ const AuthScreen: React.FC = () => {
       const res = await authService.signup(payload);
       setVerifyEmailAddr(signUpEmail.trim().toLowerCase());
       setSuccessMsg(res.message || 'Account created! Check your email for a verification code.');
-      navigateTo('verify');
+      transitionToView('verify');
     } catch (err: any) {
       setLocalError(err.response?.data?.message || err.message || 'Sign up failed.');
     } finally {
+      actionPending.current = false;
       setLocalLoading(false);
     }
   };
 
   const handleVerify = async () => {
+    if (actionPending.current) return;
     clearLocal();
-    if (!verifyCode.trim()) { setLocalError('Please enter the verification code.'); return; }
+    if (!/^\d{6}$/.test(verifyCode.trim())) { setLocalError('Please enter the 6-digit verification code.'); return; }
+    actionPending.current = true;
     setLocalLoading(true);
     try {
-      await authService.verifyEmail({ email: verifyEmailAddr, verificationCode: verifyCode.trim() });
-      await refreshUser();
+      const response = await authService.verifyEmail({ email: verifyEmailAddr, verificationCode: verifyCode.trim() });
+      if (response.authState === 'authenticated') await refreshUser();
     } catch (err: any) {
       setLocalError(err.response?.data?.message || err.message || 'Verification failed.');
     } finally {
+      actionPending.current = false;
       setLocalLoading(false);
     }
   };
 
   const handleResendCode = async () => {
+    if (actionPending.current) return;
     clearLocal();
+    actionPending.current = true;
     setLocalLoading(true);
     try {
       const res = await authService.resendVerificationCode(verifyEmailAddr);
@@ -210,13 +238,16 @@ const AuthScreen: React.FC = () => {
     } catch (err: any) {
       setLocalError(err.response?.data?.message || err.message || 'Failed to resend code.');
     } finally {
+      actionPending.current = false;
       setLocalLoading(false);
     }
   };
 
   const handleForgotPassword = async () => {
+    if (actionPending.current) return;
     clearLocal();
     if (!forgotEmail.trim()) { setLocalError('Please enter your email.'); return; }
+    actionPending.current = true;
     setLocalLoading(true);
     try {
       const normalizedEmail = forgotEmail.trim().toLowerCase();
@@ -229,13 +260,16 @@ const AuthScreen: React.FC = () => {
     } catch (err: any) {
       setLocalError(err.response?.data?.message || err.message || 'Failed to send reset code.');
     } finally {
+      actionPending.current = false;
       setLocalLoading(false);
     }
   };
 
   const handleResendResetCode = async () => {
+    if (actionPending.current) return;
     clearLocal();
     if (!forgotEmail.trim()) { setLocalError('Please enter your email first.'); return; }
+    actionPending.current = true;
     setLocalLoading(true);
     try {
       const normalizedEmail = forgotEmail.trim().toLowerCase();
@@ -245,33 +279,38 @@ const AuthScreen: React.FC = () => {
     } catch (err: any) {
       setLocalError(err.response?.data?.message || err.message || 'Failed to resend reset code.');
     } finally {
+      actionPending.current = false;
       setLocalLoading(false);
     }
   };
 
   const handleResetPassword = async () => {
+    if (actionPending.current) return;
     clearLocal();
     if (!newPassword) { setLocalError('Please enter a new password.'); return; }
     if (newPassword.length < 6) { setLocalError('Password must be at least 6 characters.'); return; }
     if (newPassword !== confirmNewPw) { setLocalError('Passwords do not match.'); return; }
+    actionPending.current = true;
     setLocalLoading(true);
     try {
+      let response: AuthResponse;
       if (resetToken) {
-        await authService.resetPassword({ token: resetToken, password: newPassword });
+        response = await authService.resetPassword({ token: resetToken, password: newPassword });
       } else {
         const normalizedEmail = forgotEmail.trim().toLowerCase();
         if (!normalizedEmail) { setLocalError('Please enter the email used for the reset request.'); return; }
-        if (!resetCode.trim()) { setLocalError('Please enter the 6-digit reset code.'); return; }
-        await authService.resetPasswordByCode({
+        if (!/^\d{6}$/.test(resetCode.trim())) { setLocalError('Please enter the 6-digit reset code.'); return; }
+        response = await authService.resetPasswordByCode({
           email: normalizedEmail,
           code: resetCode.trim(),
           password: newPassword,
         });
       }
-      await refreshUser();
+      if (response.authState === 'authenticated') await refreshUser();
     } catch (err: any) {
       setLocalError(err.response?.data?.message || err.message || 'Password reset failed.');
     } finally {
+      actionPending.current = false;
       setLocalLoading(false);
     }
   };
@@ -315,6 +354,7 @@ const AuthScreen: React.FC = () => {
       {opts?.showToggle ? (
         <View style={st.pwRow}>
           <TextInput
+            accessibilityLabel={label}
             style={st.pwInput}
             value={value}
             onChangeText={onChangeText}
@@ -331,6 +371,7 @@ const AuthScreen: React.FC = () => {
         </View>
       ) : (
         <TextInput
+          accessibilityLabel={label}
           style={st.textInput}
           value={value}
           onChangeText={onChangeText}
@@ -594,9 +635,9 @@ const AuthScreen: React.FC = () => {
       <Text style={st.cardSub}>Complete the reset and get back into your workspace.</Text>
       {renderInfoPanel(
         isTokenResetFlow ? 'Secure reset link' : '6-digit reset code',
-        isTokenResetFlow ? 'Link confirmed' : 'Enter your reset code',
+        isTokenResetFlow ? 'Reset link opened' : 'Enter your reset code',
         isTokenResetFlow
-          ? 'We detected a valid password reset link. Set your new password below.'
+          ? 'Choose a new password. The link will be checked when you submit.'
           : 'Use the 6-digit code from your email, then choose a strong new password.',
         !isTokenResetFlow ? forgotEmail.trim().toLowerCase() : undefined,
       )}
@@ -687,6 +728,7 @@ const AuthScreen: React.FC = () => {
           {view === 'verify' && renderVerifyView()}
           {view === 'forgotPassword' && renderForgotView()}
           {view === 'resetPassword' && renderResetView()}
+          <AccountPrivacyLinks />
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>

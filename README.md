@@ -2,6 +2,28 @@
 
 Source code for the Asset Insight Expo and React Native mobile application.
 
+## Latest source synchronization — 6 October 2026
+
+Synchronized source revision `0be47f1`, retaining Pristine77's newer camera,
+landscape, device-approval and logo behavior from the shared Front-End repository.
+Includes combined Asset/Lot preview save-and-generation, preview loading feedback,
+app-version activity, account privacy links and explicit interrupted-upload Resume.
+Photo sizing remains 3000 px standard / 6000 px high resolution.
+
+OpenAI credits, provider usage logging, usage multipliers/calculations and Salvage
+provider-cost tracking are excluded. Existing report layouts are retained.
+This is application source; no APK/AAB or signing credentials are included.
+
+The obsolete custom APK installer and unused legacy Incoming adapter were removed
+to match the current application. Their previous source remains in Git history.
+Verification and exclusion checks use an isolated staging copy; production and
+physical-device behavior are not exercised by source synchronization.
+
+Final checks: all 99 Jest suites / 1,079 tests and TypeScript passed. The same
+merged application source also passed Android/iOS Hermes exports, source parity
+and accounting/credential-path scans. Runtime layouts and provider integration
+still require normal release validation before deployment.
+
 ## Included
 
 - Asset Listing and Lot Listing workflows

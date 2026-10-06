@@ -9,11 +9,11 @@ version = '1.0.0'
 
 android {
   namespace "expo.modules.auctioncamera"
-  compileSdk 35
+  compileSdk rootProject.ext.compileSdkVersion
 
   defaultConfig {
     minSdk 24
-    targetSdk 35
+    targetSdk rootProject.ext.targetSdkVersion
     versionCode 1
     versionName "1.0.0"
   }

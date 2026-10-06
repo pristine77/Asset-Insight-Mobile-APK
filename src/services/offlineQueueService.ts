@@ -1,12 +1,14 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
-import { Alert, AppState, AppStateStatus, Platform } from 'react-native';
+import { Alert } from 'react-native';
 import assetService, { AssetCreateDetails, MixedLot as AssetMixedLot } from './assetService';
 import lotListingService, {
   LotListingDetails,
   LotListingLot,
 } from './lotListingService';
 import AutoSaveService from './autoSaveService';
+import OfflineCaptureStore from './offlineCaptureStore';
+import { pauseActiveUploads, createUploadOperation, isUploadFinalizing, type UploadOperation } from './uploadCancellation';
 import { LocalMediaStore } from './localMediaStore';
 import {
   type ConnectivityResult,
@@ -54,9 +56,39 @@ const getOfflineQueueDir = (): string => `${FileSystem.documentDirectory || ''}o
 
 let didInit = false;
 let processing = false;
-let syncInterval: ReturnType<typeof setInterval> | null = null;
-let appStateSub: { remove: () => void } | null = null;
 let networkSub: (() => void) | null = null;
+
+/*
+ * Automatic pause on connection loss (revised 2026-10-01).
+ *
+ * This used to pause every active upload the moment NetInfo reported
+ * isConnected === false OR isInternetReachable === false. isInternetReachable
+ * is NetInfo's own probe of a public URL: it reads false on weak site signal,
+ * on networks that block that URL while the API is reachable, and for a moment
+ * during a Wi-Fi/cellular handover. Each flicker paused the report in the
+ * field; one landing on "Finalizing" turned an accepted report into a paused
+ * draft.
+ *
+ * Now only an actual disconnect counts, it must last DISCONNECT_PAUSE_DELAY_MS
+ * (a handover recovers well inside that), and a submission being finalized is
+ * left to settle (see isUploadFinalizing). Transfers interrupted by a real
+ * outage still fail on their own and stop at the 120 s no-progress deadline.
+ */
+export const DISCONNECT_PAUSE_DELAY_MS = 10_000;
+let disconnectPauseTimer: ReturnType<typeof setTimeout> | null = null;
+function cancelDisconnectPause(): void {
+  if (!disconnectPauseTimer) return;
+  clearTimeout(disconnectPauseTimer);
+  disconnectPauseTimer = null;
+}
+function scheduleDisconnectPause(): void {
+  if (disconnectPauseTimer) return;
+  disconnectPauseTimer = setTimeout(() => {
+    disconnectPauseTimer = null;
+    // Preserve the reason for feedback; reconnection never resumes the upload.
+    if (!isUploadFinalizing()) pauseActiveUploads('connection');
+  }, DISCONNECT_PAUSE_DELAY_MS);
+}
 const listeners = new Set<(jobs: OfflineQueueJob[]) => void>();
 
 async function ensureQueueDirExists(): Promise<void> {
@@ -145,6 +177,8 @@ async function persistFileForQueue(args: {
 }
 
 async function deleteLocalFile(uri: string): Promise<void> {
+  // This queue only owns files it created. Gallery/camera/shared draft originals are never deleted here.
+  if (!uri.startsWith(getOfflineQueueDir())) return;
   try {
     const info = await FileSystem.getInfoAsync(uri);
     if (info.exists) {
@@ -156,7 +190,10 @@ async function deleteLocalFile(uri: string): Promise<void> {
 }
 
 async function loadQueue(): Promise<OfflineQueueJob[]> {
-  const raw = await AsyncStorage.getItem(QUEUE_KEY);
+  const owner = OfflineCaptureStore.getOwnerId();
+  if (!owner) return [];
+  const raw = await AsyncStorage.getItem(`${QUEUE_KEY}:owner:${encodeURIComponent(owner)}`);
+  if (owner !== OfflineCaptureStore.getOwnerId()) return [];
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw);
@@ -166,8 +203,9 @@ async function loadQueue(): Promise<OfflineQueueJob[]> {
   }
 }
 
-async function saveQueue(queue: OfflineQueueJob[]): Promise<void> {
-  await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+async function saveQueue(queue: OfflineQueueJob[], owner = OfflineCaptureStore.getOwnerId()): Promise<void> {
+  if (!owner || owner !== OfflineCaptureStore.getOwnerId()) return;
+  await AsyncStorage.setItem(`${QUEUE_KEY}:owner:${encodeURIComponent(owner)}`, JSON.stringify(queue));
   listeners.forEach((listener) => listener(queue));
 }
 
@@ -179,7 +217,7 @@ function computeBackoffMs(attempts: number): number {
 }
 
 function retryableUploadMessage(): string {
-  return 'Upload paused because the internet connection was interrupted. It will retry automatically when the connection returns, or you can tap Send.';
+  return 'Upload paused. Connect to the internet and tap Resume upload. Nothing will submit automatically.';
 }
 
 async function isOnline(): Promise<boolean> {
@@ -425,8 +463,9 @@ async function assertQueuedFilesExist(job: OfflineQueueJob): Promise<void> {
   }
 }
 
-async function submitJob(job: OfflineQueueJob): Promise<void> {
+async function submitJob(job: OfflineQueueJob, operation: UploadOperation): Promise<void> {
   await assertQueuedFilesExist(job);
+  operation.assertActive();
 
   if (job.type === 'asset') {
     await assetService.createAssetReport(job.details as AssetCreateDetails, job.lots as AssetMixedLot[]);
@@ -439,8 +478,11 @@ async function submitJob(job: OfflineQueueJob): Promise<void> {
   }
 }
 
-async function processQueue(): Promise<void> {
-  if (processing) return;
+async function processQueue(selected?: Set<string>): Promise<void> {
+  if (processing || !selected?.size) return;
+  const owner = OfflineCaptureStore.getOwnerId();
+  if (!owner) return;
+  const operation = createUploadOperation();
   processing = true;
   try {
     const queue = await loadQueue();
@@ -452,13 +494,16 @@ async function processQueue(): Promise<void> {
     const updated: OfflineQueueJob[] = [];
 
     for (const job of queue) {
+      if (owner !== OfflineCaptureStore.getOwnerId() || !operation.isActive()) return;
+      if (!selected.has(job.id)) { updated.push(job); continue; }
       if (typeof job.nextAttemptAt === 'number' && job.nextAttemptAt > now) {
         updated.push(job);
         continue;
       }
 
       try {
-        await submitJob(job);
+        await submitJob(job, operation);
+        if (!operation.isActive() || owner !== OfflineCaptureStore.getOwnerId()) return;
 
         for (const uri of job.fileUris ?? []) {
           await deleteLocalFile(uri);
@@ -479,6 +524,7 @@ async function processQueue(): Promise<void> {
           `Your ${label} saved on ${new Date(job.createdAt).toLocaleString()} was uploaded successfully. Processing continues in the background.`
         );
       } catch (e: any) {
+        if (!operation.isActive() || owner !== OfflineCaptureStore.getOwnerId()) return;
         const attempts = (job.attempts ?? 0) + 1;
         const isFileError = e instanceof OfflineQueueFileError;
         const status = getErrorStatus(e);
@@ -509,7 +555,7 @@ async function processQueue(): Promise<void> {
         const msg = isNetworkError
           ? retryableUploadMessage()
           : isTransientServerError
-            ? 'The server is temporarily unavailable. This upload remains safe and will retry automatically.'
+            ? 'The server is temporarily unavailable. Your draft is safe; tap Resume upload when ready.'
             : getSubmissionError(e).message;
 
         if (!retryable && job.lastError !== msg) {
@@ -530,32 +576,9 @@ async function processQueue(): Promise<void> {
       }
     }
 
-    await saveQueue(updated);
+    await saveQueue(updated, owner);
   } finally {
     processing = false;
-  }
-}
-
-function startSyncLoop(): void {
-  if (syncInterval) return;
-  syncInterval = setInterval(() => {
-    void processQueue();
-  }, Platform.OS === 'android' ? 20_000 : 25_000);
-}
-
-function stopSyncLoop(): void {
-  if (syncInterval) {
-    clearInterval(syncInterval);
-    syncInterval = null;
-  }
-}
-
-function onAppStateChange(next: AppStateStatus) {
-  if (next === 'active') {
-    void loadQueue().then((queue) =>
-      AutoSaveService.cleanupOrphanedMedia(queue.flatMap((job) => job.fileUris || [])).catch(() => undefined)
-    );
-    void processQueue();
   }
 }
 
@@ -571,24 +594,16 @@ export const OfflineQueueService = {
     if (didInit) return;
     didInit = true;
 
-    startSyncLoop();
-    void loadQueue().then((queue) =>
-      AutoSaveService.cleanupOrphanedMedia(queue.flatMap((job) => job.fileUris || [])).catch(() => undefined)
-    );
-    void processQueue();
-
-    appStateSub = AppState.addEventListener('change', onAppStateChange);
+    // Reconnect may sync inventory elsewhere, never submit a queued report.
     networkSub = NetInfo.addEventListener((state) => {
-      if (state.isConnected === true) {
-        void processQueue();
-      }
+      if (state.isConnected === false) scheduleDisconnectPause();
+      else cancelDisconnectPause();
     });
   },
 
   cleanup(): void {
-    stopSyncLoop();
-    appStateSub?.remove();
-    appStateSub = null;
+    cancelDisconnectPause();
+    pauseActiveUploads();
     networkSub?.();
     networkSub = null;
     didInit = false;
@@ -741,7 +756,7 @@ export const OfflineQueueService = {
           : job
       )
     );
-    await processQueue();
+    await processQueue(new Set([id]));
     const remaining = (await loadQueue()).find((job) => job.id === id);
     if (!remaining) {
       return {
@@ -762,11 +777,11 @@ export const OfflineQueueService = {
   async retryAll(): Promise<void> {
     const q = await loadQueue();
     await saveQueue(q.map((job) => ({ ...job, nextAttemptAt: undefined })));
-    await processQueue();
+    await processQueue(new Set(q.map((job) => job.id)));
   },
 
   async forceSyncOnce(): Promise<void> {
-    await processQueue();
+    // Refresh is not authorization to send. Use the explicit retry actions.
   },
 
   async clearAllJobs(): Promise<void> {

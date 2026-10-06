@@ -12,12 +12,15 @@ import {
   KeyboardAvoidingView,
   Platform,
   Image,
+  Switch,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { useAuth } from '../../context/AuthContext';
-import realEstateService, { RealEstateDetails } from '../../services/realEstateService';
+import realEstateService, { RealEstateDetails, FarmlandDetails } from '../../services/realEstateService';
+import { REAL_ESTATE_MAIN_IMAGE_LIMIT, REAL_ESTATE_EXTRA_IMAGE_LIMIT, remainingImageSlots, type ReportUploadImage } from '../../services/reportUploadPolicy';
+import { pollAcceptedReport } from '../../services/reportProgressPolling';
 
 interface RealEstateFormSheetProps {
   visible: boolean;
@@ -27,6 +30,7 @@ interface RealEstateFormSheetProps {
 
 const isoDate = (d: Date) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const initialFarmland = (): FarmlandDetails => ({ use_direct_comparable: true, use_income_approach: false, use_cost_approach: false });
 
 const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onClose, onSuccess }) => {
   const { user } = useAuth();
@@ -57,6 +61,8 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
   const [numberOfFullBathrooms, setNumberOfFullBathrooms] = useState('');
   const [numberOfHalfBathrooms, setNumberOfHalfBathrooms] = useState('');
   const [knownIssues, setKnownIssues] = useState('');
+  const [farmland, setFarmland] = useState<FarmlandDetails>(initialFarmland);
+  const [farmlandNumbers, setFarmlandNumbers] = useState<Record<string, string>>({});
 
   // Inspector Info
   const [inspectorName, setInspectorName] = useState('');
@@ -68,14 +74,15 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
   // Images state
   const [images, setImages] = useState<Array<{ uri: string; name: string; type: string }>>([]);
   const [mapImage, setMapImage] = useState<{ uri: string; name: string; type: string } | null>(null);
+  const [extraImages, setExtraImages] = useState<ReportUploadImage[]>([]);
 
   // Submission state
   const [submitting, setSubmitting] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [uploadProgress, setUploadProgress] = useState(0);
   const [progressPhase, setProgressPhase] = useState<'idle' | 'uploading' | 'processing' | 'done' | 'error'>('idle');
-  const [jobId, setJobId] = useState<string | null>(null);
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const submissionRef = useRef(false);
+  const stopPollingRef = useRef<(() => void) | null>(null);
 
   // Pre-fill user data
   useEffect(() => {
@@ -87,14 +94,13 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
     }
   }, [user, visible]);
 
-  // Cleanup polling on unmount
+  // Dispose polling when the sheet hides as well as on unmount.
   useEffect(() => {
+    if (!visible) stopPollingRef.current?.();
     return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-      }
+      stopPollingRef.current?.();
     };
-  }, []);
+  }, [visible]);
 
   const clearError = (field: string) => {
     setErrors((prev) => {
@@ -111,18 +117,32 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
     if (!inspectorName.trim()) newErrors.inspectorName = 'Required';
     if (!contactEmail.trim()) newErrors.contactEmail = 'Required';
     if (images.length === 0) newErrors.images = 'At least one image required';
+    if (propertyType === 'agricultural') {
+      if (!farmland.use_direct_comparable && !farmland.use_income_approach && !farmland.use_cost_approach) {
+        newErrors.farmland = 'Select at least one valuation approach.';
+      }
+      for (const [key, text] of Object.entries(farmlandNumbers)) {
+        if (!text.trim()) continue;
+        const value = Number(text);
+        if (!Number.isFinite(value) || value < 0 || (key === 'cap_rate' && value <= 0) || (['vacancy_loss_percent', 'operating_expense_ratio', 'cap_rate'].includes(key) && value > 100)) {
+          newErrors.farmland = 'Use non-negative numbers; percentages must be at most 100 and capitalization rate must be greater than zero.';
+        }
+      }
+    }
 
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
 
   const pickImages = async () => {
+    const remaining = remainingImageSlots(images.length, REAL_ESTATE_MAIN_IMAGE_LIMIT);
+    if (!remaining) return;
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         allowsMultipleSelection: true,
         quality: 0.8,
-        selectionLimit: 20 - images.length,
+        selectionLimit: remaining,
       });
 
       if (!result.canceled && result.assets) {
@@ -131,7 +151,7 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
           name: asset.fileName || `image_${Date.now()}_${index}.jpg`,
           type: asset.mimeType || 'image/jpeg',
         }));
-        setImages((prev) => [...prev, ...newImages].slice(0, 20));
+        setImages((prev) => [...prev, ...newImages].slice(0, REAL_ESTATE_MAIN_IMAGE_LIMIT));
         clearError('images');
       }
     } catch (error) {
@@ -140,6 +160,10 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
   };
 
   const pickMapImage = async () => {
+    if (!mapImage && extraImages.length >= REAL_ESTATE_EXTRA_IMAGE_LIMIT) {
+      Alert.alert('Photo limit reached', 'Remove a report-only photo before adding a map.');
+      return;
+    }
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
@@ -160,38 +184,59 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
     }
   };
 
+  const pickExtraImages = async () => {
+    const remaining = remainingImageSlots(extraImages.length + (mapImage ? 1 : 0), REAL_ESTATE_EXTRA_IMAGE_LIMIT);
+    if (!remaining) return;
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsMultipleSelection: true,
+        quality: 0.8,
+        selectionLimit: remaining,
+      });
+      if (!result.canceled) {
+        const selected = result.assets.map((asset, index) => ({
+          uri: asset.uri,
+          name: asset.fileName || `extra_${Date.now()}_${index}.jpg`,
+          type: asset.mimeType || 'image/jpeg',
+        }));
+        setExtraImages((previous) => [...previous, ...selected].slice(0, REAL_ESTATE_EXTRA_IMAGE_LIMIT - (mapImage ? 1 : 0)));
+      }
+    } catch {
+      Alert.alert('Error', 'Failed to pick report-only photos');
+    }
+  };
+
   const removeImage = (index: number) => {
     setImages((prev) => prev.filter((_, i) => i !== index));
   };
 
   const startPolling = (id: string) => {
-    pollIntervalRef.current = setInterval(async () => {
-      try {
-        const progress = await realEstateService.getProgress(id);
-        if (progress.phase === 'done') {
-          clearInterval(pollIntervalRef.current!);
-          setProgressPhase('done');
-          Alert.alert('Success', 'Report created successfully!');
-          resetForm();
-          onSuccess?.();
-          onClose();
-        } else if (progress.phase === 'error') {
-          clearInterval(pollIntervalRef.current!);
-          setProgressPhase('error');
-          Alert.alert('Error', progress.message || 'Failed to create report');
-        }
-      } catch (error) {
-        console.error('Polling error:', error);
-      }
-    }, 3000);
+    stopPollingRef.current?.();
+    stopPollingRef.current = pollAcceptedReport({
+      load: () => realEstateService.getProgress(id),
+      onDone: () => {
+        Alert.alert('Preview ready', 'Your real estate preview is ready. Review it in Previews before submitting for approval.');
+        finishAcceptedReport();
+      },
+      onError: (message) => {
+        submissionRef.current = false;
+        setSubmitting(false);
+        setProgressPhase('error');
+        Alert.alert('Generation failed', message);
+      },
+      onPending: continueInBackground,
+    });
   };
 
   const handleSubmit = async () => {
+    if (submissionRef.current) return;
     if (!validateForm()) {
       Alert.alert('Error', 'Please fill all required fields');
       return;
     }
 
+    submissionRef.current = true;
     setSubmitting(true);
     setProgressPhase('uploading');
     setUploadProgress(0);
@@ -224,6 +269,12 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
           number_of_half_bathrooms: numberOfHalfBathrooms,
           known_issues: knownIssues.split(',').map((s) => s.trim()).filter(Boolean),
         },
+        ...(propertyType === 'agricultural' ? {
+          farmland_details: {
+            ...farmland,
+            ...Object.fromEntries(Object.entries(farmlandNumbers).filter(([, value]) => value.trim()).map(([key, value]) => [key, Number(value)])),
+          },
+        } : {}),
         inspector_info: {
           inspector_name: inspectorName,
           company_name: companyName,
@@ -239,26 +290,41 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
         mapImage || undefined,
         (progress) => {
           setUploadProgress(progress);
-        }
+        },
+        extraImages
       );
 
       if (response.jobId) {
-        setJobId(response.jobId);
         setProgressPhase('processing');
         startPolling(response.jobId);
       } else {
         setProgressPhase('done');
-        Alert.alert('Success', response.message || 'Report submitted successfully!');
-        resetForm();
-        onSuccess?.();
-        onClose();
+        Alert.alert('Submission accepted', response.message || 'The server accepted your report. Check Previews for progress.');
+        finishAcceptedReport();
       }
     } catch (error: any) {
+      submissionRef.current = false;
+      setSubmitting(false);
       setProgressPhase('error');
       Alert.alert('Error', error?.response?.data?.message || error?.message || 'Failed to submit report');
-    } finally {
-      setSubmitting(false);
     }
+  };
+
+  const finishAcceptedReport = () => {
+    stopPollingRef.current?.();
+    resetForm();
+    onSuccess?.();
+    onClose();
+  };
+
+  const continueInBackground = () => {
+    Alert.alert('Upload accepted', 'The server is preparing your preview. You will receive an email when it is ready. Check Previews before submitting again.');
+    finishAcceptedReport();
+  };
+
+  const requestClose = () => {
+    if (submissionRef.current) return;
+    onClose();
   };
 
   const resetForm = () => {
@@ -276,21 +342,25 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
     setNumberOfFullBathrooms('');
     setNumberOfHalfBathrooms('');
     setKnownIssues('');
+    setFarmland(initialFarmland());
+    setFarmlandNumbers({});
     setCredentials('');
     setImages([]);
     setMapImage(null);
+    setExtraImages([]);
     setProgressPhase('idle');
     setUploadProgress(0);
-    setJobId(null);
+    submissionRef.current = false;
+    setSubmitting(false);
     setErrors({});
   };
 
   return (
-    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} animationType="slide" onRequestClose={requestClose}>
       <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
         {/* Header */}
         <View style={styles.header}>
-          <TouchableOpacity onPress={onClose} style={styles.closeButton}>
+          <TouchableOpacity onPress={requestClose} disabled={submitting} style={styles.closeButton} accessibilityLabel="Close real estate form">
             <Feather name="x" size={24} color="#374151" />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Real Estate Appraisal</Text>
@@ -318,7 +388,12 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
                 </>
               )}
               {progressPhase === 'processing' && (
-                <Text style={styles.progressText}>Your report is being generated...</Text>
+                <>
+                  <Text style={styles.progressText}>Upload accepted. Preparing your preview for review; final reports are not yet approved.</Text>
+                  <TouchableOpacity onPress={continueInBackground} style={styles.submitButton} accessibilityRole="button">
+                    <Text style={styles.submitButtonText}>Continue in background</Text>
+                  </TouchableOpacity>
+                </>
               )}
             </View>
           </View>
@@ -653,6 +728,66 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
               </View>
             </View>
 
+            {propertyType === 'agricultural' && (
+              <View style={styles.section}>
+                <Text style={styles.sectionTitle}>Farmland & valuation approaches</Text>
+                {errors.farmland ? <Text style={styles.errorText}>{errors.farmland}</Text> : null}
+                {([
+                  ['total_title_acres', 'Total title acres', true],
+                  ['cultivated_acres', 'Cultivated acres', true],
+                  ['rm_area', 'Rural municipality / area', false],
+                  ['soil_class', 'Soil class', false],
+                  ['crop_type', 'Crop type', false],
+                  ['distance_to_city_km', 'Distance to city (km)', true],
+                  ['annual_rent_per_acre', 'Annual rent per acre', true],
+                  ['notes', 'Farmland notes', false],
+                  ['subject_name', 'Valuation subject name', false],
+                  ['valuation_date', 'Valuation date (YYYY-MM-DD)', false],
+                ] as const).map(([key, label, numeric]) => (
+                  <View key={key} style={styles.fieldContainer}>
+                    <Text style={styles.fieldLabel}>{label}</Text>
+                    <TextInput
+                      accessibilityLabel={label}
+                      style={styles.input}
+                      value={numeric ? farmlandNumbers[key] || '' : String(farmland[key] ?? '')}
+                      keyboardType={numeric ? 'decimal-pad' : 'default'}
+                      onChangeText={(value) => {
+                        clearError('farmland');
+                        if (numeric) setFarmlandNumbers((previous) => ({ ...previous, [key]: value }));
+                        else setFarmland((previous) => ({ ...previous, [key]: value }));
+                      }}
+                    />
+                  </View>
+                ))}
+                {([
+                  ['is_rented', 'Currently rented'],
+                  ['irrigation', 'Irrigation'],
+                  ['use_direct_comparable', 'Direct comparable approach'],
+                  ['use_income_approach', 'Income approach'],
+                  ['use_cost_approach', 'Cost approach'],
+                ] as const).map(([key, label]) => (
+                  <View key={key} style={[styles.row, { alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }]}>
+                    <Text style={[styles.fieldLabel, { flex: 1 }]}>{label}</Text>
+                    <Switch accessibilityLabel={label} value={farmland[key] === true} onValueChange={(value) => setFarmland((previous) => ({ ...previous, [key]: value }))} />
+                  </View>
+                ))}
+                {farmland.use_income_approach && ([
+                  ['market_rent_per_acre', 'Market rent per acre'],
+                  ['vacancy_loss_percent', 'Vacancy loss (%)'],
+                  ['operating_expense_ratio', 'Operating expense ratio (%)'],
+                  ['cap_rate', 'Capitalization rate (%)'],
+                ] as const).map(([key, label]) => (
+                  <View key={key} style={styles.fieldContainer}>
+                    <Text style={styles.fieldLabel}>{label}</Text>
+                    <TextInput accessibilityLabel={label} style={styles.input} value={farmlandNumbers[key] || ''} keyboardType="decimal-pad" onChangeText={(value) => {
+                      clearError('farmland');
+                      setFarmlandNumbers((previous) => ({ ...previous, [key]: value }));
+                    }} />
+                  </View>
+                ))}
+              </View>
+            )}
+
             {/* Settings Section */}
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>Settings</Text>
@@ -680,9 +815,10 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
 
               <TouchableOpacity
                 style={[styles.addImageButton, errors.images && styles.addImageButtonError]}
+                disabled={images.length >= REAL_ESTATE_MAIN_IMAGE_LIMIT}
                 onPress={pickImages}>
                 <Feather name="image" size={24} color="#2563EB" />
-                <Text style={styles.addImageText}>Add Images ({images.length}/20)</Text>
+                <Text style={styles.addImageText}>Add Images ({images.length}/{REAL_ESTATE_MAIN_IMAGE_LIMIT})</Text>
               </TouchableOpacity>
               {errors.images && <Text style={styles.errorText}>{errors.images}</Text>}
 
@@ -700,6 +836,24 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
                   ))}
                 </ScrollView>
               )}
+
+              <View style={styles.mapSection}>
+                <Text style={styles.fieldLabel}>Report-only photos (not analyzed)</Text>
+                <TouchableOpacity style={styles.addMapButton} onPress={pickExtraImages} disabled={extraImages.length + (mapImage ? 1 : 0) >= REAL_ESTATE_EXTRA_IMAGE_LIMIT}>
+                  <Feather name="image" size={20} color="#2563EB" />
+                  <Text style={styles.addMapText}>Add report-only photos ({extraImages.length + (mapImage ? 1 : 0)}/{REAL_ESTATE_EXTRA_IMAGE_LIMIT}, including map)</Text>
+                </TouchableOpacity>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.imagePreviewScroll}>
+                  {extraImages.map((image, index) => (
+                    <View key={`${image.uri}-${index}`} style={styles.imagePreviewContainer}>
+                      <Image source={{ uri: image.uri }} style={styles.imagePreview} />
+                      <TouchableOpacity accessibilityLabel={`Remove report-only photo ${index + 1}`} style={styles.removeImageButton} onPress={() => setExtraImages((previous) => previous.filter((_, position) => position !== index))}>
+                        <Feather name="x" size={14} color="#fff" />
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </ScrollView>
+              </View>
 
               {/* Map Image */}
               <View style={styles.mapSection}>
@@ -725,6 +879,7 @@ const RealEstateFormSheet: React.FC<RealEstateFormSheetProps> = ({ visible, onCl
 
             {/* Submit Button */}
             <TouchableOpacity
+              accessibilityLabel="Submit real estate report"
               style={[styles.submitButton, submitting && styles.submitButtonDisabled]}
               onPress={handleSubmit}
               disabled={submitting}>
@@ -949,6 +1104,8 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   addMapText: {
+    flexShrink: 1,
+    textAlign: 'center',
     fontSize: 14,
     fontWeight: '600',
     color: '#2563EB',

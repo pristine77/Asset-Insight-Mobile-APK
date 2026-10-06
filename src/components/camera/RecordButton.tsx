@@ -30,6 +30,10 @@ export const RecordButton: React.FC<RecordButtonProps> = ({
 
   return (
     <TouchableOpacity
+      accessibilityRole="button"
+      accessibilityLabel={isRecording ? 'Stop video recording' : 'Record video, 720p at 30 frames per second'}
+      accessibilityState={{ disabled }}
+      hitSlop={8}
       style={[
         styles.recordBtn,
         isRecording && styles.recordBtnActive,
@@ -41,7 +45,7 @@ export const RecordButton: React.FC<RecordButtonProps> = ({
       disabled={disabled}>
       <Feather name={isRecording ? 'square' : 'video'} size={compact ? 18 : 20} color="#fff" />
       <Text style={[styles.recordBtnText, compact && styles.recordBtnTextCompact]}>
-        {isRecording ? 'Stop' : compact ? 'Rec' : 'Record'}
+        {isRecording ? 'Stop' : compact ? 'Rec' : 'Record 720p'}
       </Text>
     </TouchableOpacity>
   );

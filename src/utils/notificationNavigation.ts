@@ -8,7 +8,7 @@ export type NotificationNavigationTarget =
   | {
       kind: "preview";
       reportId: string;
-      reportType: "Asset" | "RealEstate" | "LotListing";
+      reportType: "Asset" | "RealEstate" | "LotListing" | "Salvage";
       mode: "pending" | "submitted";
     }
   | { kind: "reports" }
@@ -18,9 +18,9 @@ function toNonEmptyString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function toReportType(value: unknown): "Asset" | "RealEstate" | "LotListing" | null {
+function toReportType(value: unknown): "Asset" | "RealEstate" | "LotListing" | "Salvage" | null {
   const normalized = toNonEmptyString(value);
-  if (normalized === "Asset" || normalized === "RealEstate" || normalized === "LotListing") {
+  if (normalized === "Asset" || normalized === "RealEstate" || normalized === "LotListing" || normalized === "Salvage") {
     return normalized;
   }
   return null;
@@ -45,7 +45,7 @@ export function getNotificationNavigationTarget(
       kind: "preview",
       reportId,
       reportType,
-      mode: type === "report_preview_ready" ? "submitted" : "pending",
+      mode: type === "report_preview_ready" && reportType !== "Salvage" ? "submitted" : "pending",
     };
   }
 

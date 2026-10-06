@@ -14,16 +14,18 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { useAppTheme, type AppThemeColors } from '../context/ThemeContext';
 import LotListingFormSheet from '../components/forms/LotListingFormSheet';
+import AuctioneerIncoming from '../components/auction/AuctioneerIncoming';
+import type { AuctioneerReportType } from '../services/auctioneerService';
 import auctionManagementService, {
   AuctionManagementTaskPayload,
   AuctionManagementTaskStatus,
 } from '../services/auctionManagementService';
-import auctioneerIncomingService, { AuctioneerIncomingTask } from '../services/auctioneerIncomingService';
 
 const emptyImage = require('../../assets/auction-management-empty.png');
 
 interface AuctionManagementScreenProps {
   onOpenDrawer: () => void;
+  onOpenReport: (reportId: string, reportType: AuctioneerReportType) => void;
 }
 
 const TABS: { key: AuctionManagementTaskStatus; label: string; icon: string }[] = [
@@ -68,35 +70,24 @@ function statusLabel(status?: string | null) {
   return 'Incoming';
 }
 
-function auctioneerStatusLabel(status: AuctioneerIncomingTask['status']) {
-  if (status === 'available') return 'New assignment';
-  if (status === 'sent') return 'Sent';
-  if (status === 'report_created') return 'Report created';
-  return 'Your report';
-}
-
-export default function AuctionManagementScreen({ onOpenDrawer }: AuctionManagementScreenProps) {
+export default function AuctionManagementScreen({ onOpenDrawer, onOpenReport }: AuctionManagementScreenProps) {
   const { colors } = useAppTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [activeTab, setActiveTab] = useState<AuctionManagementTaskStatus>('incoming');
   const [tasks, setTasks] = useState<AuctionManagementTaskPayload[]>([]);
-  const [auctioneerIncoming, setAuctioneerIncoming] = useState<AuctioneerIncomingTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedTask, setSelectedTask] = useState<AuctionManagementTaskPayload | null>(null);
   const [formVisible, setFormVisible] = useState(false);
+  const [source, setSource] = useState<'legacy' | 'auctioneer2'>('legacy');
+  const [modernRefresh, setModernRefresh] = useState(0);
 
   const activeTabConfig = useMemo(() => TABS.find((tab) => tab.key === activeTab) || TABS[0], [activeTab]);
 
   const loadTasks = useCallback(async (status: AuctionManagementTaskStatus = activeTab, showSpinner = true) => {
     if (showSpinner) setLoading(true);
     try {
-      const [legacyTasks, incoming] = await Promise.all([
-        auctionManagementService.getTasks(status),
-        status === 'incoming' ? auctioneerIncomingService.getIncoming(true) : Promise.resolve([]),
-      ]);
-      setTasks(legacyTasks);
-      setAuctioneerIncoming(incoming);
+      setTasks(await auctionManagementService.getTasks(status));
     } catch (error: any) {
       Alert.alert('Auction Management', error?.message || 'Failed to load contract tasks.');
     } finally {
@@ -106,8 +97,8 @@ export default function AuctionManagementScreen({ onOpenDrawer }: AuctionManagem
   }, [activeTab]);
 
   useEffect(() => {
-    void loadTasks(activeTab, true);
-  }, [activeTab, loadTasks]);
+    if (source === 'legacy') void loadTasks(activeTab, true);
+  }, [activeTab, loadTasks, source]);
 
   const refresh = useCallback(() => {
     setRefreshing(true);
@@ -124,16 +115,6 @@ export default function AuctionManagementScreen({ onOpenDrawer }: AuctionManagem
       setFormVisible(true);
     } catch (error: any) {
       Alert.alert('Auction Management', error?.message || 'Failed to open contract task.');
-    }
-  }, []);
-
-  const openAuctioneerTask = useCallback(async (task: AuctioneerIncomingTask) => {
-    try {
-      const setupTask = await auctioneerIncomingService.openLotListingTask(task);
-      setSelectedTask(setupTask);
-      setFormVisible(true);
-    } catch (error: any) {
-      Alert.alert('Auctioneer assignment', error?.message || 'Unable to open this assigned work item.');
     }
   }, []);
 
@@ -157,11 +138,24 @@ export default function AuctionManagementScreen({ onOpenDrawer }: AuctionManagem
           <Text style={styles.headerEyebrow}>Asset Insight</Text>
           <Text style={styles.headerTitle}>Auction Management System</Text>
         </View>
-        <TouchableOpacity style={styles.iconButton} onPress={refresh}>
+        <TouchableOpacity style={styles.iconButton} accessibilityRole="button" accessibilityLabel="Refresh incoming contracts" onPress={source === 'legacy' ? refresh : () => setModernRefresh((value) => value + 1)}>
           <Feather name="refresh-cw" size={18} color={colors.text} />
         </TouchableOpacity>
       </View>
 
+      <View style={styles.tabs}>
+        {(['legacy', 'auctioneer2'] as const).map((option) => (
+          <TouchableOpacity key={option} accessibilityRole="tab"
+            accessibilityLabel={option === 'legacy' ? 'Legacy Auctionsoft tasks' : 'Auctioneer 2.0 contracts'}
+            accessibilityState={{ selected: source === option }}
+            style={[styles.tabButton, source === option && styles.tabButtonActive]}
+            onPress={() => setSource(option)}>
+            <Text style={[styles.tabText, source === option && styles.tabTextActive]}>{option === 'legacy' ? 'Auctionsoft' : 'Auctioneer 2.0'}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      {source === 'auctioneer2' ? <AuctioneerIncoming refreshVersion={modernRefresh} onOpenReport={onOpenReport} /> : <>
       <View style={styles.tabs}>
         {TABS.map((tab) => {
           const active = tab.key === activeTab;
@@ -187,14 +181,14 @@ export default function AuctionManagementScreen({ onOpenDrawer }: AuctionManagem
             <Text style={styles.summaryTitle}>{activeTabConfig.label} contracts</Text>
             <Text style={styles.summaryText}>
               {activeTab === 'incoming'
-                ? 'Assignments from Auctioneer Operations To-Do and Auctionsoft mobile capture.'
+                ? 'Contracts sent from Auctionsoft for mobile lot capture.'
                 : activeTab === 'in_progress'
                   ? 'Opened work that can continue through Lot Listing.'
                   : 'Closed Auction Management contract tasks.'}
             </Text>
           </View>
           <View style={styles.summaryCount}>
-            <Text style={styles.summaryCountText}>{tasks.length + auctioneerIncoming.length}</Text>
+            <Text style={styles.summaryCountText}>{tasks.length}</Text>
           </View>
         </View>
 
@@ -202,7 +196,7 @@ export default function AuctionManagementScreen({ onOpenDrawer }: AuctionManagem
           <View style={styles.centerState}>
             <ActivityIndicator color={colors.accent} />
           </View>
-        ) : tasks.length === 0 && auctioneerIncoming.length === 0 ? (
+        ) : tasks.length === 0 ? (
           <View style={styles.emptyCard}>
             <Image source={emptyImage} style={styles.emptyImage} resizeMode="cover" />
             <View style={styles.emptyIcon}>
@@ -211,55 +205,19 @@ export default function AuctionManagementScreen({ onOpenDrawer }: AuctionManagem
             <Text style={styles.emptyTitle}>All clear!</Text>
             <Text style={styles.emptyText}>
               {activeTab === 'incoming'
-                ? 'No lots are waiting. Auctioneer Operations To-Do and Auctionsoft send work here automatically.'
+                ? 'No contracts are waiting for lot listing. Auctionsoft sends work here automatically.'
                 : activeTab === 'in_progress'
                   ? 'No Auction Management drafts are in progress.'
                   : 'No completed contracts yet.'}
             </Text>
             <View style={styles.flowRow}>
-              <Text style={styles.flowMuted}>Auctioneer</Text>
+              <Text style={styles.flowMuted}>Auctionsoft</Text>
               <Text style={styles.flowActive}>Mobile capture</Text>
               <Text style={styles.flowMuted}>Lotting / Op To-Do</Text>
             </View>
           </View>
         ) : (
-          <>
-            {activeTab === 'incoming' && auctioneerIncoming.length > 0 ? (
-              <View style={styles.auctioneerSection}>
-                <View style={styles.auctioneerSectionHeader}>
-                  <Feather name="inbox" size={15} color={colors.accent} />
-                  <Text style={styles.auctioneerSectionTitle}>Auctioneer assignments</Text>
-                </View>
-                <Text style={styles.auctioneerSectionText}>
-                  Lots assigned to your Asset Insight account from Auctioneer Operations To-Do.
-                </Text>
-                {auctioneerIncoming.map((task) => (
-                  <TouchableOpacity key={task.cycleKey} style={styles.auctioneerTaskCard} onPress={() => void openAuctioneerTask(task)} activeOpacity={0.88}>
-                    <View style={styles.taskTitleRow}>
-                      <Text style={styles.taskTitle} numberOfLines={1}>Contract {task.contractNo}</Text>
-                      <View style={styles.statusChip}>
-                        <Text style={styles.statusChipText}>{auctioneerStatusLabel(task.status)}</Text>
-                      </View>
-                    </View>
-                    <Text style={styles.taskMeta} numberOfLines={1}>{task.customerName || 'Customer not set'}</Text>
-                    <Text style={styles.taskMeta} numberOfLines={1}>{task.eventTitle || task.location || 'Auctioneer assignment'}</Text>
-                    <View style={styles.taskFooter}>
-                      <View style={styles.taskMetric}>
-                        <Feather name="layers" size={13} color={colors.accent} />
-                        <Text style={styles.taskMetricText}>{task.lotCount} active lot{task.lotCount === 1 ? '' : 's'}</Text>
-                      </View>
-                      {task.pendingLotCount > 0 ? (
-                        <View style={styles.pendingLotMetric}>
-                          <Feather name="plus-circle" size={13} color={colors.success} />
-                          <Text style={styles.pendingLotMetricText}>{task.pendingLotCount} newly assigned</Text>
-                        </View>
-                      ) : null}
-                    </View>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            ) : null}
-            {tasks.map((task) => {
+          tasks.map((task) => {
             const services = serviceCount(task);
             return (
               <TouchableOpacity
@@ -306,10 +264,10 @@ export default function AuctionManagementScreen({ onOpenDrawer }: AuctionManagem
                 ) : null}
               </TouchableOpacity>
             );
-            })}
-          </>
+          })
         )}
       </ScrollView>
+      </>}
 
       <LotListingFormSheet
         visible={formVisible}
@@ -437,34 +395,6 @@ const createStyles = (colors: AppThemeColors) => StyleSheet.create({
     color: colors.accent,
     fontSize: 18,
     fontWeight: '900',
-  },
-  auctioneerSection: {
-    marginBottom: 14,
-  },
-  auctioneerSectionHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 7,
-    marginBottom: 4,
-  },
-  auctioneerSectionTitle: {
-    color: colors.text,
-    fontSize: 14,
-    fontWeight: '900',
-  },
-  auctioneerSectionText: {
-    color: colors.textMuted,
-    fontSize: 12,
-    lineHeight: 17,
-    marginBottom: 9,
-  },
-  auctioneerTaskCard: {
-    backgroundColor: colors.surface,
-    borderRadius: 10,
-    padding: 14,
-    marginBottom: 10,
-    borderWidth: 1,
-    borderColor: colors.accent,
   },
   centerState: {
     minHeight: 180,
@@ -611,20 +541,6 @@ const createStyles = (colors: AppThemeColors) => StyleSheet.create({
     color: colors.textSecondary,
     fontSize: 11,
     fontWeight: '800',
-  },
-  pendingLotMetric: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-    borderRadius: 8,
-    backgroundColor: colors.successSoft,
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-  },
-  pendingLotMetricText: {
-    color: colors.success,
-    fontSize: 11,
-    fontWeight: '900',
   },
   errorText: {
     marginTop: 10,

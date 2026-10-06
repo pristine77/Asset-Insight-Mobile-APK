@@ -1,17 +1,21 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import axios from "axios";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Dimensions, Platform } from "react-native";
 import { API_BASE_URL, API_ENDPOINTS } from "../config/api";
 import {
   clearSecureSession,
   emitRestrictedDeviceAccess,
   emitSessionInvalidated,
   getDeviceKey,
+  getOrCreateDeviceKey,
   getMemoryAccessToken,
   getRefreshToken,
   setMemoryAccessToken,
 } from "./deviceAccessStorage";
 import { getAndroidReinstallId } from "./deviceReinstallIdentity";
+import { getAppVersionLabel } from './appVersion';
+import { captureAuthOperation, getAuthOperationEpoch, mutateAuthSession, staleAuthOperation } from './authSessionOperation';
 
 // Storage keys
 export const STORAGE_KEYS = {
@@ -33,19 +37,34 @@ const api = axios.create({
 // Request interceptor - add auth token
 api.interceptors.request.use(
   async (config: any) => {
+    const assertCurrent = captureAuthOperation();
+    config._authEpoch = getAuthOperationEpoch();
     const token = getMemoryAccessToken();
     if (token && config.headers) {
       config.headers.Authorization = `Bearer ${token}`;
     }
     const [deviceKey, reinstallId] = await Promise.all([
-      getDeviceKey(),
+      getOrCreateDeviceKey(),
       getAndroidReinstallId(),
     ]);
+    assertCurrent();
     if (deviceKey && config.headers) {
       config.headers["X-Device-Key"] = deviceKey;
     }
     if (reinstallId && config.headers) {
       config.headers["X-Device-Reinstall-Id"] = reinstallId;
+    }
+    if (config.headers) {
+      const screen = Dimensions.get("screen");
+      config.headers["X-Device-Platform"] = Platform.OS === "ios" ? "ios" : "android";
+      config.headers["X-Activity-Source"] = Platform.OS === "ios" ? "ios" : "android";
+      const appVersion = getAppVersionLabel();
+      if (appVersion) config.headers["X-App-Version"] = appVersion;
+      const details = config.data?.details || config.data?.formData || config.data;
+      const activityId = details?.capture_id || details?.client_submission_id || details?.clientSubmissionId || config.data?.clientDraftId;
+      if (typeof activityId === "string" && /^[a-zA-Z0-9._:-]{1,160}$/.test(activityId)) config.headers["X-Activity-Id"] = activityId;
+      config.headers["X-Device-Form-Factor"] =
+        Math.min(screen.width, screen.height) >= 600 ? "tablet" : "mobile";
     }
     return config;
   },
@@ -70,31 +89,16 @@ const processQueue = (error: unknown, token: string | null = null) => {
   failedQueue = [];
 };
 
-const clearSessionAndSignalExpiry = async (refreshToken: string | null) => {
-  try {
-    if (refreshToken) {
-      const [deviceKey, reinstallId] = await Promise.all([
-        getDeviceKey(),
-        getAndroidReinstallId(),
-      ]);
-      await axios.post(
-        `${API_BASE_URL}${API_ENDPOINTS.LOGOUT}`,
-        { token: refreshToken },
-        {
-          headers: {
-            ...(deviceKey ? { "X-Device-Key": deviceKey } : {}),
-            ...(reinstallId ? { "X-Device-Reinstall-Id": reinstallId } : {}),
-          },
-        }
-      ).catch(() => {});
-    }
-  } finally {
+const clearSessionAndSignalExpiry = async (assertCurrent: () => void) =>
+  mutateAuthSession(assertCurrent, async () => {
     await clearSecureSession();
+    assertCurrent();
     await AsyncStorage.removeItem(STORAGE_KEYS.USER);
+    assertCurrent();
     await AsyncStorage.setItem(STORAGE_KEYS.SESSION_EXPIRED, "1");
+    assertCurrent();
     emitSessionInvalidated();
-  }
-};
+  });
 
 const AUTH_STATE_BY_CODE: Record<string, string> = {
   DEVICE_CONTEXT_REQUIRED: "registration_required",
@@ -105,13 +109,30 @@ const AUTH_STATE_BY_CODE: Record<string, string> = {
   IP_BLOCKED: "ip_blocked",
 };
 
+// Public authentication actions use the submitted credentials/code, not an old
+// account's refresh token. Never replay one-time actions after a 401 response.
+function isPublicAuthRequest(url: unknown): boolean {
+  return typeof url === 'string' && /^\/auth\/(?:login|signup|verify-email|resend-verification-code|forgot-password|reset-password-code|reset-password\/[^?]+)(?:\?|$)/.test(url);
+}
+
 api.interceptors.response.use(
-  (response: any) => response,
+  (response: any) => {
+    if (response.config?._authEpoch != null && response.config._authEpoch !== getAuthOperationEpoch()) throw staleAuthOperation();
+    return response;
+  },
   async (error: any) => {
     const originalRequest = error.config;
+    if (originalRequest?._authEpoch != null && originalRequest._authEpoch !== getAuthOperationEpoch()) return Promise.reject(staleAuthOperation());
+    const assertCurrent = captureAuthOperation();
     const status = error.response?.status;
     const responseData = error.response?.data;
     const code = String(responseData?.code || "");
+    const publicAuthRequest = isPublicAuthRequest(originalRequest?.url);
+    if (publicAuthRequest && code === 'DEVICE_CONTEXT_REQUIRED' && !responseData?.challengeToken) {
+      // Invalid request metadata is not a revocation of an existing session.
+      // Keep the recovery screen/code intact and let it display the error.
+      return Promise.reject(error);
+    }
     const restrictedCodes = new Set([
       "DEVICE_CONTEXT_REQUIRED",
       "DEVICE_PENDING",
@@ -127,22 +148,23 @@ api.interceptors.response.use(
         code,
         authState: responseData?.authState || AUTH_STATE_BY_CODE[code],
       };
-      await clearSecureSession();
-      await AsyncStorage.multiRemove([STORAGE_KEYS.USER, STORAGE_KEYS.SESSION_EXPIRED]);
-      if (restricted.authState === "registration_required" && !restricted.challengeToken) {
-        emitSessionInvalidated();
-      } else {
-        await emitRestrictedDeviceAccess(restricted);
-      }
+      await mutateAuthSession(assertCurrent, async () => {
+        await clearSecureSession(); assertCurrent();
+        await AsyncStorage.multiRemove([STORAGE_KEYS.USER, STORAGE_KEYS.SESSION_EXPIRED]); assertCurrent();
+        if (restricted.authState === "registration_required" && !restricted.challengeToken) emitSessionInvalidated();
+        else await emitRestrictedDeviceAccess(restricted, assertCurrent);
+      });
       return Promise.reject(error);
     }
 
-    if ((status === 401 || status === 403) && originalRequest && !originalRequest._retry) {
+    if (status === 401 && originalRequest && !originalRequest._retry && !publicAuthRequest) {
       if (isRefreshing) {
         return new Promise((resolve, reject) => {
           failedQueue.push({ resolve, reject });
         })
           .then((token) => {
+            assertCurrent();
+            originalRequest._retry = true;
             if (originalRequest.headers) {
               originalRequest.headers.Authorization = `Bearer ${token}`;
             }
@@ -156,9 +178,10 @@ api.interceptors.response.use(
 
       try {
         const refreshToken = await getRefreshToken();
+        assertCurrent();
         if (!refreshToken) {
           processQueue(error, null);
-          await clearSessionAndSignalExpiry(null);
+          await clearSessionAndSignalExpiry(assertCurrent);
           return Promise.reject(error);
         }
 
@@ -166,18 +189,21 @@ api.interceptors.response.use(
           getDeviceKey(),
           getAndroidReinstallId(),
         ]);
+        assertCurrent();
         const { data } = await axios.post(
           `${API_BASE_URL}${API_ENDPOINTS.REFRESH_TOKEN}`,
           { token: refreshToken },
           {
+            timeout: 15000,
             headers: {
               ...(deviceKey ? { "X-Device-Key": deviceKey } : {}),
               ...(reinstallId ? { "X-Device-Reinstall-Id": reinstallId } : {}),
             },
           }
         );
-
+        assertCurrent();
         const newAccessToken = data.accessToken;
+        if (typeof newAccessToken !== 'string' || !newAccessToken.trim()) throw new Error('The session refresh response was incomplete. Try again when connected.');
         setMemoryAccessToken(newAccessToken);
 
         processQueue(null, newAccessToken);
@@ -188,6 +214,7 @@ api.interceptors.response.use(
         return api(originalRequest);
       } catch (refreshError) {
         processQueue(refreshError, null);
+        assertCurrent();
         const restricted = (refreshError as any)?.response?.data;
         const restrictedCode = String(restricted?.code || "");
         const normalized = {
@@ -195,18 +222,20 @@ api.interceptors.response.use(
           code: restrictedCode,
           authState: restricted?.authState || AUTH_STATE_BY_CODE[restrictedCode],
         };
-        if (normalized.authState) {
-          await clearSecureSession();
-          await AsyncStorage.multiRemove([STORAGE_KEYS.USER, STORAGE_KEYS.SESSION_EXPIRED]);
-          if (normalized.authState === "registration_required" && !normalized.challengeToken) {
-            emitSessionInvalidated();
-          } else {
-            await emitRestrictedDeviceAccess(normalized);
-          }
+        if (restrictedCodes.has(restrictedCode) || Object.values(AUTH_STATE_BY_CODE).includes(normalized.authState)) {
+          await mutateAuthSession(assertCurrent, async () => {
+            await clearSecureSession(); assertCurrent();
+            await AsyncStorage.multiRemove([STORAGE_KEYS.USER, STORAGE_KEYS.SESSION_EXPIRED]); assertCurrent();
+            if (normalized.authState === "registration_required" && !normalized.challengeToken) emitSessionInvalidated();
+            else await emitRestrictedDeviceAccess(normalized, assertCurrent);
+          });
           return Promise.reject(refreshError);
         }
-        const storedRefreshToken = await getRefreshToken().catch(() => null);
-        await clearSessionAndSignalExpiry(storedRefreshToken);
+        // Connectivity loss, timeout, cancellation, malformed responses and 5xx
+        // must leave the cached owner and secure refresh token available offline.
+        if ([401, 403].includes((refreshError as any)?.response?.status)) {
+          await clearSessionAndSignalExpiry(assertCurrent);
+        }
         return Promise.reject(refreshError);
       } finally {
         isRefreshing = false;

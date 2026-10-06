@@ -1,13 +1,22 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import api from "./api";
+import { createUploadOperation, cancellableUploadRequest, type UploadOperation } from './uploadCancellation';
 import { API_ENDPOINTS } from "../config/api";
-import { uploadReportFilesDirectToR2, type DirectUploadFile } from "./directR2UploadService";
+import { isRetryableRequestError } from "./connectivityService";
+import { restoreImageWatermarkPreference } from "../utils/watermarkPreference";
+import {
+  uploadReportFilesDirectToR2,
+  type DirectUploadFile,
+  type DirectUploadProgressCallback,
+} from "./directR2UploadService";
 import type { ReportWorkflowStage } from './assetService';
 
 export type LotListingMode = 'single_lot' | 'per_item' | 'per_photo';
 
 export interface LotListingDetails {
+  capture_id?: string;
   client_submission_id?: string;
+  supersedes_client_submission_id?: string;
   auctioneer_work_item_id?: string;
   force_new?: boolean;
   contract_no: string;
@@ -19,12 +28,17 @@ export interface LotListingDetails {
   currency?: string;
   include_damage_analysis?: boolean;
   bank_photos_enabled?: boolean;
+  watermark_images?: boolean;
   valuation_methods?: Array<'FML' | 'TKV' | 'OLV' | 'FLV'>;
   mixed_lots?: Array<{
     count: number;
     extra_count?: number;
+    video_count?: number;
     cover_index?: number;
     mode: LotListingMode;
+    source_key?: string;
+    source_lot_id?: string;
+    source_submission_id?: string;
   }>;
   focus_boxes?: Array<{ imageIndex: number; x: number; y: number; w: number; h: number }>;
   progress_id?: string;
@@ -44,6 +58,7 @@ export interface LotFile {
   uri: string;
   name: string;
   type: string;
+  size?: number;
   captureOrder?: number;
   originalOrder?: number;
 }
@@ -52,6 +67,7 @@ export interface LotListingLot {
   id: string;
   files: LotFile[];
   extraFiles?: LotFile[];
+  videoFile?: LotFile;
   lot_number: string | number;
   mode?: LotListingMode;
   coverIndex?: number;
@@ -73,6 +89,7 @@ export interface LotListing {
     location?: string;
     include_damage_analysis?: boolean;
     bank_photos_enabled?: boolean;
+    watermark_images?: boolean;
     valuation_methods?: Array<'FML' | 'TKV' | 'OLV' | 'FLV'>;
     lots?: any[];
   };
@@ -131,21 +148,33 @@ export interface ProgressData {
 
 class LotListingService {
   /**
-   * Create a new lot listing with images - uses same AI processing as Asset
+   * Create a new lot listing with images - uses same AI processing as Asset.
+   * options.operation is the caller's upload operation: pausing it
+   * (pauseUploadOperation) stops this transfer, direct or multipart, and no
+   * other upload.
    */
   async createLotListing(
     details: LotListingDetails,
     lots: LotListingLot[],
-    onUploadProgress?: (progress: number) => void
+    onUploadProgress?: DirectUploadProgressCallback,
+    options?: { operation?: UploadOperation }
   ): Promise<{ jobId: string; message: string; reportId?: string; status?: string; phase?: string }> {
-    const mixedLots = lots.map((lot) => ({
+    const operation = createUploadOperation(options?.operation);
+    const mixedLots = lots.map((lot, index) => ({
+      ...(details.auctioneer_work_item_id ? {
+        source_key: details.mixed_lots?.[index]?.source_key,
+        source_lot_id: details.mixed_lots?.[index]?.source_lot_id,
+        source_submission_id: details.mixed_lots?.[index]?.source_submission_id,
+      } : {}),
       count: lot.files.length,
       extra_count: lot.extraFiles?.length || 0,
+      video_count: lot.videoFile ? 1 : 0,
       cover_index: lot.coverIndex || 0,
       mode: lot.mode || 'single_lot',
     }));
     const directDetails = {
       ...details,
+      watermark_images: restoreImageWatermarkPreference(details.watermark_images),
       include_damage_analysis: details.include_damage_analysis !== false,
       valuation_methods: details.valuation_methods?.length ? details.valuation_methods : ['FML'],
       mixed_lots: mixedLots,
@@ -159,6 +188,7 @@ class LotListingService {
             uri: file.uri,
             name: file.name || `lot-${lotIndex + 1}-main-${imageIndex + 1}.jpg`,
             type: file.type || "image/jpeg",
+            size: file.size,
             fieldname: "images",
             lotIndex,
             imageIndex,
@@ -172,6 +202,7 @@ class LotListingService {
             uri: file.uri,
             name: file.name || `lot-${lotIndex + 1}-extra-${imageIndex + 1}.jpg`,
             type: file.type || "image/jpeg",
+            size: file.size,
             fieldname: "images",
             lotIndex,
             imageIndex,
@@ -180,15 +211,31 @@ class LotListingService {
             role: "extra",
           });
         });
+        if (lot.videoFile) {
+          files.push({
+            uri: lot.videoFile.uri,
+            name: lot.videoFile.name || `lot-${lotIndex + 1}-walkthrough.mp4`,
+            type: lot.videoFile.type || 'video/mp4',
+            size: lot.videoFile.size,
+            fieldname: 'videos',
+            lotIndex,
+            imageIndex: 0,
+            role: 'video',
+          });
+        }
       });
 
-      return await uploadReportFilesDirectToR2({
+      const response = await uploadReportFilesDirectToR2({
         endpoint: "/lot-listing",
         details: directDetails,
         files,
         onProgress: onUploadProgress,
+        operation,
       });
+      operation.assertActive();
+      return response;
     } catch (error: any) {
+      operation.assertActive();
       const status = Number(error?.response?.status || 0);
       if (![404, 405, 501].includes(status)) throw error;
       console.warn("[LotListingService] Direct upload is unsupported; using legacy multipart upload.");
@@ -227,14 +274,24 @@ class LotListingService {
         formData.append("images", fileObj);
         imageIndex++;
       }
+      if (lot.videoFile) {
+        formData.append('videos', {
+          uri: lot.videoFile.uri,
+          name: lot.videoFile.name || `video-${lot.id}.mp4`,
+          type: lot.videoFile.type || 'video/mp4',
+        } as any);
+      }
     }
 
-    const response = await api.post(API_ENDPOINTS.CREATE_LOT_LISTING, formData, {
+    operation.assertActive();
+    const response = await cancellableUploadRequest(operation, (signal) => api.post(API_ENDPOINTS.CREATE_LOT_LISTING, formData, {
+      signal,
       headers: {
         "Content-Type": "multipart/form-data",
       },
       timeout: 300000, // 5 minutes for large uploads
       onUploadProgress: (progressEvent: any) => {
+        if (!operation.isActive()) return;
         if (onUploadProgress && progressEvent.total) {
           const progress = Math.min(
             100,
@@ -243,7 +300,7 @@ class LotListingService {
           onUploadProgress(progress);
         }
       },
-    });
+    }));
 
     return response.data;
   }
@@ -321,14 +378,22 @@ class LotListingService {
     intervalMs: number = 2000
   ): Promise<void> {
     return new Promise((resolve, reject) => {
+      let transientFailures = 0;
+      const maxTransientFailures = 20;
       const poll = async () => {
         try {
           const data = await this.getProgress(jobId);
           if (!data) {
-            reject(new Error("Progress not found"));
+            transientFailures += 1;
+            if (transientFailures > maxTransientFailures) {
+              reject(new Error("Preview processing is continuing, but its progress is temporarily unavailable."));
+              return;
+            }
+            setTimeout(poll, Math.min(15000, intervalMs * 2 ** Math.min(transientFailures, 3)));
             return;
           }
 
+          transientFailures = 0;
           onProgress(data);
 
           if (data.phase === "done" || data.phase === "error") {
@@ -338,6 +403,11 @@ class LotListingService {
 
           setTimeout(poll, intervalMs);
         } catch (e) {
+          if (isRetryableRequestError(e) && transientFailures < maxTransientFailures) {
+            transientFailures += 1;
+            setTimeout(poll, Math.min(15000, intervalMs * 2 ** Math.min(transientFailures, 3)));
+            return;
+          }
           reject(e);
         }
       };

@@ -11,7 +11,6 @@ import {
   Alert,
   Linking,
   Modal,
-  KeyboardAvoidingView,
   Platform,
   Image,
   useWindowDimensions,
@@ -44,6 +43,7 @@ import crmTaskApi, {
 import type { CrmDashboardTaskFilter } from '../services/crmService';
 import { useAuth } from '../context/AuthContext';
 import api from '../services/api';
+import CrmModalFrame, { crmTouchTarget } from '../components/crm/CrmModalFrame';
 
 interface CrmTasksScreenProps {
   onOpenDrawer: () => void;
@@ -264,11 +264,25 @@ type CallOption = {
   value: string;
 };
 
-function normalizePhoneIdentity(value: string): string {
+const PHONE_PLACEHOLDER_PATTERN = /^(?:researching(?:\.{3})?|pending|unknown|n\/?a|none|not\s+(?:available|found|provided)|no\s+(?:phone|number)|tbd|-+)$/i;
+
+function parseDialablePhone(value?: string): { display: string; dial: string; identity: string } | null {
   const raw = String(value || '').trim();
-  if (!raw) return '';
-  const digits = raw.replace(/\D/g, '');
-  return digits || raw.toLowerCase();
+  if (!raw || PHONE_PLACEHOLDER_PATTERN.test(raw)) return null;
+
+  const extensionMatch = raw.match(/(?:ext\.?|extension|x)\s*(\d{1,8})\s*$/i);
+  const extension = extensionMatch?.[1] || '';
+  const main = extensionMatch ? raw.slice(0, extensionMatch.index).trim() : raw;
+  const digits = main.replace(/\D/g, '');
+  if (digits.length < 7 || digits.length > 15) return null;
+  const identityDigits = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+
+  const dial = `${main.trim().startsWith('+') ? '+' : ''}${digits}${extension ? `,${extension}` : ''}`;
+  return {
+    display: raw,
+    dial,
+    identity: `${identityDigits}${extension ? `x${extension}` : ''}`,
+  };
 }
 
 function hasAnyCallNumber(task: CrmTaskItem): boolean {
@@ -280,15 +294,16 @@ function buildCallOptions(task: CrmTaskItem): CallOption[] {
   const seen = new Set<string>();
 
   const push = (label: string, value?: string) => {
-    const raw = String(value || '').trim();
-    if (!raw) return;
-    const identity = normalizePhoneIdentity(raw);
-    if (!identity || seen.has(identity)) return;
-    seen.add(identity);
-    options.push({ label, value: raw });
+    const parsed = parseDialablePhone(value);
+    if (!parsed || seen.has(parsed.identity)) return;
+    seen.add(parsed.identity);
+    options.push({ label, value: parsed.display });
   };
 
-  push('Primary', task.phoneFormatted || task.phoneRaw);
+  // Check both fields independently: an older record can contain a placeholder
+  // formatted value while retaining a valid raw primary number.
+  push('Primary', task.phoneFormatted);
+  push('Primary', task.phoneRaw);
   (task.contactPhones || []).forEach((phone, index) => push(`Contact Phone ${index + 1}`, phone));
   (task.contactMobilePhones || []).forEach((phone, index) =>
     push(`Contact Mobile ${index + 1}`, phone)
@@ -1075,7 +1090,7 @@ const CrmTasksScreen = ({
   const openDialer = async (task: CrmTaskItem) => {
     const options = buildCallOptions(task);
     if (options.length === 0) {
-      Alert.alert('No Phone', 'This task does not have a phone number.');
+      Alert.alert('No phone available', 'This contact does not have a valid phone number.');
       return;
     }
 
@@ -1331,21 +1346,14 @@ const CrmTasksScreen = ({
   }, [dialingNumber]);
 
   const dialSelectedNumber = useCallback(async (value: string) => {
-    const raw = String(value || '').trim();
-    if (!raw) return;
-
-    const cleaned = raw.replace(/[^\d+]/g, '');
-    const digitsOnly = cleaned.startsWith('+')
-      ? `+${cleaned.slice(1).replace(/\+/g, '')}`
-      : cleaned.replace(/\+/g, '');
-
-    if (!digitsOnly) {
+    const parsed = parseDialablePhone(value);
+    if (!parsed) {
       Alert.alert('Unable to call', 'The selected number is invalid.');
       return;
     }
 
-    const url = `tel:${digitsOnly}`;
-    setDialingNumber(raw);
+    const url = `tel:${parsed.dial}`;
+    setDialingNumber(parsed.display);
     try {
       const canOpen = await Linking.canOpenURL(url);
       if (!canOpen) {
@@ -2348,7 +2356,7 @@ const CrmTasksScreen = ({
                   <View style={[styles.taskInfoRow, isCompact && styles.taskInfoRowCompact]}>
                     <Feather name="phone" size={14} color="#6B7280" />
                     <Text style={[styles.taskInfoText, isCompact && styles.taskInfoTextCompact]}>
-                      {task.phoneFormatted || task.phoneRaw || 'No phone'}
+                      {buildCallOptions(task)[0]?.value || 'No phone available'}
                       {callOptionCount > 1 ? ` (+${callOptionCount - 1} more)` : ''}
                     </Text>
                   </View>
@@ -2495,6 +2503,9 @@ const CrmTasksScreen = ({
                         styles.callBtn,
                       ]}
                       onPress={() => openDialer(task)}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Call ${task.clientName || 'client'}`}
+                      accessibilityState={{ disabled: !hasAnyCallNumber(task) }}
                       disabled={!hasAnyCallNumber(task)}>
                       <Feather name="phone-call" size={isVeryCompact ? 14 : 15} color="#0C4A6E" />
                       {!isVeryCompact && (
@@ -2511,7 +2522,7 @@ const CrmTasksScreen = ({
                         isVeryCompact && styles.actionBtnVeryCompact,
                         styles.emailBtn,
                       ]}
-                      onPress={() => openEmailModal(task)}>
+                      onPress={() => openEmailModal(task)} accessibilityRole="button" accessibilityLabel={`Email ${task.clientName || 'client'}`}>
                       <Feather name="mail" size={isVeryCompact ? 14 : 15} color="#fff" />
                       {!isVeryCompact && (
                         <Text
@@ -2527,7 +2538,7 @@ const CrmTasksScreen = ({
                         isVeryCompact && styles.actionBtnVeryCompact,
                         styles.updateBtn,
                       ]}
-                      onPress={() => openUpdateModal(task)}>
+                      onPress={() => openUpdateModal(task)} accessibilityRole="button" accessibilityLabel={`Update ${task.clientName || 'task'}`}>
                       <Feather name="edit-3" size={isVeryCompact ? 14 : 15} color="#fff" />
                       {!isVeryCompact && (
                         <Text
@@ -2552,6 +2563,9 @@ const CrmTasksScreen = ({
                         styles.calendarBtn,
                       ]}
                       onPress={() => void addTaskToOutlookCalendar(task)}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Add ${task.clientName || 'task'} to calendar`}
+                      accessibilityState={{ disabled: outlookBulkSyncing || outlookSyncingTaskId === task._id, busy: outlookSyncingTaskId === task._id }}
                       disabled={
                         outlookBulkSyncing ||
                         outlookSyncingTaskId === task._id
@@ -2575,7 +2589,7 @@ const CrmTasksScreen = ({
                         isVeryCompact && styles.actionBtnVeryCompact,
                         styles.transferBtn,
                       ]}
-                      onPress={() => void openTransferModal(task)}>
+                      onPress={() => void openTransferModal(task)} accessibilityRole="button" accessibilityLabel={`Transfer ${task.clientName || 'task'}`}>
                       <Feather name="repeat" size={isVeryCompact ? 14 : 15} color="#fff" />
                       {!isVeryCompact && (
                         <Text style={[styles.actionBtnText, isCompact && styles.actionBtnTextCompact]}>
@@ -2596,23 +2610,21 @@ const CrmTasksScreen = ({
         transparent
         animationType="fade"
         onRequestClose={() => !quickAdding && setQuickAddOpen(false)}>
-        <KeyboardAvoidingView
-          style={[styles.centerModalOverlay, isVeryCompact && styles.centerModalOverlayVeryCompact]}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}>
-          <View style={[styles.quickAddModal, isVeryCompact && styles.quickAddModalCompact]}>
+        <CrmModalFrame label="Quick Add lead form" onClose={() => !quickAdding && setQuickAddOpen(false)}
+          cardStyle={[styles.quickAddModal, isVeryCompact && styles.quickAddModalCompact]}>
             <View style={styles.modalHeader}>
               <View>
                 <Text style={styles.modalTitle}>Quick Add</Text>
                 <Text style={styles.quickAddModalSubtitle}>Organic lead</Text>
               </View>
-              <TouchableOpacity disabled={quickAdding} onPress={() => setQuickAddOpen(false)} style={styles.quickAddCloseBtn}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close Quick Add" accessibilityState={{ disabled: quickAdding }} disabled={quickAdding} onPress={() => setQuickAddOpen(false)} style={[styles.quickAddCloseBtn, crmTouchTarget]}>
                 <Feather name="x" size={18} color="#334155" />
               </TouchableOpacity>
             </View>
             <TextInput
               style={styles.quickAddInput}
               value={quickAddName}
+              accessibilityLabel="Lead name"
               onChangeText={setQuickAddName}
               placeholder="Name"
               placeholderTextColor="#94A3B8"
@@ -2621,6 +2633,7 @@ const CrmTasksScreen = ({
             <TextInput
               style={styles.quickAddInput}
               value={quickAddPhone}
+              accessibilityLabel="Lead phone number"
               onChangeText={setQuickAddPhone}
               placeholder="Phone number"
               placeholderTextColor="#94A3B8"
@@ -2636,6 +2649,9 @@ const CrmTasksScreen = ({
                     key={option.value}
                     disabled={quickAdding}
                     onPress={() => setQuickAddSpecialization(option.value)}
+                    accessibilityRole="radio"
+                    accessibilityLabel={option.label}
+                    accessibilityState={{ selected, disabled: quickAdding }}
                     style={[styles.quickAddSpecializationChip, selected && styles.quickAddSpecializationChipActive]}
                     activeOpacity={0.8}>
                     <Text
@@ -2653,6 +2669,9 @@ const CrmTasksScreen = ({
             <TouchableOpacity
               disabled={quickAdding}
               style={styles.quickAddDateButton}
+              accessibilityRole="button"
+              accessibilityLabel={`Due date: ${formatQuickAddDueDate(quickAddDueDate)}`}
+              accessibilityState={{ disabled: quickAdding, expanded: showQuickAddDuePicker }}
               onPress={() => setShowQuickAddDuePicker(true)}
               activeOpacity={0.8}>
               <Feather name="calendar" size={16} color="#0284C7" />
@@ -2669,6 +2688,7 @@ const CrmTasksScreen = ({
             <TextInput
               style={[styles.quickAddInput, styles.quickAddNotesInput]}
               value={quickAddNotes}
+              accessibilityLabel="Lead notes"
               onChangeText={setQuickAddNotes}
               placeholder="Notes"
               placeholderTextColor="#94A3B8"
@@ -2677,15 +2697,14 @@ const CrmTasksScreen = ({
               editable={!quickAdding}
             />
             <View style={styles.modalFooterRow}>
-              <TouchableOpacity disabled={quickAdding} onPress={() => setQuickAddOpen(false)} style={styles.cancelBtn}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Cancel Quick Add" accessibilityState={{ disabled: quickAdding }} disabled={quickAdding} onPress={() => setQuickAddOpen(false)} style={[styles.cancelBtn, crmTouchTarget]}>
                 <Text style={styles.cancelBtnText}>Cancel</Text>
               </TouchableOpacity>
-              <TouchableOpacity disabled={quickAdding} onPress={submitQuickAdd} style={[styles.submitBtn, styles.quickAddCreateBtn, quickAdding && styles.quickAddDisabledBtn]}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Create lead" accessibilityState={{ disabled: quickAdding, busy: quickAdding }} disabled={quickAdding} onPress={submitQuickAdd} style={[styles.submitBtn, styles.quickAddCreateBtn, crmTouchTarget, quickAdding && styles.quickAddDisabledBtn]}>
                 <Text style={styles.submitBtnText}>{quickAdding ? 'Creating...' : 'Create'}</Text>
               </TouchableOpacity>
             </View>
-          </View>
-        </KeyboardAvoidingView>
+        </CrmModalFrame>
       </Modal>
 
       <Modal
@@ -2693,24 +2712,16 @@ const CrmTasksScreen = ({
         transparent
         animationType="slide"
         onRequestClose={() => closeUpdateModal()}>
-        <KeyboardAvoidingView
-          style={styles.modalOverlay}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}>
-          <SafeAreaView edges={['bottom']} style={styles.modalSafeArea}>
-            <View style={[styles.modalCard, isCompact && styles.modalCardCompact]}>
+        <CrmModalFrame label="Task update form" onClose={() => closeUpdateModal()}
+          cardStyle={[styles.modalCard, isCompact && styles.modalCardCompact]}>
               <View style={styles.modalHeader}>
                 <Text style={styles.modalTitle}>Task Update</Text>
-                <TouchableOpacity onPress={() => closeUpdateModal()} disabled={submitting}>
+                <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close task update" accessibilityState={{ disabled: submitting }} style={crmTouchTarget} onPress={() => closeUpdateModal()} disabled={submitting}>
                   <Feather name="x" size={20} color="#6B7280" />
                 </TouchableOpacity>
               </View>
 
-              <ScrollView
-                style={styles.modalBodyScroll}
-                contentContainerStyle={styles.modalBodyContent}
-                keyboardShouldPersistTaps="handled"
-                showsVerticalScrollIndicator={false}>
+              <View style={[styles.modalBodyScroll, styles.modalBodyContent]}>
                 <Text style={styles.modalClientName}>{selectedTask?.clientName || 'Client'}</Text>
                 {selectedTask?.companyName ? (
                   <Text style={styles.modalMetaText}>Company: {selectedTask.companyName}</Text>
@@ -2755,11 +2766,13 @@ const CrmTasksScreen = ({
                 </TouchableOpacity>
                 {sectionContactOpen ? (
                   <View style={accStyles.body}>
-                    {selectedTask?.phoneFormatted || selectedTask?.phoneRaw ? (
+                    {selectedTaskCallOptions.length > 0 ? (
                       <Text style={styles.modalMetaText}>
-                        Phone: {selectedTask.phoneFormatted || selectedTask.phoneRaw}
+                        Phone: {selectedTaskCallOptions[0]?.value}
                       </Text>
-                    ) : null}
+                    ) : (
+                      <Text style={styles.modalMetaText}>No phone available</Text>
+                    )}
                     {selectedTaskCallOptions.length > 0 ? (
                       <View style={styles.inlineCallList}>
                         {selectedTaskCallOptions.map((option, index) => (
@@ -2987,6 +3000,9 @@ const CrmTasksScreen = ({
                   {CRM_STATUSES.map((status) => (
                     <TouchableOpacity
                       key={status}
+                      accessibilityRole="radio"
+                      accessibilityLabel={`Task status: ${statusText(status)}`}
+                      accessibilityState={{ selected: updateStatus === status }}
                       style={[
                         styles.statusOption,
                         isVeryCompact && styles.statusOptionVeryCompact,
@@ -3071,6 +3087,7 @@ const CrmTasksScreen = ({
                 <TextInput
                   style={[styles.commentInput, isVeryCompact && styles.commentInputVeryCompact]}
                   value={comment}
+                  accessibilityLabel="Task comment"
                   onChangeText={setComment}
                   placeholder="Add call notes or update details"
                   placeholderTextColor="#9CA3AF"
@@ -3183,6 +3200,7 @@ const CrmTasksScreen = ({
                                 value={editingComment}
                                 onChangeText={setEditingComment}
                                 placeholder="Edit message"
+                                accessibilityLabel="Edit activity message"
                                 placeholderTextColor="#94A3B8"
                                 multiline
                               />
@@ -3383,12 +3401,18 @@ const CrmTasksScreen = ({
                 <View style={[styles.modalFooterRow, isVeryCompact && styles.modalFooterRowVeryCompact]}>
                   <TouchableOpacity
                     style={styles.cancelBtn}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cancel task update"
+                    accessibilityState={{ disabled: submitting }}
                     onPress={() => closeUpdateModal()}
                     disabled={submitting}>
                     <Text style={styles.cancelBtnText}>Cancel</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={styles.submitBtn}
+                    accessibilityRole="button"
+                    accessibilityLabel="Submit task update"
+                    accessibilityState={{ disabled: submitting, busy: submitting }}
                     onPress={submitUpdate}
                     disabled={submitting}>
                     {submitting ? (
@@ -3398,10 +3422,8 @@ const CrmTasksScreen = ({
                     )}
                   </TouchableOpacity>
                 </View>
-              </ScrollView>
-            </View>
-          </SafeAreaView>
-        </KeyboardAvoidingView>
+              </View>
+        </CrmModalFrame>
       </Modal>
 
       <Modal
@@ -3409,26 +3431,22 @@ const CrmTasksScreen = ({
         transparent
         animationType="slide"
         onRequestClose={closeEmailModal}>
-        <KeyboardAvoidingView
-          style={styles.modalOverlay}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}>
-          <SafeAreaView edges={['bottom']} style={styles.modalSafeArea}>
-            <View style={[styles.modalCard, isCompact && styles.modalCardCompact]}>
+        <CrmModalFrame label="Compose email form" onClose={closeEmailModal}
+          cardStyle={[styles.modalCard, isCompact && styles.modalCardCompact]}>
               <View style={styles.modalHeader}>
                 <Text style={styles.modalTitle}>Compose Email</Text>
                 <TouchableOpacity
                   onPress={closeEmailModal}
+                  accessibilityRole="button"
+                  accessibilityLabel="Close email"
+                  accessibilityState={{ disabled: emailRewriting || emailTranscribing }}
+                  style={crmTouchTarget}
                   disabled={emailRewriting || emailTranscribing}>
                   <Feather name="x" size={20} color="#6B7280" />
                 </TouchableOpacity>
               </View>
 
-              <ScrollView
-                style={styles.modalBodyScroll}
-                contentContainerStyle={styles.modalBodyContent}
-                keyboardShouldPersistTaps="handled"
-                showsVerticalScrollIndicator={false}>
+              <View style={[styles.modalBodyScroll, styles.modalBodyContent]}>
                 <Text style={styles.modalClientName}>
                   To: {emailTask?.clientName || 'Client'} {emailTo ? `<${emailTo}>` : '(no email)'}
                 </Text>
@@ -3437,6 +3455,7 @@ const CrmTasksScreen = ({
                 <TextInput
                   style={emailStyles.fieldInput}
                   value={emailTo}
+                  accessibilityLabel="Recipient email"
                   onChangeText={setEmailTo}
                   placeholder="recipient@email.com"
                   placeholderTextColor="#9CA3AF"
@@ -3448,6 +3467,7 @@ const CrmTasksScreen = ({
                 <TextInput
                   style={emailStyles.fieldInput}
                   value={emailSubject}
+                  accessibilityLabel="Email subject"
                   onChangeText={setEmailSubject}
                   placeholder="Email subject (or leave blank for Software to generate)"
                   placeholderTextColor="#9CA3AF"
@@ -3542,6 +3562,7 @@ const CrmTasksScreen = ({
                   <TextInput
                     style={[emailStyles.bodyInput, isVeryCompact && emailStyles.bodyInputVeryCompact]}
                     value={emailBody}
+                    accessibilityLabel="Email message"
                     onChangeText={setEmailBody}
                     placeholder="Type your email body or use voice to dictate..."
                     placeholderTextColor="#9CA3AF"
@@ -3563,22 +3584,26 @@ const CrmTasksScreen = ({
                 <View style={styles.modalFooterRow}>
                   <TouchableOpacity
                     style={styles.cancelBtn}
+                    accessibilityRole="button"
+                    accessibilityLabel="Cancel email"
+                    accessibilityState={{ disabled: emailRewriting || emailTranscribing }}
                     onPress={closeEmailModal}
                     disabled={emailRewriting || emailTranscribing}>
                     <Text style={styles.cancelBtnText}>Cancel</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={[styles.submitBtn, emailStyles.sendBtn]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Send email"
+                    accessibilityState={{ disabled: emailRewriting || emailTranscribing || !emailTo.trim() }}
                     onPress={() => void sendEmail()}
                     disabled={emailRewriting || emailTranscribing || !emailTo.trim()}>
                     <Feather name="send" size={16} color="#fff" />
                     <Text style={styles.submitBtnText}>Send Email</Text>
                   </TouchableOpacity>
                 </View>
-              </ScrollView>
-            </View>
-          </SafeAreaView>
-        </KeyboardAvoidingView>
+              </View>
+        </CrmModalFrame>
       </Modal>
 
       <Modal
@@ -3586,11 +3611,10 @@ const CrmTasksScreen = ({
         transparent
         animationType="fade"
         onRequestClose={closeEmailClientChooser}>
-        <View style={[styles.centerModalOverlay, isVeryCompact && styles.centerModalOverlayVeryCompact]}>
-          <View style={chooserStyles.card}>
+        <CrmModalFrame label="Choose email application" onClose={closeEmailClientChooser} cardStyle={chooserStyles.card}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Open Email With</Text>
-              <TouchableOpacity onPress={closeEmailClientChooser}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close email application chooser" style={crmTouchTarget} onPress={closeEmailClientChooser}>
                 <Feather name="x" size={20} color="#6B7280" />
               </TouchableOpacity>
             </View>
@@ -3639,8 +3663,7 @@ const CrmTasksScreen = ({
             <TouchableOpacity style={chooserStyles.cancelBtn} onPress={closeEmailClientChooser}>
               <Text style={chooserStyles.cancelBtnText}>Cancel</Text>
             </TouchableOpacity>
-          </View>
-        </View>
+        </CrmModalFrame>
       </Modal>
 
       <Modal
@@ -3648,11 +3671,8 @@ const CrmTasksScreen = ({
         transparent
         animationType="fade"
         onRequestClose={closeCalendarSyncModal}>
-        <KeyboardAvoidingView
-          style={[styles.centerModalOverlay, isVeryCompact && styles.centerModalOverlayVeryCompact]}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}>
-          <View style={[styles.calendarSyncModalCard, isCompact && styles.transferModalCardCompact, isVeryCompact && styles.calendarSyncModalCardVeryCompact]}>
+        <CrmModalFrame label="Calendar task selection" onClose={closeCalendarSyncModal}
+          cardStyle={[styles.calendarSyncModalCard, isCompact && styles.transferModalCardCompact, isVeryCompact && styles.calendarSyncModalCardVeryCompact]}>
             <View style={styles.modalHeader}>
               <View style={styles.calendarSyncHeaderTextWrap}>
                 <Text style={styles.modalTitle}>Sync Tasks to Calendar</Text>
@@ -3660,7 +3680,7 @@ const CrmTasksScreen = ({
                   {calendarSyncSelectedCount} selected of {tasks.length}
                 </Text>
               </View>
-              <TouchableOpacity onPress={closeCalendarSyncModal} disabled={outlookBulkSyncing}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close calendar sync" accessibilityState={{ disabled: outlookBulkSyncing }} style={crmTouchTarget} onPress={closeCalendarSyncModal} disabled={outlookBulkSyncing}>
                 <Feather name="x" size={20} color="#6B7280" />
               </TouchableOpacity>
             </View>
@@ -3670,6 +3690,7 @@ const CrmTasksScreen = ({
               <TextInput
                 style={styles.calendarSyncSearchInput}
                 value={calendarSyncSearchText}
+                accessibilityLabel="Search calendar tasks"
                 onChangeText={setCalendarSyncSearchText}
                 placeholder="Search client, company, email, phone"
                 placeholderTextColor="#9CA3AF"
@@ -3686,6 +3707,9 @@ const CrmTasksScreen = ({
                 return (
                   <TouchableOpacity
                     key={`calendar-sync-${option.key}`}
+                    accessibilityRole="radio"
+                    accessibilityLabel={option.label}
+                    accessibilityState={{ selected: active, disabled: outlookBulkSyncing }}
                     style={[
                       styles.calendarSyncFilterChip,
                       active && styles.calendarSyncFilterChipActive,
@@ -3725,13 +3749,16 @@ const CrmTasksScreen = ({
                 <Text style={styles.emptySubtitle}>No tasks match the current search or filter.</Text>
               </View>
             ) : (
-              <ScrollView style={styles.calendarSyncTaskList} nestedScrollEnabled>
+              <ScrollView style={styles.calendarSyncTaskList} nestedScrollEnabled keyboardShouldPersistTaps="handled">
                 {calendarSyncFilteredTasks.map((task) => {
                   const selected = calendarSyncSelectedTaskIds.includes(task._id);
                   const badge = getStatusBadge(task.status);
                   return (
                     <TouchableOpacity
                       key={`calendar-sync-row-${task._id}`}
+                      accessibilityRole="checkbox"
+                      accessibilityLabel={task.clientName || 'Client'}
+                      accessibilityState={{ checked: selected, disabled: outlookBulkSyncing }}
                       style={[
                         styles.calendarSyncTaskRow,
                         selected && styles.calendarSyncTaskRowSelected,
@@ -3792,8 +3819,7 @@ const CrmTasksScreen = ({
                 )}
               </TouchableOpacity>
             </View>
-          </View>
-        </KeyboardAvoidingView>
+        </CrmModalFrame>
       </Modal>
 
       <Modal
@@ -3801,14 +3827,11 @@ const CrmTasksScreen = ({
         transparent
         animationType="fade"
         onRequestClose={() => closeTransferModal()}>
-        <KeyboardAvoidingView
-          style={[styles.centerModalOverlay, isVeryCompact && styles.centerModalOverlayVeryCompact]}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}>
-          <View style={[styles.transferModalCard, isCompact && styles.transferModalCardCompact, isVeryCompact && styles.transferModalCardVeryCompact]}>
+        <CrmModalFrame label="Transfer task form" onClose={() => closeTransferModal()}
+          cardStyle={[styles.transferModalCard, isCompact && styles.transferModalCardCompact, isVeryCompact && styles.transferModalCardVeryCompact]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Transfer Task</Text>
-              <TouchableOpacity onPress={() => closeTransferModal()} disabled={transferSubmitting}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close transfer task" accessibilityState={{ disabled: transferSubmitting }} style={crmTouchTarget} onPress={() => closeTransferModal()} disabled={transferSubmitting}>
                 <Feather name="x" size={20} color="#6B7280" />
               </TouchableOpacity>
             </View>
@@ -3824,12 +3847,15 @@ const CrmTasksScreen = ({
             ) : transferAgents.length === 0 ? (
               <Text style={styles.timelineEmptyText}>No CRM agents available for transfer.</Text>
             ) : (
-              <ScrollView style={styles.transferAgentList} nestedScrollEnabled>
+              <ScrollView style={styles.transferAgentList} nestedScrollEnabled keyboardShouldPersistTaps="handled">
                 {transferAgents.map((agent) => {
                   const selected = transferAgentId === agent._id;
                   return (
                     <TouchableOpacity
                       key={agent._id}
+                      accessibilityRole="radio"
+                      accessibilityLabel={crmUserLabel(agent)}
+                      accessibilityState={{ selected }}
                       style={[
                         styles.transferAgentItem,
                         selected && styles.transferAgentItemActive,
@@ -3868,6 +3894,7 @@ const CrmTasksScreen = ({
             <TextInput
               style={styles.transferNoteInput}
               value={transferNote}
+              accessibilityLabel="Transfer note"
               onChangeText={setTransferNote}
               placeholder="Write a quick note for the receiving agent"
               placeholderTextColor="#9CA3AF"
@@ -3880,12 +3907,18 @@ const CrmTasksScreen = ({
             <View style={styles.modalFooterRow}>
               <TouchableOpacity
                 style={styles.cancelBtn}
+                accessibilityRole="button"
+                accessibilityLabel="Cancel task transfer"
+                accessibilityState={{ disabled: transferSubmitting }}
                 onPress={() => closeTransferModal()}
                 disabled={transferSubmitting}>
                 <Text style={styles.cancelBtnText}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.submitBtn, styles.transferSendBtn]}
+                accessibilityRole="button"
+                accessibilityLabel="Send transfer request"
+                accessibilityState={{ disabled: transferSubmitting || !transferAgentId, busy: transferSubmitting }}
                 onPress={() => void submitTransferRequest()}
                 disabled={transferSubmitting || !transferAgentId}>
                 {transferSubmitting ? (
@@ -3895,8 +3928,7 @@ const CrmTasksScreen = ({
                 )}
               </TouchableOpacity>
             </View>
-          </View>
-        </KeyboardAvoidingView>
+        </CrmModalFrame>
       </Modal>
 
       <Modal
@@ -3904,11 +3936,11 @@ const CrmTasksScreen = ({
         transparent
         animationType="fade"
         onRequestClose={closeTransferInboxModal}>
-        <View style={[styles.centerModalOverlay, isVeryCompact && styles.centerModalOverlayVeryCompact]}>
-          <View style={[styles.callModalCard, isCompact && styles.callModalCardCompact, isVeryCompact && styles.callModalCardVeryCompact]}>
+        <CrmModalFrame label="Transfer requests" onClose={closeTransferInboxModal}
+          cardStyle={[styles.callModalCard, isCompact && styles.callModalCardCompact, isVeryCompact && styles.callModalCardVeryCompact]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Transfer Inbox</Text>
-              <TouchableOpacity onPress={closeTransferInboxModal} disabled={Boolean(transferRespondingId)}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close transfer inbox" accessibilityState={{ disabled: Boolean(transferRespondingId) }} style={crmTouchTarget} onPress={closeTransferInboxModal} disabled={Boolean(transferRespondingId)}>
                 <Feather name="x" size={20} color="#6B7280" />
               </TouchableOpacity>
             </View>
@@ -3923,7 +3955,7 @@ const CrmTasksScreen = ({
                 <Text style={styles.emptySubtitle}>No transfer requests found.</Text>
               </View>
             ) : (
-              <ScrollView style={styles.inboxList}>
+              <ScrollView style={styles.inboxList} nestedScrollEnabled keyboardShouldPersistTaps="handled">
                 {transferInbox.map((item) => {
                   const isPending = item.status === 'pending';
                   const busy = transferRespondingId === item._id;
@@ -3973,8 +4005,7 @@ const CrmTasksScreen = ({
                 })}
               </ScrollView>
             )}
-          </View>
-        </View>
+        </CrmModalFrame>
       </Modal>
 
       <Modal
@@ -3982,11 +4013,11 @@ const CrmTasksScreen = ({
         transparent
         animationType="fade"
         onRequestClose={closeCallModal}>
-        <View style={[styles.centerModalOverlay, isVeryCompact && styles.centerModalOverlayVeryCompact]}>
-          <View style={[styles.callModalCard, isCompact && styles.callModalCardCompact, isVeryCompact && styles.callModalCardVeryCompact]}>
+        <CrmModalFrame label="Choose phone number" onClose={closeCallModal}
+          cardStyle={[styles.callModalCard, isCompact && styles.callModalCardCompact, isVeryCompact && styles.callModalCardVeryCompact]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Select Number to Call</Text>
-              <TouchableOpacity onPress={closeCallModal} disabled={Boolean(dialingNumber)}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close phone numbers" accessibilityState={{ disabled: Boolean(dialingNumber) }} style={crmTouchTarget} onPress={closeCallModal} disabled={Boolean(dialingNumber)}>
                 <Feather name="x" size={20} color="#6B7280" />
               </TouchableOpacity>
             </View>
@@ -4000,6 +4031,9 @@ const CrmTasksScreen = ({
               {callOptions.map((option, index) => (
                 <TouchableOpacity
                   key={`${option.label}-${option.value}-${index}`}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Call ${option.label}: ${option.value}`}
+                  accessibilityState={{ disabled: Boolean(dialingNumber), busy: dialingNumber === option.value }}
                   style={styles.callOptionBtn}
                   onPress={() => void dialSelectedNumber(option.value)}
                   disabled={Boolean(dialingNumber)}>
@@ -4017,8 +4051,7 @@ const CrmTasksScreen = ({
                 </TouchableOpacity>
               ))}
             </View>
-          </View>
-        </View>
+        </CrmModalFrame>
       </Modal>
 
       <Modal
@@ -4026,11 +4059,8 @@ const CrmTasksScreen = ({
         transparent
         animationType="fade"
         onRequestClose={() => undefined}>
-        <KeyboardAvoidingView
-          style={[styles.centerModalOverlay, isVeryCompact && styles.centerModalOverlayVeryCompact]}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}>
-          <View style={[styles.profileSetupCard, isCompact && styles.profileSetupCardCompact, isVeryCompact && styles.profileSetupCardVeryCompact]}>
+        <CrmModalFrame label="CRM coverage form"
+          cardStyle={[styles.profileSetupCard, isCompact && styles.profileSetupCardCompact, isVeryCompact && styles.profileSetupCardVeryCompact]}>
             <Text style={styles.profileSetupTitle}>Set Your CRM Coverage</Text>
             <Text style={styles.profileSetupSubtitle}>
               Add your address, quadrant, and specialties so imported leads can be matched to the
@@ -4041,6 +4071,7 @@ const CrmTasksScreen = ({
             <TextInput
               style={styles.profileAddressInput}
               value={crmProfileAddress}
+              accessibilityLabel="CRM work area address"
               onChangeText={setCrmProfileAddress}
               placeholder="Enter your CRM work area address"
               placeholderTextColor="#94A3B8"
@@ -4062,6 +4093,9 @@ const CrmTasksScreen = ({
                       isSelected && styles.profileQuadrantChipActive,
                     ]}
                     onPress={() => toggleCrmProfileQuadrant(option.value)}
+                    accessibilityRole="checkbox"
+                    accessibilityLabel={option.label}
+                    accessibilityState={{ checked: isSelected, disabled: crmProfileSaving }}
                     disabled={crmProfileSaving}>
                     <Text
                       style={[
@@ -4090,6 +4124,10 @@ const CrmTasksScreen = ({
                       isSelected && styles.profileQuadrantChipActive,
                     ]}
                     onPress={() => handleCrmProfileSpecializationPress(option.value)}
+                    accessibilityRole="button"
+                    accessibilityLabel={option.label}
+                    accessibilityHint="Tap to choose one specialty. Long press to select multiple specialties."
+                    accessibilityState={{ selected: isSelected, disabled: crmProfileSaving }}
                     onLongPress={() => handleCrmProfileSpecializationLongPress(option.value)}
                     delayLongPress={220}
                     disabled={crmProfileSaving}>
@@ -4107,6 +4145,9 @@ const CrmTasksScreen = ({
 
             <TouchableOpacity
               style={styles.profileSetupSaveBtn}
+              accessibilityRole="button"
+              accessibilityLabel="Save CRM coverage"
+              accessibilityState={{ disabled: crmProfileSaving, busy: crmProfileSaving }}
               onPress={() => void saveCrmProfile()}
               disabled={crmProfileSaving}>
               {crmProfileSaving ? (
@@ -4115,8 +4156,7 @@ const CrmTasksScreen = ({
                 <Text style={styles.profileSetupSaveText}>Save CRM Coverage</Text>
               )}
             </TouchableOpacity>
-          </View>
-        </KeyboardAvoidingView>
+        </CrmModalFrame>
       </Modal>
     </SafeAreaView>
   );
@@ -4823,6 +4863,8 @@ const styles = StyleSheet.create({
     gap: 5,
   },
   actionBtnVeryCompact: {
+    minHeight: 44,
+    minWidth: 44,
     borderRadius: 8,
     paddingVertical: 8,
     gap: 0,
@@ -4837,12 +4879,16 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
   },
   modalCard: {
+    width: '100%',
+    maxWidth: 760,
+    alignSelf: 'center',
+    flexShrink: 1,
     backgroundColor: '#fff',
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     padding: 16,
     paddingBottom: 16,
-    maxHeight: '92%',
+    maxHeight: '100%',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: -8 },
     shadowOpacity: 0.2,
@@ -4859,6 +4905,8 @@ const styles = StyleSheet.create({
   },
   modalBodyScroll: {
     marginTop: 8,
+    flexShrink: 1,
+    flexGrow: 0,
   },
   modalBodyContent: {
     paddingBottom: 10,
@@ -4869,6 +4917,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   modalTitle: {
+    flexShrink: 1,
     fontSize: 18,
     fontWeight: '800',
     color: '#111827',
@@ -5001,6 +5050,8 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   statusOption: {
+    minHeight: 44,
+    justifyContent: 'center',
     borderWidth: 1,
     borderColor: '#D1D5DB',
     borderRadius: 999,
@@ -5431,6 +5482,7 @@ const styles = StyleSheet.create({
   modalFooterRow: {
     marginTop: 16,
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 10,
   },
   modalFooterRowVeryCompact: {
@@ -5439,6 +5491,9 @@ const styles = StyleSheet.create({
   },
   cancelBtn: {
     flex: 1,
+    minHeight: 44,
+    minWidth: 100,
+    paddingHorizontal: 10,
     borderWidth: 1,
     borderColor: '#D1D5DB',
     borderRadius: 12,
@@ -5457,6 +5512,9 @@ const styles = StyleSheet.create({
   },
   submitBtn: {
     flex: 1,
+    minHeight: 44,
+    minWidth: 100,
+    paddingHorizontal: 10,
     borderRadius: 12,
     backgroundColor: '#0284C7',
     paddingVertical: 12,
@@ -5550,6 +5608,8 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   calendarSyncQuickBtn: {
+    minHeight: 44,
+    justifyContent: 'center',
     flex: 1,
     borderRadius: 10,
     backgroundColor: '#ECFDF5',
@@ -5710,6 +5770,8 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   quickAddSpecializationChip: {
+    minHeight: 44,
+    justifyContent: 'center',
     borderRadius: 999,
     borderWidth: 1,
     borderColor: '#CBD5E1',
@@ -5873,6 +5935,8 @@ const styles = StyleSheet.create({
     fontSize: 11,
   },
   profileQuadrantChip: {
+    minHeight: 44,
+    justifyContent: 'center',
     borderWidth: 1,
     borderColor: '#CBD5E1',
     borderRadius: 999,

@@ -30,6 +30,7 @@ import { useAuth } from "../context/AuthContext";
 import { useNotifications } from "../context/NotificationContext";
 import NotificationCenterModal from "../components/NotificationCenterModal";
 import { NotificationItem } from "../services/notificationService";
+import CrmModalFrame, { crmTouchTarget } from "../components/crm/CrmModalFrame";
 
 interface CrmDashboardScreenProps {
   onOpenDrawer: () => void;
@@ -335,7 +336,7 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
           <View style={styles.heroGlow} />
           <View style={styles.heroDepth} />
           <View style={styles.heroTopRow}>
-            <TouchableOpacity onPress={onOpenDrawer} style={styles.menuBtn}>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel="Open menu" onPress={onOpenDrawer} style={styles.menuBtn}>
               <Feather name="menu" size={22} color="#fff" />
             </TouchableOpacity>
             <View style={styles.heroTextWrap}>
@@ -346,7 +347,7 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
               <Text style={[styles.heroSubtitle, isCompact && { fontSize: 11 }, isVeryCompact && { fontSize: 10 }]}>Overview, alerts & upcoming tasks.</Text>
             </View>
             <View style={styles.heroActions}>
-              <TouchableOpacity onPress={() => setNotifPanelOpen(true)} style={styles.notifBtn} activeOpacity={0.8}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Notifications, ${unreadCount} unread`} onPress={() => setNotifPanelOpen(true)} style={styles.notifBtn} activeOpacity={0.8}>
                 <Feather name="bell" size={20} color="#fff" />
                 {unreadCount > 0 ? (
                   <View style={styles.notifBadge}>
@@ -357,12 +358,15 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
             </View>
           </View>
           <View style={[styles.heroBtnRow, isVeryCompact && styles.heroBtnRowVeryCompact]}>
-            <TouchableOpacity style={[styles.taskBoardBtn, isVeryCompact && styles.heroBtnVeryCompact]} onPress={() => onOpenTasks({ filter: "all" })} activeOpacity={0.85}>
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel="Open task page" style={[styles.taskBoardBtn, isCompact && styles.fullWidthHeroAction, isVeryCompact && styles.heroBtnVeryCompact]} onPress={() => onOpenTasks({ filter: "all" })} activeOpacity={0.85}>
               <Feather name="phone-call" size={isVeryCompact ? 13 : 15} color="#0C4A6E" />
               <Text style={[styles.taskBoardBtnText, isVeryCompact && styles.heroBtnTextVeryCompact]}>{isVeryCompact ? "Tasks" : "Open Task Page"}</Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.refreshBtn, isVeryCompact && styles.heroBtnVeryCompact]}
+              accessibilityRole="button"
+              accessibilityLabel="Refresh dashboard"
+              accessibilityState={{ disabled: refreshing, busy: refreshing }}
               onPress={onRefresh}
               activeOpacity={0.85}
               disabled={refreshing}
@@ -372,6 +376,8 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.quickAddBtn, isVeryCompact && styles.heroBtnVeryCompact]}
+              accessibilityRole="button"
+              accessibilityLabel="Quick Add lead"
               onPress={() => setQuickAddOpen(true)}
               activeOpacity={0.85}
             >
@@ -570,20 +576,22 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
         onDeleteNotification={deleteNotification}
       />
       <Modal visible={quickAddOpen} transparent animationType="fade" onRequestClose={() => !quickAdding && setQuickAddOpen(false)}>
-        <View style={styles.modalOverlay}>
-          <View style={[styles.quickAddModal, isVeryCompact && styles.quickAddModalCompact]}>
+        <CrmModalFrame label="Quick Add lead form" onClose={() => !quickAdding && setQuickAddOpen(false)}
+          cardStyle={[styles.quickAddModal, isVeryCompact && styles.quickAddModalCompact]}>
             <View style={styles.modalHeader}>
-              <View>
+              <View style={{ flex: 1, minWidth: 0 }}>
                 <Text style={styles.modalTitle}>Quick Add</Text>
                 <Text style={styles.modalSubtitle}>Organic lead</Text>
               </View>
-              <TouchableOpacity disabled={quickAdding} onPress={() => setQuickAddOpen(false)} style={styles.modalCloseBtn}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close Quick Add" accessibilityState={{ disabled: quickAdding }} disabled={quickAdding} onPress={() => setQuickAddOpen(false)} style={[styles.modalCloseBtn, crmTouchTarget]}>
                 <Feather name="x" size={18} color="#334155" />
               </TouchableOpacity>
             </View>
             <TextInput
               style={styles.input}
               value={quickAddName}
+              accessibilityLabel="Lead name"
+              editable={!quickAdding}
               onChangeText={setQuickAddName}
               placeholder="Name"
               placeholderTextColor="#94A3B8"
@@ -591,6 +599,8 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
             <TextInput
               style={styles.input}
               value={quickAddPhone}
+              accessibilityLabel="Lead phone number"
+              editable={!quickAdding}
               onChangeText={setQuickAddPhone}
               placeholder="Phone number"
               placeholderTextColor="#94A3B8"
@@ -603,9 +613,12 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
                 return (
                   <TouchableOpacity
                     key={option.value}
+                    accessibilityRole="radio"
+                    accessibilityLabel={option.label}
+                    accessibilityState={{ selected, disabled: quickAdding }}
                     disabled={quickAdding}
                     onPress={() => setQuickAddSpecialization(option.value)}
-                    style={[styles.specializationChip, selected && styles.specializationChipActive]}
+                    style={[styles.specializationChip, crmTouchTarget, selected && styles.specializationChipActive]}
                     activeOpacity={0.8}
                   >
                     <Text style={[styles.specializationChipText, selected && styles.specializationChipTextActive]}>
@@ -617,6 +630,9 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
             </View>
             <Text style={styles.fieldLabel}>Due date</Text>
             <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel={`Due date: ${formatQuickAddDueDate(quickAddDueDate)}`}
+              accessibilityState={{ disabled: quickAdding, expanded: showQuickAddDuePicker }}
               disabled={quickAdding}
               style={styles.dateButton}
               onPress={() => setShowQuickAddDuePicker(true)}
@@ -636,6 +652,8 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
             <TextInput
               style={[styles.input, styles.notesInput]}
               value={quickAddNotes}
+              accessibilityLabel="Lead notes"
+              editable={!quickAdding}
               onChangeText={setQuickAddNotes}
               placeholder="Notes"
               placeholderTextColor="#94A3B8"
@@ -643,15 +661,14 @@ const CrmDashboardScreen = ({ onOpenDrawer, onOpenTasks }: CrmDashboardScreenPro
               textAlignVertical="top"
             />
             <View style={styles.modalActions}>
-              <TouchableOpacity disabled={quickAdding} onPress={() => setQuickAddOpen(false)} style={styles.cancelBtn}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Cancel Quick Add" accessibilityState={{ disabled: quickAdding }} disabled={quickAdding} onPress={() => setQuickAddOpen(false)} style={[styles.cancelBtn, crmTouchTarget]}>
                 <Text style={styles.cancelBtnText}>Cancel</Text>
               </TouchableOpacity>
-              <TouchableOpacity disabled={quickAdding} onPress={submitQuickAdd} style={[styles.createBtn, quickAdding && styles.disabledBtn]}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Create lead" accessibilityState={{ disabled: quickAdding, busy: quickAdding }} disabled={quickAdding} onPress={() => { void submitQuickAdd(); }} style={[styles.createBtn, crmTouchTarget, quickAdding && styles.disabledBtn]}>
                 <Text style={styles.createBtnText}>{quickAdding ? "Creating..." : "Create"}</Text>
               </TouchableOpacity>
             </View>
-          </View>
-        </View>
+        </CrmModalFrame>
       </Modal>
     </SafeAreaView>
   );
@@ -735,16 +752,16 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   menuBtn: {
-    width: 42,
-    height: 42,
+    width: 44,
+    height: 44,
     borderRadius: 13,
     backgroundColor: "rgba(255,255,255,0.2)",
     justifyContent: "center",
     alignItems: "center",
   },
   notifBtn: {
-    width: 42,
-    height: 42,
+    width: 44,
+    height: 44,
     borderRadius: 13,
     backgroundColor: "rgba(255,255,255,0.2)",
     justifyContent: "center",
@@ -793,11 +810,13 @@ const styles = StyleSheet.create({
   heroBtnRow: {
     marginTop: 14,
     flexDirection: "row",
+    flexWrap: "wrap",
     alignItems: "center",
     justifyContent: "center",
     gap: 10,
   },
   taskBoardBtn: {
+    minHeight: 44,
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
@@ -814,6 +833,7 @@ const styles = StyleSheet.create({
     elevation: 5,
   },
   refreshBtn: {
+    minHeight: 44,
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
@@ -830,6 +850,7 @@ const styles = StyleSheet.create({
     elevation: 3,
   },
   quickAddBtn: {
+    minHeight: 44,
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
@@ -1214,7 +1235,9 @@ const styles = StyleSheet.create({
     marginTop: 10,
     gap: 6,
   },
+  fullWidthHeroAction: { flexBasis: '100%', flexGrow: 0 },
   heroBtnVeryCompact: {
+    minHeight: 44,
     paddingHorizontal: 10,
     paddingVertical: 8,
     gap: 5,
@@ -1362,11 +1385,15 @@ const styles = StyleSheet.create({
   },
   modalActions: {
     flexDirection: "row",
+    flexWrap: "wrap",
     gap: 10,
     marginTop: 4,
   },
   cancelBtn: {
     flex: 1,
+    minWidth: 100,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
     minHeight: 44,
     borderRadius: 13,
     borderWidth: 1,
@@ -1381,6 +1408,9 @@ const styles = StyleSheet.create({
   },
   createBtn: {
     flex: 1,
+    minWidth: 100,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
     minHeight: 44,
     borderRadius: 13,
     alignItems: "center",

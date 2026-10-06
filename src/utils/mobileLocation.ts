@@ -34,9 +34,11 @@ export async function getHiddenCurrentLocation(): Promise<HiddenLocationSnapshot
       return snapshotFromPosition(lastKnown);
     }
 
-    const current = await Location.getCurrentPositionAsync({
-      accuracy: Location.Accuracy.Balanced,
-    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const current = await Promise.race([
+      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Location request timed out')), 8000); }),
+    ]).finally(() => { if (timer) clearTimeout(timer); });
     return snapshotFromPosition(current);
   } catch (error) {
     console.warn('[Location] Hidden location detection failed:', error);

@@ -1,27 +1,70 @@
 import { AppState, AppStateStatus } from 'react-native';
 import AutoSaveService, { OfflineReportDraft } from './autoSaveService';
 import OfflineQueueService from './offlineQueueService';
-import reportDraftService from './reportDraftService';
+import reportDraftService, { ReportDraft } from './reportDraftService';
+import OfflineCaptureStore from './offlineCaptureStore';
+import {
+  canAttemptDraftCloudSync,
+  classifyDraftCloudSyncError,
+  DraftCloudSyncFailure,
+} from './draftCloudSyncState';
 
 let didInit = false;
 let syncing = false;
 let syncInterval: ReturnType<typeof setInterval> | null = null;
 let appStateSub: { remove: () => void } | null = null;
+const inFlightDrafts = new Map<string, Promise<DraftCloudSyncResult>>();
+
+export type DraftCloudSyncResult =
+  | { status: 'synced'; cloud: ReportDraft }
+  | { status: 'failed'; failure: DraftCloudSyncFailure }
+  | { status: 'skipped' };
 
 const isCloudClean = (draft: OfflineReportDraft) => {
   if (!draft.cloudSyncedAt) return false;
   return new Date(draft.cloudSyncedAt).getTime() >= new Date(draft.updatedAt).getTime();
 };
 
-async function syncDraft(draft: OfflineReportDraft): Promise<void> {
+async function syncDraft(
+  draft: OfflineReportDraft,
+  options: { force?: boolean } = {}
+): Promise<DraftCloudSyncResult> {
+  if (!canAttemptDraftCloudSync(draft, options)) return { status: 'skipped' };
+  if (!draft.ownerId || draft.ownerId !== OfflineCaptureStore.getOwnerId()) return { status: 'skipped' };
+
+  const active = inFlightDrafts.get(draft.id);
+  if (active) return active;
+
+  const operation = (async (): Promise<DraftCloudSyncResult> => {
+    try {
+      const cloud = await reportDraftService.upsertFromLocalDraft(draft);
+      if (draft.ownerId !== OfflineCaptureStore.getOwnerId()) return { status: 'skipped' };
+      await AutoSaveService.markDraftCloudSynced(
+        draft.id,
+        cloud.id || cloud._id || '',
+        draft.updatedAt
+      );
+      return { status: 'synced', cloud };
+    } catch (error: any) {
+      if (draft.ownerId !== OfflineCaptureStore.getOwnerId()) return { status: 'skipped' };
+      const failure = classifyDraftCloudSyncError(error, draft.cloudSyncAttempts || 0);
+      await AutoSaveService.markDraftCloudSyncError(draft.id, failure.message, {
+        kind: failure.kind,
+        retryAt: failure.retryAt,
+        attempts: failure.attempts,
+        lastAttemptAt: failure.lastAttemptAt,
+      });
+      return { status: 'failed', failure };
+    }
+  })();
+
+  inFlightDrafts.set(draft.id, operation);
   try {
-    const cloud = await reportDraftService.upsertFromLocalDraft(draft);
-    await AutoSaveService.markDraftCloudSynced(draft.id, cloud.id || cloud._id || '');
-  } catch (error: any) {
-    await AutoSaveService.markDraftCloudSyncError(
-      draft.id,
-      error?.response?.data?.message || error?.message || 'Cloud sync failed'
-    );
+    return await operation;
+  } finally {
+    if (inFlightDrafts.get(draft.id) === operation) {
+      inFlightDrafts.delete(draft.id);
+    }
   }
 }
 
@@ -29,9 +72,13 @@ async function syncOnce(): Promise<void> {
   if (syncing) return;
   syncing = true;
   try {
-    if (!(await OfflineQueueService.isOnline())) return;
-    const drafts = await AutoSaveService.getDrafts();
-    for (const draft of drafts) {
+    if (!didInit || AppState.currentState !== 'active' || !(await OfflineQueueService.isOnline())) return;
+    const summaries = await OfflineCaptureStore.listSummaries();
+    for (const summary of summaries) {
+      if (!didInit) return;
+      if (summary.captureMode === 'offline' || summary.manualSubmissionRequired) continue;
+      const draft = await AutoSaveService.getDraft(summary.id);
+      if (!draft) continue;
       if (!isCloudClean(draft)) {
         await syncDraft(draft);
       }
@@ -67,6 +114,7 @@ const DraftSyncService = {
   },
 
   syncOnce,
+  syncDraft,
 };
 
 export default DraftSyncService;

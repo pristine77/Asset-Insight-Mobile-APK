@@ -33,6 +33,8 @@ export function isNetworkTransportError(error: any): boolean {
       'EAI_AGAIN',
       'ERR_NETWORK',
       'ERR_INTERNET_DISCONNECTED',
+      'UPLOAD_STALLED',
+      'E_UPLOAD_STALLED',
     ].includes(code)
   ) {
     return true;
@@ -41,6 +43,7 @@ export function isNetworkTransportError(error: any): boolean {
   const message = String(error?.message || '').toLowerCase();
   return (
     message.includes('network error') ||
+    message.includes('networkerror') ||
     message.includes('network request failed') ||
     message.includes('failed to fetch') ||
     message.includes('connection reset') ||
@@ -61,6 +64,15 @@ export function getServerErrorMessage(error: any): string {
   const message = body?.message || body?.error;
   if (typeof message === 'string' && message.trim()) return message.trim();
   return typeof error?.message === 'string' ? error.message.trim() : '';
+}
+
+function actionableErrorMessage(error: any): string {
+  const message = getServerErrorMessage(error);
+  // Proxy/storage HTML, transport diagnostics and bare status codes are not
+  // instructions a person can use. Keep specific plain-language validation.
+  return message.length > 0 && message.length <= 500 &&
+    !/<[^>]+>|https?:\/\/|(?:status(?:\s+code)?|http|error)\s*[:=]?\s*[45]\d\d|^[45]\d\d$|(?:upload|request) failed[^\n]*\([45]\d\d\)|network\s*error|failed to fetch|fetch failed|\b(?:ECONN\w*|ETIMEDOUT|ERR_\w+)\b/i.test(message)
+    ? message : '';
 }
 
 export async function getConnectivityStatus(): Promise<ConnectivityResult> {
@@ -93,47 +105,72 @@ export async function getConnectivityStatus(): Promise<ConnectivityResult> {
 }
 
 export async function shouldQueueAfterError(error: any): Promise<boolean> {
+  if (!isRetryableRequestError(error)) return false;
+  const status = getErrorStatus(error);
+  // A transient server/storage response is safe to retry with the same upload
+  // session and client submission id. Queue it even when general internet is up.
+  if (status && TRANSIENT_HTTP_STATUSES.has(status)) return true;
   if (!isNetworkTransportError(error)) return false;
   const connectivity = await getConnectivityStatus();
-  return connectivity.status === 'offline';
+  return connectivity.status !== 'online';
 }
 
-export function getSubmissionError(error: any): { title: string; message: string } {
+export function getSubmissionError(error: any, retryAction = 'Resume upload'): { title: string; message: string } {
   const status = getErrorStatus(error);
-  const serverMessage = getServerErrorMessage(error);
+  const serverMessage = actionableErrorMessage(error);
+  const code = error?.response?.data?.code;
+  const draftConflicts = ['STALE_DRAFT_REVISION', 'DRAFT_REVISION_CONFLICT', 'DRAFT_MEDIA_CONFLICT'];
+  if (draftConflicts.includes(code)) return {
+    title: 'Draft needs checking',
+    message: 'The saved draft changed while this request was running. Keep this form and its originals. Reopen the latest saved draft before trying again; do not clear the draft or start another upload.',
+  };
+  if (code === 'DRAFT_ALREADY_PROMOTED') return {
+    title: 'Earlier submission found',
+    message: 'This draft was already submitted. Keep your current work and check Reports or Previews. If the report is missing, contact support before submitting it again.',
+  };
+
+  if (['UPLOAD_STALLED', 'E_UPLOAD_STALLED'].includes(String(error?.code || ''))) {
+    return {
+      title: 'Upload Interrupted',
+      message: `The upload stopped making progress. Keep this draft and its originals. Check the connection, then tap ${retryAction}. The same submission will be checked before it is completed.`,
+    };
+  }
 
   if (status === 401 || status === 403) {
     return {
       title: 'Sign In Required',
-      message: 'Your session has expired. Sign in again, then retry. Your report remains saved.',
+      message: status === 401 ? 'Sign in again, then reopen this draft and resume. Keep the draft and its originals.' : 'This account or device cannot complete the upload. Check its access or contact support. Keep the draft and its originals.',
     };
   }
   if (status === 408 || status === 425 || status === 429) {
     return {
       title: 'Upload Delayed',
-      message: serverMessage || 'The server is busy. Your report remains saved; wait a moment and retry.',
+      message: serverMessage || 'The server is busy. Keep this draft and its originals; wait a moment, then resume the same upload.',
     };
   }
   if (status && status >= 400 && status < 500) {
     return {
       title: 'Report Needs Attention',
-      message: serverMessage || 'The report was not accepted. Review the entered information and try again.',
+      message: serverMessage || (status === 409
+        ? 'The earlier upload needs checking. Keep this draft and its originals. Resume the same upload; if this continues, contact support before starting another report.'
+        : status === 413 ? 'This upload exceeds the allowed size. Keep the originals and review the file sizes or contact support before retrying.'
+        : 'The upload could not be completed. Keep this form and its originals, review the entered information, then try again.'),
     };
   }
   if (status && status >= 500) {
     return {
       title: 'Server Temporarily Unavailable',
-      message: serverMessage || 'The server could not complete the upload. Your report remains saved; try again shortly.',
+      message: 'The server could not confirm the upload. Keep this draft and its originals; wait a moment, then resume the same submission.',
     };
   }
   if (isNetworkTransportError(error)) {
     return {
       title: 'Upload Interrupted',
-      message: 'The upload connection was interrupted. Your report remains saved. Check the connection and tap Submit again.',
+      message: `The upload connection was interrupted before confirmation. Keep this draft and its originals. Check the connection and tap ${retryAction} to check the same submission.`,
     };
   }
   return {
     title: 'Submission Failed',
-    message: serverMessage || 'The report could not be submitted. Your work remains saved.',
+    message: serverMessage || 'The upload could not be confirmed. Keep this form and its originals. Try saving on this device, then resume the same submission.',
   };
 }

@@ -29,6 +29,8 @@ export type NotificationItem = {
   createdAt: string;
   read: boolean;
   readAt?: string | null;
+  /** Push envelopes contain no full message; hydrate through the owner-only API. */
+  requiresDetails?: boolean;
 };
 
 export type NotificationInboxResponse = {
@@ -151,6 +153,14 @@ export async function fetchNotifications(params?: {
 
 export async function markNotificationRead(id: string): Promise<void> {
   await api.patch(`/notifications/${encodeURIComponent(id)}/read`);
+}
+
+export async function fetchNotification(id: string, signal?: AbortSignal): Promise<NotificationItem> {
+  const { data } = await api.get(`/notifications/${encodeURIComponent(id)}`, { signal });
+  if (!data?.item || String(data.item.id || data.item._id || "") !== id || typeof data.item.body !== "string" || !data.item.body.trim()) {
+    throw new Error("Notification details are unavailable");
+  }
+  return normalizeNotificationItem(data.item);
 }
 
 export async function markAllNotificationsRead(): Promise<void> {
