@@ -20,6 +20,7 @@ import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/dat
 import { Feather, FontAwesome } from '@expo/vector-icons';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
+import { ensurePhotoPickerAccess } from '../utils/photoPickerAccess';
 import { Audio } from 'expo-av';
 import * as MailComposer from 'expo-mail-composer';
 import { WebView } from 'react-native-webview';
@@ -2001,8 +2002,7 @@ const CrmTasksScreen = ({
         return;
       }
 
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
+      if (!(await ensurePhotoPickerAccess())) {
         Alert.alert('Permission Required', 'Please allow gallery access to attach images.');
         return;
       }

@@ -1,5 +1,6 @@
 import React from 'react';
-import { Alert, StyleSheet } from 'react-native';
+import { Alert, Platform, StyleSheet } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import PreviewScreen from './PreviewScreen';
 import api from '../services/api';
@@ -22,7 +23,11 @@ jest.mock('@shopify/react-native-skia', () => ({
 }));
 jest.mock('expo-file-system/legacy', () => ({ cacheDirectory: 'file:///cache/' }));
 jest.mock('expo-sharing', () => ({}));
-jest.mock('expo-image-picker', () => ({}));
+jest.mock('expo-image-picker', () => ({
+  requestMediaLibraryPermissionsAsync: jest.fn(),
+  launchImageLibraryAsync: jest.fn(),
+  MediaTypeOptions: { Images: 'Images' },
+}));
 jest.mock('../services/api', () => ({
   __esModule: true,
   default: { get: jest.fn(), put: jest.fn(), post: jest.fn() },
@@ -93,6 +98,30 @@ beforeEach(() => {
   });
 });
 afterEach(() => jest.restoreAllMocks());
+
+it.each(['Asset', 'LotListing'] as const)('opens the %s Android photo picker with broad library access unavailable', async reportType => {
+  const previousOS = Platform.OS;
+  Platform.OS = 'android';
+  try {
+    saved = fixture(1);
+    const retained = structuredClone(saved);
+    jest.mocked(ImagePicker.requestMediaLibraryPermissionsAsync).mockRejectedValue(new Error('Broad permission is not declared'));
+    jest.mocked(ImagePicker.launchImageLibraryAsync).mockResolvedValue({ canceled: true, assets: null });
+    await render(<PreviewScreen reportId="picker-report" reportType={reportType} mode="pending" onBack={onBack} />);
+    await screen.findByDisplayValue('93530');
+    await fireEvent.press(screen.getByText('Add photos'));
+    await waitFor(() => expect(ImagePicker.launchImageLibraryAsync).toHaveBeenCalledTimes(1));
+    expect(ImagePicker.requestMediaLibraryPermissionsAsync).not.toHaveBeenCalled();
+    expect(ImagePicker.launchImageLibraryAsync).toHaveBeenCalledWith(expect.objectContaining({
+      allowsMultipleSelection: true, quality: 1,
+    }));
+    expect(saved).toEqual(retained);
+    expect(api.post).not.toHaveBeenCalled();
+    expect(api.put).not.toHaveBeenCalled();
+  } finally {
+    Platform.OS = previousOS;
+  }
+});
 
 it.each(['Asset', 'LotListing'] as const)('saves and regenerates %s with one current snapshot and no separate save', async reportType => {
   saved = fixture(2);

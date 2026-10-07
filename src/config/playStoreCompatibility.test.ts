@@ -43,6 +43,7 @@ describe('Google Play production compatibility', () => {
     expect(build.production.env).toEqual({
       EXPO_NO_DOTENV: '1',
       EXPO_PUBLIC_API_BASE_URL: 'https://api.assetinsightvaluator.com/api',
+      EXPO_PUBLIC_CAPTURE_BACKUP_ENABLED: 'false',
     });
     expect(build.production.android).toMatchObject({ buildType: 'app-bundle', credentialsSource: 'remote' });
     expect(build['production-apk'].extends).toBe('production');
@@ -50,12 +51,12 @@ describe('Google Play production compatibility', () => {
     expect(build['production-apk'].env).toEqual(build.production.env);
   });
 
-  it('keeps the 1.0.2 marketing version consistent without resetting the remote Android counter', () => {
+  it('keeps the 1.0.3 marketing version consistent without resetting the remote Android counter', () => {
     const appConfig = readJson('app.json');
     const packageJson = readJson('package.json');
     const lock = readJson('package-lock.json');
     const gradle = fs.readFileSync(path.join(projectRoot, 'android/app/build.gradle'), 'utf8');
-    expect(appConfig.expo.version).toBe('1.0.2');
+    expect(appConfig.expo.version).toBe('1.0.3');
     expect(packageJson.version).toBe(appConfig.expo.version);
     expect(lock.version).toBe(appConfig.expo.version);
     expect(lock.packages[''].version).toBe(appConfig.expo.version);

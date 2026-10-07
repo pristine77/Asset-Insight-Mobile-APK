@@ -19,12 +19,16 @@ public class PhotoWatermarkInstrumentation extends Instrumentation {
     private boolean recordVideo;
     private boolean cameraHandoffOnly;
     private boolean uploadOnly;
+    private boolean cameraLayoutOnly;
+    private boolean fixedCameraOnly;
     @Override public void onCreate(Bundle arguments) {
         super.onCreate(arguments);
         videoOnly = arguments != null && "true".equals(arguments.getString("videoOnly"));
         recordVideo = arguments != null && "true".equals(arguments.getString("recordVideo"));
         cameraHandoffOnly = arguments != null && "true".equals(arguments.getString("cameraHandoffOnly"));
         uploadOnly = arguments != null && "true".equals(arguments.getString("uploadOnly"));
+        cameraLayoutOnly = arguments != null && "true".equals(arguments.getString("cameraLayoutOnly"));
+        fixedCameraOnly = arguments != null && "true".equals(arguments.getString("fixedCameraOnly"));
         start();
     }
     private static void check(boolean condition, String message) {
@@ -33,6 +37,21 @@ public class PhotoWatermarkInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle result = new Bundle();
         try {
+            if (fixedCameraOnly) {
+                FixedLotCameraAssertions.run(this);
+                ListingVideoAssertions.run(getTargetContext());
+                CameraLayoutAssertions.run(this);
+                result.putString("stream", "PASS: native fixed-lot controls, stable identities/modes/order, scoped photo/video deletion with empty rows, bounded navigation, pending journal validation/recreation and unchanged 720p controls.");
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
+            if (cameraLayoutOnly) {
+                CameraLayoutAssertions.run(this);
+                ListingVideoAssertions.run(getTargetContext());
+                result.putString("stream", "PASS: September camera controls at 100/130/200% font, scroll-to-Done, recording controls and strict HD/30fps video policy.");
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
             if (uploadOnly) {
                 ContentUriUploaderAssertions.run(getTargetContext());
                 result.putString("stream", "PASS: native MediaStore HTTPS byte/length/progress integrity, four-worker bound, prompt queued/active cancellation, stalled writes/receipt deadline, one settlement and worker recovery.");

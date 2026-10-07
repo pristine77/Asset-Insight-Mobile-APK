@@ -6,7 +6,7 @@ jest.mock('./api', () => ({ __esModule: true, default: { get: jest.fn(), post: j
 const fixture = () => ({
   workItemId: 'parent', cycleKey: 'cycle', reportType: 'asset' as const, kind: 'scheduleA' as const,
   clientSubmissionId: 'submission-parent', status: 'claimed' as const, reportId: null,
-  contract: { id: 'contract', contractNo: '93530.3-A' },
+  contract: { id: 'contract', contractNo: '93530.3-A', eventId: 'event-original' },
   lots: [{ sourceKey: 'source-one', lotId: 'lot-one' }, { sourceKey: 'source-two', lotId: 'lot-two' }],
 });
 beforeEach(() => jest.clearAllMocks());
@@ -47,6 +47,7 @@ it.each([
   { workItemId: 'parent' }, { clientSubmissionId: 'submission-parent' }, { status: 'report_created', reportId: 'existing' },
   { kind: 'scheduleA' }, { lots: [{ sourceKey: 'old-source' }] }, { reportType: 'lotListing' },
   { contract: { id: 'other', contractNo: '93530.3-A' } }, { status: 'abandoned' },
+  { contract: { ...fixture().contract, eventId: 'changed-event' } },
 ])('rejects unsafe successor %#', (change) => {
   const previous = parseAuctioneerSetup(fixture());
   const next = parseAuctioneerSetup({ ...fixture(), workItemId: 'next', clientSubmissionId: 'submission-next', kind: 'unknown', lots: [], ...change });
@@ -63,4 +64,11 @@ it('locks Schedule A identities, count, order and grouping while allowing origin
   expect(hasValidAuctioneerLotStructure(current, lots.map((lot) => ({ ...lot, mode: 'per_photo' })))).toBe(false);
   expect(hasValidAuctioneerLotStructure(current, lots.map((lot) => ({ ...lot, files: [{ uri: 'file:///photo.jpg', name: 'photo.jpg', type: 'image/jpeg' }] })))).toBe(true);
   expect(auctioneerLotSource(current, 1)).toEqual({ source_key: 'source-two', source_lot_id: 'lot-two', source_submission_id: undefined });
+});
+
+it('allows newly verified event metadata for a legacy setup without guessing or overriding a known event', () => {
+  const previous = parseAuctioneerSetup({ ...fixture(), contract: { ...fixture().contract, eventId: undefined } });
+  const next = parseAuctioneerSetup({ ...fixture(), workItemId: 'next', clientSubmissionId: 'submission-next', kind: 'unknown', lots: [] });
+  expect(() => validateAuctioneerSuccessor(previous, next)).not.toThrow();
+  expect(() => validateAuctioneerSuccessor(next, { ...next, workItemId: 'third', clientSubmissionId: 'submission-third', contract: { ...next.contract, eventId: undefined } })).toThrow(/not a fresh lot/);
 });

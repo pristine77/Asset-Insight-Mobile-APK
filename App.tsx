@@ -41,6 +41,7 @@ import type { NotificationItem } from './src/services/notificationService';
 import offlineQueueService from './src/services/offlineQueueService';
 import draftSyncService from './src/services/draftSyncService';
 import OfflineCaptureSync from './src/services/offlineCaptureSync';
+import { startCaptureBackups, stopCaptureBackupObservers } from './src/services/captureBackupService';
 import type { OfflineDraftType } from './src/services/autoSaveService';
 import type { CrmDashboardTaskFilter, CrmTaskStatus } from './src/services/crmService';
 import { getNotificationNavigationTarget } from './src/utils/notificationNavigation';
@@ -651,10 +652,12 @@ function AuthGate() {
 
   useEffect(() => {
     if (accountKey) {
+      void startCaptureBackups(accountKey.slice('account:'.length)).catch(() => undefined);
       offlineQueueService.init();
       draftSyncService.init();
       OfflineCaptureSync.init();
       return () => {
+        stopCaptureBackupObservers();
         offlineQueueService.cleanup();
         draftSyncService.cleanup();
         OfflineCaptureSync.cleanup();
@@ -662,6 +665,7 @@ function AuthGate() {
     }
 
     offlineQueueService.cleanup();
+    stopCaptureBackupObservers();
     draftSyncService.cleanup();
     OfflineCaptureSync.cleanup();
     return () => {

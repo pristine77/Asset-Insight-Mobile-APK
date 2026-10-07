@@ -23,6 +23,7 @@ import KeyboardSafeViewport from "../components/KeyboardSafeViewport";
 import { Feather } from "@expo/vector-icons";
 import * as Sharing from "expo-sharing";
 import * as ImagePicker from "expo-image-picker";
+import { ensurePhotoPickerAccess } from "../utils/photoPickerAccess";
 import {
   Canvas,
   drawAsImage,
@@ -893,9 +894,9 @@ const PreviewScreen = ({
     const isCurrent = () =>
       reportContextRef.current === contextAtStart &&
       previewRequestRevisionRef.current === requestRevision;
-    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    const permissionGranted = await ensurePhotoPickerAccess();
     if (!isCurrent()) return;
-    if (!permission.granted) {
+    if (!permissionGranted) {
       Alert.alert("Photos permission needed", "Please allow photo access to add images to this lot.");
       return;
     }

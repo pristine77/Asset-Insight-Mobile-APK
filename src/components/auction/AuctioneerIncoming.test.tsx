@@ -31,9 +31,11 @@ jest.mock('../../services/auctionManagementService', () => ({
 }));
 jest.mock('../forms/AssetFormSheet', () => {
   const { Text, View, TouchableOpacity } = jest.requireActual('react-native');
-  return (props: any) =>
-    props.visible ? (
+  return (props: any) => {
+    const [boundarySession] = require('react').useState(props.auctioneer.workItemId);
+    return props.visible ? (
       <View>
+        <Text>Boundary session {boundarySession}</Text>
         <Text>Asset form {props.auctioneer.workItemId}</Text>
         <Text>Imported {props.auctioneer.contract.contractNo}</Text>
         <TouchableOpacity
@@ -58,6 +60,7 @@ jest.mock('../forms/AssetFormSheet', () => {
         </TouchableOpacity>
       </View>
     ) : null;
+  };
 });
 jest.mock('../forms/LotListingFormSheet', () => {
   const { Text, View } = jest.requireActual('react-native');
@@ -153,6 +156,7 @@ it('replaces an accepted form with the returned successor without claiming again
   expect(await screen.findByText('Asset form child-2')).toBeTruthy();
   expect(screen.queryByText('Asset form work-1')).toBeNull();
   expect(screen.getByText('Imported 93530')).toBeTruthy();
+  expect(screen.getByText('Boundary session work-1')).toBeTruthy();
   expect(auctioneerService.claim).toHaveBeenCalledTimes(1);
 });
 

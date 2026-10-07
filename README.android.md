@@ -1,5 +1,135 @@
 # Android local development
 
+## Pristine source export — 2026-10-07
+
+Integrated source `c43c079` as content-only changes, without source Git history,
+provider usage/accounting or cost/multiplier calculations. Native CameraX routing,
+fixed-lot identities and September controls, draft preservation, same-contract
+Continue, current permission and device-exchange fixes are included. Production
+backup remains disabled; this source export is not a new signed/store release.
+
+Pristine's add-logo-where-missing defaults, Bank behavior, bounded photo decoder
+and asynchronous journal queue are preserved. The queue now snapshots fixed-lot
+structure together with each session, instead of reading later form state when
+the worker eventually serializes it. The paired standalone mobile export has the
+same application changes. Existing offline work and camera quality are untouched.
+
+Merged verification: 1,338 tests / 111 suites and TypeScript pass in both exports.
+Android/iOS Hermes exports, camera Kotlin/resources and app instrumentation Kotlin
+compilation pass. The queued fixed-lot snapshot has source regression coverage and
+a compiled Android instrumentation case; this turn does not run a physical device
+or emulator, perform a live upload, or produce/sign a release binary.
+
+## Native camera routing correction — 2026-10-06 (local; new APK required)
+
+The requested rollback means the existing Android `CameraViewActivity`/CameraX
+camera, not the React Native Vision Camera screen. The earlier XML-only rollback
+did not address two existing routing branches: Schedule A fixed lots deliberately
+used Vision (`2ade973`, September 18), and generic native launch errors switched
+to it automatically (`f1770cb`, May 31). These were not introduced by October 3's
+landscape layout change.
+
+All Android Asset/Lot camera openings now stay on the native path. Launch errors
+offer native Retry/Close without opening a different camera. Assigned lots require
+an explicit native `lockedStructure` capability; older binaries show an update
+message without launching an unsafe camera. iOS retains its existing Vision
+implementation because this CameraX module is Android-only.
+
+The native fixed-lot policy preserves IDs, order, modes and empty rows, bounds
+navigation to the assigned slots, and displays source labels independently of
+internal ordinal numbers. JavaScript validates raw return and recovery manifests
+before normalization/save/acknowledgement; account, draft, assignment and metadata
+changes fence late results. Existing camera journals remain available on rejected
+handoffs. Recovery also rechecks photo edits after asynchronous activity staging.
+September native layouts, the 720p/30fps recording profile, photo quality and
+original-media storage are unchanged. No camera-engine or dependency replacement.
+
+Local JavaScript verification: 104 suites / 1,253 tests, TypeScript and Android/iOS
+Hermes exports pass. Regression tests first reproduced the forced Vision routing,
+then cover native retry, old-binary capability rejection, fixed manifests, empty
+rows, custom labels, nonzero starting slots, video and delayed recovery/assignment
+changes. Full arm64 Android debug/test APK assembly and isolated API35 checks
+pass: actual native Activity controls/rotation, volume-up photo capture into a
+fixed Item lot, Done identity/order conservation, empty rows, scoped deletion,
+199-to-200 photo limits, selected video mode after reinflation, journal reopen,
+the existing 254/5,000-photo atomic-handoff checks and strict 720p profile/resource
+checks. Nine size/font combinations retain the
+old controls. Reviewed actual portrait/landscape screenshots:
+`/tmp/assetinsight-fixed-native-camera-portrait.png` and
+`/tmp/assetinsight-fixed-native-camera-landscape.png`. These emulator fixtures
+do not establish physical-device endurance or a new real-video recording. No
+production access, customer changes, push or signed APK release is included.
+Receipts: `/tmp/assetinsight-native-camera-final-tests.log` and
+`/tmp/assetinsight-native-camera-final-hermes.log`,
+`/tmp/assetinsight-fixed-camera-build.log` and
+`/tmp/assetinsight-fixed-camera-instrument.log`, with handoff results in
+`/tmp/assetinsight-fixed-camera-handoff.log`.
+
+## Persistent capture backup — 2026-10-06 (local)
+
+`modules/capture-backup` is an Expo native module backed by AndroidX WorkManager
+2.12.0. Autolinking and a new native build are required; do not run prebuild over
+the canonical Android project. Jobs carry only an opaque ID, with atomic private
+metadata in `noBackupFilesDir` and AES-GCM authority protected by Android Keystore.
+The backup-only grant is not a normal bearer or refresh token.
+
+Bounded work slices stream originals and reconcile server receipts. Pause cancels
+active transport; the event-only retry can still flush its observation while
+media remain paused. Network-policy changes replace constraints and fence the
+previous worker generation. Restart/reboot reuse the durable queue. Force-stop,
+system quotas and OEM restrictions may defer work and are not a guarantee of
+continuous execution. Report submission remains manual and separate.
+
+The isolated library instrumentation exercises local HTTPS targets, lost PUT
+responses, create-only retry, known/missing originals, identity/pause/deletion
+gates, partial revisions, metadata limits and interruption evidence. WorkManager
+queue/Keystore persistence is checked across process recreation and API35 reboot.
+This does not establish production R2 permissions, physical Samsung/OEM behavior,
+large-real-photo endurance or new React screen operation in an installed release.
+The full arm64 debug application also assembles successfully; the release APK
+has not been signed/distributed and no production account was used for testing.
+See `README.offline-capture.md` and backend `docs/capture-backups.md` for rollout
+requirements, private bucket configuration, retention and recovery boundaries.
+
+## September camera controls with 720p recording — 2026-10-06 (local)
+
+The requested two-week baseline is September 22: source commit `466b0d9`
+(September 20) and corresponding Pristine frontend `5122788`. Portrait controls
+already match that baseline. Restore its full-size landscape Bundle / Item /
+Photo / Extra, gallery, recording and Prev / Next / Done controls instead of
+the October 3 shrinking-column redesign. Keep a persistent vertical scrollbar
+so the earlier scrollable panel is discoverable on short or large-font screens.
+The canonical app already used this layout; its only runtime change is that
+scroll affordance. Both Pristine native checkouts receive the layout rollback.
+
+Do not revert the camera engine: strict 720p/30fps video, 3000px standard photo
+policy, current watermarking, bounded decoding where present, capture journals,
+atomic handoff and recovery remain intact. No saved photos, drafts, backend,
+upload flow or release artifacts are changed. A new native binary is required;
+these local changes are not yet pushed or released.
+
+Regression coverage includes both layout recording controls, strict video
+profile and offline real-resource inflation at portrait/short-landscape sizes
+with 100%, 130% and 200% font scaling. Run the dedicated Android check with
+`adb shell am instrument -w -e cameraLayoutOnly true com.assetinsight.app.test/com.assetinsight.app.PhotoWatermarkInstrumentation`.
+This checks resource layout and video policy, not physical camera endurance.
+
+Verification: Front-End native checkout passes all 100 Jest suites / 1,083 tests
+and TypeScript; canonical native passes TypeScript and 102 focused camera tests;
+standalone Mobile-APK passes TypeScript and 22 focused layout/video tests. The
+Android module and arm64 debug/test APK builds pass. Offline API35 instrumentation
+passes all nine size/font combinations plus existing strict HD/30fps profile and
+durable-video/journal assertions. No actual new recording or physical-device
+endurance was tested. An earlier concurrent run timed out five unrelated preview
+tests; the complete default-timeout rerun passed without test/runtime changes.
+
+Local debug build preparation only: reused the ignored debug keystore and linked
+the freshly built Worklets library into the legacy intermediate path expected by
+Reanimated's installed CMake file. No package/lockfile, production signing key or
+release artifact was changed. Build receipt:
+`/tmp/assetinsight-camera-september-build-final.log`; suite receipt:
+`/tmp/assetinsight-camera-september-tests-rerun.log`.
+
 ## Restore pre-reduction camera quality — 2026-10-05 (source fix; release pending)
 
 Restored the photo-size/encoding correction from Pristine `551205d`
@@ -600,14 +730,28 @@ the current work-item setup before opening a form. Legacy task IDs are never
 converted into modern work-item IDs. Existing linked reports open through the
 ordinary report-preview navigation.
 
-Modern forms offer **Generate files & new lot**. The existing upload/analysis
-workflow must first accept the report; only then does the app call
+Modern forms offer **Create Lot & Close** and **Create Lot & Continue**. The
+existing upload workflow must first accept the report; only then does Continue call
 `POST /auctioneer/work-items/:id/continue` with that report ID. The backend returns
 one deterministic successor with the same contract/type and a new work-item and
 client-submission identity. The form remounts only after validating that successor
-as an unused unknown-lots claim with empty source lots. Contract details carry
-forward; media, entered lots and upstream Schedule A source identifiers do not.
+as an unused unknown-lots claim with empty source lots and the same event. Current
+edited report details and settings carry forward (including explicit blank/false
+values); media, entered lots and upstream Schedule A source identifiers do not.
 This starts the next capture without waiting for analysis/file generation to finish.
+The accepted form unmounts immediately to stop stale autosave. Continuation retry
+only opens the next form and never reuploads the accepted photos. Local acceptance
+storage and record-only cleanup run independently; a failed local receipt retains
+the original inventory. The Incoming wrapper survives the parent setup update,
+while its inner keyed form gets fresh draft/capture/submission identities. Late
+responses and cleanup are owner-fenced. No contract permission is inferred from
+carried details, and an unavailable assignment still blocks fresh capture.
+
+October 6 regression checks cover both real form components with same-contract
+edited-detail/setting carryover, empty successor media, fresh submission identities,
+parent navigation updates, duplicate taps, interrupted handoff retry, stalled/failed
+local acceptance storage, delayed cleanup and account changes. These isolated tests
+do not certify live Auctioneer assignment behavior or physical-device endurance.
 
 Before upload, the current modern form is saved locally with its optional
 `auctioneerWorkItemId`. Reopening validates the saved type, contract, submission ID
@@ -694,7 +838,7 @@ Acknowledgement retains only an identity/revision tombstone, so restarting a
 camera session cannot reuse an earlier acknowledged revision. Both native and
 SQLite journals reject stale acknowledgements after a later capture.
 
-The fallback camera (including iOS and fixed imported lots) uses the same
+The iOS Vision camera (and saved sessions from older Android fallback builds) uses the same
 owner/draft recovery contract through a metadata-only SQLite pending-capture
 journal. Photo and video handoff waits for the local draft transaction before
 acknowledging that journal or enabling Done/navigation. Failed saves keep the
@@ -702,7 +846,8 @@ originals and offer retry from Done; reopening offers explicit journal recovery.
 Video originals are moved out of temporary camera storage without an additional
 offline copy. Offline/manual-submission captures never invoke cloud enhancement,
 even when the report's enhancement preference is retained. Switching into that
-mode cancels active enhancement and suppresses queued requests.
+mode cancels active enhancement and suppresses queued requests. New Android
+fixed-lot captures use the protected native journal described above instead.
 
 The native module streams `content://media` uploads directly with an exact known
 length, four transfer slots, progress, cancellation, HTTPS-only URLs and disabled
@@ -937,3 +1082,26 @@ while Avast holds the download. Builds run with the JDK pointed at Windows'
 certificate store (`JAVA_TOOL_OPTIONS=-Djavax.net.ssl.trustStoreType=WINDOWS-ROOT
 -Djavax.net.ssl.trustStore=NONE`) and the Gradle package placed in the
 wrapper's folder by hand after a checksum check.
+
+# Google Play 1.0.3 preparation (6 October 2026)
+
+Production AAB/APK profiles explicitly set `EXPO_PUBLIC_CAPTURE_BACKUP_ENABLED=false`.
+This release includes the current native CameraX and draft/Continue fixes, but does
+not enable private cloud capture backup. Both JavaScript and the compiled Android
+worker fail closed; prior backup authority is deactivated without deleting local
+originals or retained queue snapshots. Do not enable this flag until private R2,
+live transfer/recovery tests, public privacy disclosures and the owner-bound
+in-app opt-in are reviewed for a separate rollout.
+
+Gallery selection uses Android's system picker without broad image/video/audio
+read permission. Legacy storage access remains version-bounded; native capture
+and iOS permission behavior are preserved. Release builds exclude overlay and
+package-install permissions. EAS manages the monotonically increasing build code.
+An upload-key reset does not change Google's app-signing certificate: never ask
+sideloaded users to uninstall or clear their offline work to move to Play.
+
+Automatic device approval now hands the newly issued status challenge directly
+from registration into session exchange. The consumed enrollment token is not
+reused; malformed/expired replies and account changes fail closed. Ordinary
+per-device approval remains unchanged. Build 27 was a verified upload baseline;
+the replacement release must include this first-login correction before review.

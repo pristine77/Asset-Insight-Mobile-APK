@@ -17,6 +17,7 @@ jest.mock('./CameraScreen', () => ({ __esModule: true, default: jest.fn(() => nu
 jest.mock('./nativeAuctionCameraModule', () => ({ loadNativeAuctionCamera: jest.fn() }));
 
 const openAuctionCamera = jest.fn<Promise<string>, [string?]>();
+const getCameraCapabilities = jest.fn(async () => ({ lockedStructure: true }));
 
 const originalPlatform = Platform.OS;
 const lot: MixedLot = {
@@ -35,7 +36,8 @@ beforeEach(() => {
   jest.clearAllMocks();
   jest.mocked(OfflineCaptureStore.stageCameraActivity).mockResolvedValue(undefined);
   Object.defineProperty(Platform, 'OS', { value: 'android', configurable: true });
-  jest.mocked(loadNativeAuctionCamera).mockResolvedValue({ openAuctionCamera });
+  getCameraCapabilities.mockResolvedValue({ lockedStructure: true });
+  jest.mocked(loadNativeAuctionCamera).mockResolvedValue({ openAuctionCamera, getCameraCapabilities });
   jest.mocked(openAuctionCamera).mockResolvedValue(JSON.stringify([{ ...lot, files: [photo] }]));
 });
 
@@ -173,21 +175,192 @@ it('does not overwrite photo edits made while the recovery confirmation was open
   expect(alert).toHaveBeenLastCalledWith('Draft changed', expect.any(String));
 });
 
-it('routes fixed source lots to the structure-safe camera without opening legacy native capture', async () => {
+it('does not overwrite photo edits made while recovery activity is being staged', async () => {
+  const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => {});
+  const acknowledgeCapture = jest.fn();
+  const context = { ownerId: 'owner', draftId: 'draft', sessionId: 'session' };
+  const journal = { ...context, revision: 5, lots: [{ ...lot, files: [photo] }] };
+  const getPendingCapture = jest.fn().mockResolvedValue(JSON.stringify(journal));
+  let finish!: () => void;
+  jest.mocked(OfflineCaptureStore.stageCameraActivity).mockReturnValueOnce(new Promise<void>(resolve => { finish = resolve; }));
+  const input = { ...props(true), visible: false, captureContext: context };
+  jest.mocked(loadNativeAuctionCamera).mockResolvedValue({ openAuctionCamera, getPendingCapture, acknowledgeCapture });
+  const view = await render(<NativeAuctionCameraScreen {...input} />);
+  await waitFor(() => expect(alert).toHaveBeenCalledWith('Recover camera photos?', expect.any(String), expect.any(Array)));
+  await act(async () => { alert.mock.calls[0][2]?.find(button => button.text === 'Recover photos')?.onPress?.(); });
+  await view.rerender(<NativeAuctionCameraScreen {...input} lots={[{ ...lot, files: [{ ...photo, uri: 'file:///current-edit.jpg' }] }]} />);
+  await act(async () => { finish(); });
+  expect(input.onAutoSave).not.toHaveBeenCalled();
+  expect(input.setLots).not.toHaveBeenCalled();
+  expect(acknowledgeCapture).not.toHaveBeenCalled();
+  expect(alert).toHaveBeenLastCalledWith('Draft changed', expect.any(String));
+});
+
+it('opens the old native Android camera for fixed source lots with explicit structure protection', async () => {
   const input = { ...props(true), manualSubmissionRequired: true };
   await render(<NativeAuctionCameraScreen {...input} />);
-  expect(openAuctionCamera).not.toHaveBeenCalled();
-  expect(loadNativeAuctionCamera).not.toHaveBeenCalled();
-  expect(LegacyCameraScreen).toHaveBeenCalled();
-  const received = jest.mocked(LegacyCameraScreen).mock.calls[0][0];
-  expect(received).toMatchObject({ lockedStructure: true, lots: input.lots, activeLotIdx: 0, sourceLabels: ['Lot 157'], manualSubmissionRequired: true });
-  // The same capture/save callbacks retain photos; there is no native-result
-  // normalization, rejected setLots, or automatic close on this path.
-  expect(received.setLots).toBe(input.setLots);
-  expect(received.onAutoSave).toBe(input.onAutoSave);
-  expect(received.onClose).toBe(input.onClose);
+  await waitFor(() => expect(input.onClose).toHaveBeenCalledTimes(1));
+  expect(getCameraCapabilities).toHaveBeenCalledTimes(1);
+  expect(openAuctionCamera).toHaveBeenCalledTimes(1);
+  expect(JSON.parse(openAuctionCamera.mock.calls[0][0] || '{}')).toMatchObject({
+    lockedStructure: true, activeLotIdx: 0, sourceLabels: ['Lot 157'],
+    lots: [{ id: lot.id, mode: lot.mode, lotNumber: 1 }],
+  });
+  expect(input.onAutoSave).toHaveBeenCalledWith([expect.objectContaining({ id: lot.id, files: [expect.objectContaining(photo)] })], 0);
+  expect(LegacyCameraScreen).not.toHaveBeenCalled();
+});
+
+it('does not silently switch Android to Vision Camera when the native module fails', async () => {
+  jest.spyOn(console, 'warn').mockImplementation(() => {});
+  const input = props();
+  openAuctionCamera.mockRejectedValueOnce(new Error('Native module missing'));
+  const view = await render(<NativeAuctionCameraScreen {...input} />);
+  await waitFor(() => expect(view.getByText('Native camera could not open')).toBeTruthy());
+  expect(LegacyCameraScreen).not.toHaveBeenCalled();
   expect(input.setLots).not.toHaveBeenCalled();
+  expect(input.onAutoSave).not.toHaveBeenCalled();
   expect(input.onClose).not.toHaveBeenCalled();
+  await fireEvent.press(view.getByRole('button', { name: 'Retry native camera' }));
+  await waitFor(() => expect(input.onClose).toHaveBeenCalledTimes(1));
+  expect(openAuctionCamera).toHaveBeenCalledTimes(2);
+  expect(LegacyCameraScreen).not.toHaveBeenCalled();
+});
+
+it.each(['missing', 'unsupported'])('requires an updated native binary for fixed lots (%s capability)', async (kind) => {
+  getCameraCapabilities.mockResolvedValue({ lockedStructure: false });
+  jest.mocked(loadNativeAuctionCamera).mockResolvedValue({ openAuctionCamera,
+    ...(kind === 'missing' ? {} : { getCameraCapabilities }),
+  });
+  const input = props(true);
+  const view = await render(<NativeAuctionCameraScreen {...input} />);
+  await waitFor(() => expect(view.getByText('Camera update required')).toBeTruthy());
+  expect(openAuctionCamera).not.toHaveBeenCalled();
+  expect(LegacyCameraScreen).not.toHaveBeenCalled();
+  expect(view.queryByRole('button', { name: 'Retry native camera' })).toBeNull();
+  await fireEvent.press(view.getByRole('button', { name: 'Close camera' }));
+  expect(input.onClose).toHaveBeenCalledTimes(1);
+});
+
+it.each(['empty', 'duplicate'])('explains %s assigned lot data without launching either camera', async (kind) => {
+  const input = { ...props(true), lots: kind === 'empty' ? [] : [lot, lot] };
+  const view = await render(<NativeAuctionCameraScreen {...input} />);
+  await waitFor(() => expect(view.getByText('Camera lot data needs review')).toBeTruthy());
+  expect(openAuctionCamera).not.toHaveBeenCalled();
+  expect(LegacyCameraScreen).not.toHaveBeenCalled();
+  expect(view.queryByRole('button', { name: 'Retry native camera' })).toBeNull();
+  expect(input.setLots).not.toHaveBeenCalled();
+});
+
+it.each(['missing', 'extra', 'reordered', 'duplicate', 'rekeyed', 'missingId', 'mode', 'invalidMode'])('rejects a %s fixed native manifest without changing or acknowledging the draft', async (change) => {
+  jest.spyOn(Alert, 'alert').mockImplementation(() => {});
+  const acknowledgeCapture = jest.fn();
+  const second = { ...lot, id: 'source-2', mode: 'per_item' as const, lotNumber: '157-A', title: 'Kept title' };
+  const lots = [lot, second];
+  let returned: Record<string, unknown>[] = lots.map(value => ({ ...value, files: [photo] }));
+  if (change === 'missing') returned = returned.slice(0, 1);
+  if (change === 'extra') returned.push({ ...lot, id: 'source-3' });
+  if (change === 'reordered') returned.reverse();
+  if (change === 'duplicate') returned[1].id = lot.id;
+  if (change === 'rekeyed') returned[0].id = 'changed';
+  if (change === 'missingId') delete returned[0].id;
+  if (change === 'mode') returned[0].mode = 'per_photo';
+  if (change === 'invalidMode') returned[0].mode = 'invalid';
+  const context = { ownerId: 'owner', draftId: 'draft', sessionId: 'session' };
+  const input = { ...props(true), lots, captureContext: context };
+  jest.mocked(loadNativeAuctionCamera).mockResolvedValue({ openAuctionCamera, getCameraCapabilities, acknowledgeCapture });
+  openAuctionCamera.mockResolvedValue(JSON.stringify({ ...context, revision: 1, lots: returned }));
+  await render(<NativeAuctionCameraScreen {...input} />);
+  await waitFor(() => expect(input.onClose).toHaveBeenCalled());
+  expect(input.setLots).not.toHaveBeenCalled();
+  expect(input.onAutoSave).not.toHaveBeenCalled();
+  expect(OfflineCaptureStore.stageCameraActivity).not.toHaveBeenCalled();
+  expect(acknowledgeCapture).not.toHaveBeenCalled();
+  expect(LegacyCameraScreen).not.toHaveBeenCalled();
+});
+
+it('keeps fixed empty rows, custom labels, details, photo order and 720p video on the native round trip', async () => {
+  const empty = { ...lot, lotNumber: '157-A', title: 'First assigned lot' };
+  const second = { ...lot, id: 'source-2', lotNumber: '220', title: 'Second assigned lot', mode: 'per_item' as const };
+  const original = { ...photo, mediaId: 'original', localKey: 'kept-cloud-key', originalUri: photo.uri };
+  const extra = { ...photo, uri: 'file:///extra.jpg', mediaId: 'extra' };
+  const clip = { uri: 'file:///video.mp4', type: 'video/mp4', name: 'video.mp4', width: 1280, height: 720, size: 1000 };
+  const input = { ...props(true), lots: [empty, { ...second, files: [original], extraFiles: [extra] }],
+    sourceLabels: ['Lot 157-A', 'Lot 220'], activeLotIdx: 1 };
+  openAuctionCamera.mockResolvedValue(JSON.stringify([empty, { ...second, files: [{ uri: original.uri }], extraFiles: [{ uri: extra.uri }], videoFile: clip }]));
+  await render(<NativeAuctionCameraScreen {...input} />);
+  await waitFor(() => expect(input.onClose).toHaveBeenCalledTimes(1));
+  expect(JSON.parse(openAuctionCamera.mock.calls[0][0] || '{}')).toMatchObject({
+    lockedStructure: true, sourceLabels: ['Lot 157-A', 'Lot 220'], activeLotNumber: 2,
+    lots: [{ id: empty.id, lotNumber: 1 }, { id: second.id, lotNumber: 2 }],
+  });
+  expect(input.setLots).toHaveBeenCalledWith([
+    empty,
+    expect.objectContaining({ ...second, files: [expect.objectContaining(original)], extraFiles: [expect.objectContaining(extra)], videoFile: expect.objectContaining(clip) }),
+  ]);
+  expect(input.setActiveLotIdx).toHaveBeenCalledWith(1);
+  expect(LegacyCameraScreen).not.toHaveBeenCalled();
+});
+
+it.each(['native', 'sqlite'])('preserves a mismatched fixed %s recovery journal without overwriting assigned lots', async (source) => {
+  const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => {});
+  const context = { ownerId: 'owner', draftId: 'draft', sessionId: 'session' };
+  const journal = { ...context, revision: 7, lots: [{ ...lot, id: 'wrong-assignment', files: [photo] }] };
+  const acknowledgeCapture = jest.fn();
+  const getPendingCapture = jest.fn().mockResolvedValue(JSON.stringify(journal));
+  if (source === 'sqlite') jest.mocked(OfflineCaptureStore.getPendingCapture).mockResolvedValueOnce(journal);
+  jest.mocked(loadNativeAuctionCamera).mockResolvedValue({ openAuctionCamera, getPendingCapture, acknowledgeCapture });
+  const input = { ...props(true), visible: false, captureContext: context };
+  await render(<NativeAuctionCameraScreen {...input} />);
+  await waitFor(() => expect(alert).toHaveBeenCalledWith('Camera recovery needs review', expect.stringContaining('originals are unchanged')));
+  expect(input.setLots).not.toHaveBeenCalled();
+  expect(input.onAutoSave).not.toHaveBeenCalled();
+  expect(OfflineCaptureStore.stageCameraActivity).not.toHaveBeenCalled();
+  expect(OfflineCaptureStore.acknowledgePendingCapture).not.toHaveBeenCalled();
+  expect(acknowledgeCapture).not.toHaveBeenCalled();
+  expect(openAuctionCamera).not.toHaveBeenCalled();
+});
+
+it.each(['id', 'title', 'lotNumber', 'sourceLabel'])('fences a changed fixed %s while the native capability response is pending', async (changed) => {
+  let finish!: (capabilities: { lockedStructure: boolean }) => void;
+  getCameraCapabilities.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+  const input = props(true);
+  const view = await render(<NativeAuctionCameraScreen {...input} />);
+  await waitFor(() => expect(getCameraCapabilities).toHaveBeenCalled());
+  await view.rerender(<NativeAuctionCameraScreen {...input}
+    lots={[{ ...lot, ...(changed === 'sourceLabel' ? {} : { [changed]: 'new-assignment' }) }]}
+    sourceLabels={changed === 'sourceLabel' ? ['Lot new-label'] : input.sourceLabels} />);
+  await act(async () => { finish({ lockedStructure: true }); });
+  expect(openAuctionCamera).not.toHaveBeenCalled();
+  expect(input.setLots).not.toHaveBeenCalled();
+  expect(view.getByText('Camera closed')).toBeTruthy();
+  expect(LegacyCameraScreen).not.toHaveBeenCalled();
+});
+
+it.each(['return', 'save'])('fences fixed assignment changes during native %s without acknowledging media', async (stage) => {
+  const context = { ownerId: 'owner', draftId: 'draft', sessionId: 'session' };
+  const acknowledgeCapture = jest.fn();
+  jest.mocked(loadNativeAuctionCamera).mockResolvedValue({ openAuctionCamera, getCameraCapabilities, acknowledgeCapture });
+  let returnResult!: (result: string) => void;
+  let finishSave!: () => void;
+  openAuctionCamera.mockReturnValueOnce(new Promise(resolve => { returnResult = resolve; }));
+  const input = { ...props(true), captureContext: context };
+  input.onAutoSave.mockReturnValueOnce(new Promise<void>(resolve => { finishSave = resolve; }));
+  const view = await render(<NativeAuctionCameraScreen {...input} />);
+  await waitFor(() => expect(openAuctionCamera).toHaveBeenCalled());
+  const result = JSON.stringify({ ...context, revision: 1, lots: [{ ...lot, files: [photo] }] });
+  if (stage === 'save') {
+    await act(async () => { returnResult(result); });
+    await waitFor(() => expect(input.onAutoSave).toHaveBeenCalled());
+  }
+  await view.rerender(<NativeAuctionCameraScreen {...input} lots={[{ ...lot, id: 'new-assignment' }]} />);
+  await act(async () => { if (stage === 'save') finishSave(); else returnResult(result); });
+  expect(acknowledgeCapture).not.toHaveBeenCalled();
+  expect(input.onClose).not.toHaveBeenCalled();
+  expect(view.getByText('Camera closed')).toBeTruthy();
+  if (stage === 'return') {
+    expect(input.setLots).not.toHaveBeenCalled();
+    expect(input.onAutoSave).not.toHaveBeenCalled();
+  }
 });
 
 it.each([undefined, false])('preserves native capture for unlocked work (%s)', async (locked) => {

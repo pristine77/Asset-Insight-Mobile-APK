@@ -1,5 +1,117 @@
 # Offline capture — Asset and Lot Listing
 
+## Durable Android cloud backup — 2026-10-06 (local; release pending)
+
+Saved offline/manual-submit Asset and Lot captures now stage an independent
+backup intent in the same SQLite transaction as their local save. Revision-scoped
+outbox entries cannot overwrite an earlier snapshot before Android acknowledges
+it. A bounded, local-only handoff sends metadata to the native scheduler without
+waiting for the network; unacknowledged work remains in SQLite. Legacy editable
+captures are seeded once, not rehashed on every screen/auth restart.
+
+Android WorkManager owns streaming original-byte uploads, not a React timer.
+Closing the form or ordinary process loss does not remove the durable queue.
+Checkpoints, immutable private objects and server SHA-256/size verification allow
+same-plan retry after lost responses. A newer shortened snapshot cannot cancel
+pending originals from an earlier revision. Local files/references are retained;
+no backup path deletes, recompresses or watermarks an original. Camera UI, photo
+resolution and 720p/30fps recording remain unchanged.
+
+Drafts and Profile show **Photo cloud backup**, exact verified/total files,
+Pause/Resume and an owner-scoped mobile-data preference. Unmetered/Wi-Fi is the
+default; enabling mobile data warns about charges. An older pending revision is
+shown separately, without adding its counts to the current revision. Explicit
+draft deletion pauses pending backups and cannot be bypassed by Resume. It does
+not erase originals or existing cloud backups.
+
+Report Activity records explicit user pauses, resumes, network/system/unknown
+interruptions and server-verified completion. Offline observations persist until
+connectivity and authorization return, even if no upload plan was registered yet.
+Unknown process loss is not proof that the user pressed Pause or deleted data.
+Captured/report counts remain distinct from exact backup-revision counts.
+
+This supersedes older "nothing uploads automatically" wording **for backup
+only**. Report submission, generation, approval and Auctioneer delivery remain
+explicit and unchanged. No accepted report is recreated by backup. New backup
+plans do not overwrite ordinary cloud drafts. Complete-plan, owner-authenticated
+content endpoints support recovery; automatic replacement of local drafts and a
+new cross-device backup-restoration UI are not part of this change.
+
+Android can defer background work, and force-stop requires reopening the app.
+The seven-day backup-only grant must be renewed online; logout, owner changes or
+device restrictions stop authorization. Missing originals require review and are
+never silently skipped. iOS/older binaries do not advertise this Android service.
+The user must retain the original device until verification completes; uninstall,
+clear-app-data, physical loss and manufacturer-specific restrictions cannot be
+overridden by the app. There is no automatic retention/pruning policy in this
+release; protected original references may continue using device storage.
+
+Roll out backend support first, then admin and a **new native binary**. Configure
+`CAPTURE_BACKUP_R2_BUCKET` as a genuinely private bucket separate from current and
+legacy public report buckets; turn off its R2.dev/custom-domain public access and
+verify policy before enabling backup. Missing/unsafe configuration fails closed.
+Existing R2 credentials need permission on this private bucket. See backend
+`docs/capture-backups.md`; this is not an OTA-only change. No production access,
+customer repair, upload, push, deployment or signed APK release was performed.
+
+Validation includes isolated real SQLite and React interaction tests, owner/race
+and 5,000-photo metadata cases, Android/iOS Hermes exports, Kotlin compilation,
+and API35 HTTPS/WorkManager interruption checks. See `README.android.md` for the
+native test boundary. These are not a physical-device battery/OEM test or a
+real 5,000-original end-to-end upload endurance certification.
+
+Final native gate: 104 Jest suites / 1,230 tests, TypeScript, Android/iOS Hermes
+exports, arm64 debug application assembly, module test assembly and API35 native
+instrumentation pass. Scoped ESLint has no errors (existing array-style and
+default-import warnings remain). User labels such as `Data: 2026`, `File: inspected`
+and `Asset: tractor` are preserved while genuine local URIs are stripped/rejected.
+Receipts: `/tmp/assetinsight-durable-backup-native-final.log`,
+`/tmp/assetinsight-backup-hermes-final.log`,
+`/tmp/assetinsight-backup-full-debug-final.log` and
+`/tmp/assetinsight-capture-backup-native-persistence-final.log`.
+
+## Preserve originals through cloud sync — 2026-10-06 (local; release pending)
+
+Drafts now opens the existing local capture even when a cloud row has a newer
+timestamp. Cloud synchronization acknowledges metadata only: it never substitutes
+remote URLs for device originals and never automatically prunes their files.
+This removes the partial-cloud replacement/cleanup path found while investigating
+the 224-photo draft incident. This fix does not recover or modify that customer's
+existing draft, server records, or original media.
+
+Cloud-only Continue fetches fresh, owner-bound detail. Every lot, media identity,
+slot/index, cover and confirmed size must form a complete mapping before a local
+copy is created. A 50-of-224 uploaded manifest is rejected as a whole, with clear
+guidance to keep the original device and retry—not restored as 50 or zero photos.
+The SQLite insert checks absence atomically, so a local capture saved during the
+request, including an accepted/hidden draft, cannot be overwritten. Opening does
+not forget a paused upload. Repeated taps, account changes and late responses are
+fenced; periodic refresh does not repeatedly invalidate a slow in-flight load.
+
+Backup status compares the actual local/cloud manifest, not the server's upload
+progress timestamp. A shorter confirmed remote copy is not a complete local backup.
+Cloud acknowledgement/failure applies only to the expected owner, timestamp and
+local revision. Legacy uploaded objects with missing byte-size evidence are
+confirmed by server HEAD, without sending their bytes again. Normal offline
+captures remain manual-submit; reconnect still cannot submit an offline report.
+
+Verification: 101 Jest suites / 1,162 tests, TypeScript and Android Hermes export
+pass; scoped ESLint has no errors (existing import/array-style warnings remain).
+RN interaction tests exercise both Continue forms, delayed cleanup and parent
+handoff, cached/incomplete cloud copies, repeated taps, paused uploads, account
+changes, and local saves during loading. Real SQLite tests preserve all 224
+original references/activity during a rejected 50-photo replacement. Pure
+manifest tests cover 5,000 entries. Isolated backend compatibility checks pass
+24 tests; backend runtime is unchanged. Android API35 retained-native harness
+passes 254/5,000-photo metadata handoff/recovery and camera layout/720p profile
+checks. That harness does not execute the new React screens; physical-device,
+real-photo endurance and live Auctioneer continuation remain unverified.
+
+No push, production deployment, customer data repair or signed APK release.
+Installed apps require a new native binary, including the retained camera rollback.
+Receipts: `/tmp/assetinsight-mobile-continue-draft-final2-tests.log` and
+`/tmp/assetinsight-mobile-fixes-final-hermes.log`.
+
 ## User boundary
 
 Both native forms default to Online and offer labelled Online / Offline radio
@@ -17,8 +129,9 @@ The saving screen blocks further edits until the transaction finishes.
 lot/photo order, report-only photos and cover choices behind a loading/error
 gate. Only successfully loaded offline-origin work exposes **Submit** (or
 **Resume upload** for interrupted work). Merely autosaving does not enable
-submission. Users may edit/save again; opening and reconnecting never upload.
-Incoming Generate files & new lot remains Online-only. Existing submission
+submission. Users may edit/save again; opening and reconnecting never submit a report.
+The independent Android backup service described above may upload saved originals.
+Incoming Create Lot & Continue remains Online-only. Existing submission
 identity, assignment validation and missing-original checks are preserved.
 
 Successful review opens enqueue a metadata-only `draft_opened` activity with
@@ -58,7 +171,8 @@ photos offline. It reuses MediaStore content URIs or durable camera files. A
 temporary imported image may require one managed durable import. SQLite contains
 metadata, not photo bytes. Gallery originals and files shared with another draft
 are not deleted by save, acceptance or discard. Thumbnails remain disposable.
-Photos are **not cloud-backed up** until an explicit upload succeeds. Missing or
+Photos are **not cloud-backed up** until server verification of backup or an
+explicit report upload succeeds. Merely saving metadata is not a media backup. Missing or
 inaccessible originals remain in the draft and block submission until repaired.
 
 Android capture writes a durable owner/draft/session journal; the fallback camera

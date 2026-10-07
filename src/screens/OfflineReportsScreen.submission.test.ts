@@ -8,7 +8,7 @@ describe('Drafts submission boundary', () => {
     const handler = source.match(/const submitLocalDraft = useCallback\(([\s\S]*?)\}, \[onContinueDraft\]\);/)?.[1];
     expect(handler).toBeDefined();
     expect(handler).toContain('onContinueDraft(draft.id, draft.type)');
-    expect(handler).not.toMatch(/\b(?:if|await)\b/);
+    expect(handler).toContain('backgroundUploadManager.isBusy');
     expect(source).toContain('onPress={() => submitLocalDraft(item.draft)}');
   });
 
@@ -19,9 +19,12 @@ describe('Drafts submission boundary', () => {
   });
 
   it('continues to restore cloud-only drafts before opening their canonical form', () => {
-    const handler = source.match(/const continueCloudDraft = useCallback\(([\s\S]*?)\}, \[loadData, onContinueDraft\]\);/)?.[1];
+    const handler = source.match(/const continueCloudDraft = useCallback\(([\s\S]*?)\}, \[onContinueDraft\]\);/)?.[1];
     expect(handler).toContain('AutoSaveService.saveCloudDraftSnapshot');
     expect(handler).toContain('onContinueDraft(local.id, local.type)');
     expect(handler).not.toContain('reportDraftService.delete');
+    expect(handler).toContain('reportDraftService.get(cloudId)');
+    expect(handler).toContain('hydrateCompleteCloudDraft');
+    expect(source).not.toContain('deleteDraftMedia');
   });
 });

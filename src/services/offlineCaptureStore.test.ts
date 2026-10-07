@@ -34,6 +34,100 @@ const draft = (id = 'draft-one', count = 2): OfflineReportDraft => ({
 });
 
 describe('owner-scoped offline capture metadata', () => {
+  test('backup intent commits with the draft and stale native acknowledgements cannot discard a later save', async () => {
+    const { store } = fixtureStore();
+    const first = await store.saveDraft(draft('backup', 224));
+    expect(await store.pendingBackups()).toEqual([first]);
+    const next = await store.saveDraft({ ...first, title: 'Edited while backing up' });
+    await store.acknowledgeBackupQueue(first.id, first.localRevision!, 'owner-one');
+    expect(await store.pendingBackups()).toEqual([next]);
+    await store.acknowledgeBackupQueue(next.id, next.localRevision!, 'owner-one');
+    expect(await store.pendingBackups()).toEqual([]);
+    expect((await store.getDraft(first.id))!.lots[0].mainImages).toHaveLength(224);
+  });
+  test('unchanged receipt metadata never feeds a backup enqueue loop; new owners cannot acknowledge', async () => {
+    const { store } = fixtureStore();
+    const first = await store.saveDraft(draft());
+    await store.acknowledgeBackupQueue(first.id, first.localRevision!, 'owner-one');
+    await store.updateDraft(first.id, item => ({ ...item, cloudSyncedAt: '2026-10-06T00:00:00Z' }));
+    expect(await store.pendingBackups()).toEqual([]);
+    store.setOwner('owner-two');
+    await expect(store.acknowledgeBackupQueue(first.id, first.localRevision!, 'owner-one')).rejects.toThrow('account changed');
+  });
+  test('a deleted draft produces a durable stop while pending backup originals remain protected', async () => {
+    const { store } = fixtureStore();
+    const first = await store.saveDraft(draft());
+    await store.acknowledgeBackupQueue(first.id, first.localRevision!, 'owner-one');
+    const changed = await store.saveDraft({ ...first, lots: [{ ...first.lots[0], mainImages: [] }] });
+    expect(await store.getProtectedMediaUris()).toHaveLength(2);
+    await store.deleteDraft(changed.id);
+    expect((await store.pendingBackups()).some(item => item.submissionState === 'discarded')).toBe(true);
+    expect(await store.getProtectedMediaUris()).toHaveLength(2);
+  });
+  test('seed queues only this owner’s editable offline captures without un-hiding accepted drafts', async () => {
+    const { store, database } = fixtureStore();
+    const active = await store.saveDraft(draft());
+    await store.saveDraft(draft('accepted'));
+    await store.setSubmissionState('accepted', 'accepted');
+    database.exec('DELETE FROM capture_backup_outbox');
+    database.exec('DELETE FROM capture_backup_seeded'); // Simulate captures saved before this feature existed.
+    await store.seedBackups();
+    expect((await store.pendingBackups()).map(item => item.id)).toEqual([active.id]);
+    store.setOwner('other'); await store.seedBackups(); expect(await store.pendingBackups()).toEqual([]);
+  });
+  test('a shorter save cannot replace original backup intent before Android acknowledges the earlier revision', async () => {
+    const { store } = fixtureStore();
+    const first = await store.saveDraft(draft('pending-originals', 224));
+    const second = await store.saveDraft({ ...first, lots: [{ ...first.lots[0], mainImages: [] }] });
+    const pending = await store.pendingBackups();
+    expect(pending.map(item => item.localRevision)).toEqual([first.localRevision, second.localRevision]);
+    expect(pending[0].lots[0].mainImages).toHaveLength(224);
+    expect(pending[1].lots[0].mainImages).toHaveLength(0);
+    await store.acknowledgeBackupQueue(second.id, second.localRevision!, 'owner-one');
+    expect((await store.pendingBackups())[0].lots[0].mainImages).toHaveLength(224);
+  });
+
+  test('reopening after metadata-only receipt updates never seeds an already queued capture again', async () => {
+    const { store } = fixtureStore();
+    const saved = await store.saveDraft(draft('seed-once'));
+    await store.acknowledgeBackupQueue(saved.id, saved.localRevision!, 'owner-one');
+    await store.saveDraft({ ...saved, cloudSyncedAt: '2026-10-06T12:00:00Z' });
+    await store.seedBackups();
+    expect(await store.pendingBackups()).toEqual([]);
+    const latest = await store.getDraft(saved.id);
+    await store.saveDraft({ ...latest!, title: 'Changed by owner' });
+    expect(await store.pendingBackups()).toHaveLength(1);
+  });
+  test('cloud restore cannot replace a concurrently saved 224-photo draft or its activity', async () => {
+    const { store, database } = fixtureStore();
+    const captured = await store.saveDraft(draft('nick-shaped-fixture', 224));
+    const events = await store.pendingActivity();
+    await expect(store.createCloudDraft({ ...draft('nick-shaped-fixture', 50), ownerId: 'owner-one' }, 'owner-one'))
+      .rejects.toThrow('already saved');
+    expect(await store.getDraft(captured.id)).toEqual(captured);
+    expect(await store.pendingActivity()).toEqual(events);
+    expect(database.prepare('SELECT count(*) AS count FROM capture_media').get().count).toBe(224);
+    expect(await store.getProtectedMediaUris()).toHaveLength(224);
+  });
+  test('only creates a missing cloud draft, fences owner and keeps hidden accepted originals', async () => {
+    const { store } = fixtureStore();
+    const saved = await store.createCloudDraft({ ...draft(), ownerId: 'owner-one' }, 'owner-one');
+    expect(saved.lots[0].mainImages).toHaveLength(2);
+    await store.setSubmissionState(saved.id, 'accepted');
+    await expect(store.createCloudDraft({ ...draft(), ownerId: 'owner-one' }, 'owner-one')).rejects.toThrow('already saved');
+    store.setOwner('owner-two');
+    await expect(store.createCloudDraft({ ...draft('foreign'), ownerId: 'owner-one' }, 'owner-one')).rejects.toThrow('account changed');
+    expect(await store.getDraft('foreign')).toBeNull();
+    store.setOwner('owner-one');
+    expect((await store.getDraft(saved.id))?.submissionState).toBe('accepted');
+  });
+  test('a no-op stale cloud acknowledgement does not increment the local revision', async () => {
+    const { store } = fixtureStore();
+    const saved = await store.saveDraft(draft());
+    const result = await store.updateDraft(saved.id, current => current);
+    expect(result).toEqual(saved);
+    expect(await store.getDraft(saved.id)).toEqual(saved);
+  });
   test.each(['asset', 'lotListing'] as const)('%s review opens record only metadata and replay safely after acknowledgement', async type => {
     const { store, database, statements } = fixtureStore();
     const saved = await store.saveDraft({ ...draft(), type, formData: { factorsAnalysis: 'Do not send this', watermarkImages: true } });

@@ -36,6 +36,31 @@ interface CameraScreenProps {
 const VALID_MODES = new Set<CaptureMode>(['single_lot', 'per_item', 'per_photo']);
 const MAX_ASSET_LOT_PHOTOS = 200;
 
+class FixedLotStructureError extends Error {}
+
+const structureIdentity = (props: CameraScreenProps) => JSON.stringify([
+  Boolean(props.lockedStructure),
+  ...(props.lockedStructure ? props.lots.map((lot, index) => [
+    lot.id, lot.mode ?? 'single_lot', lot.lotNumber, lot.title, props.sourceLabels?.[index],
+  ]) : []),
+]);
+
+// Validate before normalization: an absent/rekeyed ID must never be repaired by
+// positional fallback for an assigned lot, including an older recovery journal.
+const assertFixedLotStructure = (value: unknown, expected: MixedLot[]) => {
+  const lots = Array.isArray(value) ? value : asObject(value)?.lots;
+  if (!Array.isArray(lots) || !expected.length || lots.length !== expected.length ||
+    new Set(expected.map(lot => lot.id)).size !== expected.length ||
+    lots.some((value, index) => {
+      const lot = asObject(value);
+      const mode = lot?.mode ?? 'single_lot';
+      return !lot || Array.isArray(value) || typeof expected[index].id !== 'string' || !expected[index].id.trim() || lot.id !== expected[index].id ||
+        !VALID_MODES.has(mode as CaptureMode) || mode !== (expected[index].mode ?? 'single_lot');
+    })) {
+    throw new FixedLotStructureError('The camera lot layout no longer matches the assigned lots.');
+  }
+};
+
 const asObject = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
 
@@ -238,7 +263,9 @@ const serializeNativePhoto = (
   };
 };
 
-const buildNativePayload = (lots: MixedLot[], activeLotIdx: number, captureContext?: CaptureContext) => {
+const buildNativePayload = (lots: MixedLot[], activeLotIdx: number, captureContext?: CaptureContext,
+  lockedStructure = false, sourceLabels?: string[]) => {
+  if (lockedStructure) assertFixedLotStructure(lots, lots);
   const safeActiveIdx = lots.length > 0 ? Math.max(0, Math.min(activeLotIdx, lots.length - 1)) : 0;
   const safeLots = lots.map((lot, index) => {
     const files = (lot.files ?? [])
@@ -279,6 +306,8 @@ const buildNativePayload = (lots: MixedLot[], activeLotIdx: number, captureConte
 
   return JSON.stringify({
     ...(captureContext ? { captureContext } : {}),
+    lockedStructure,
+    sourceLabels: lots.map((lot, index) => sourceLabels?.[index] || (lot.lotNumber ? `Lot ${lot.lotNumber}` : `Lot ${index + 1}`)),
     lots: safeLots,
     activeLotIdx: safeActiveIdx,
     activeLotNumber: safeActiveIdx + 1,
@@ -291,8 +320,9 @@ const isCancelledError = (error: unknown) => {
 };
 
 const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
-  const { visible, onClose, lockedStructure = false } = props;
-  const [useLegacyFallback, setUseLegacyFallback] = useState(false);
+  const { visible, onClose } = props;
+  const [launchAttempt, setLaunchAttempt] = useState(0);
+  const [launchError, setLaunchError] = useState<{ title: string; message: string; canRetry: boolean } | null>(null);
   const [launching, setLaunching] = useState(false);
   const [savingDraft, setSavingDraft] = useState(false);
   // The account or draft changed while this camera was opening or returning.
@@ -305,12 +335,14 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
   latestPropsRef.current = props;
 
   useEffect(() => {
-    const context = props.captureContext;
+    const context = latestPropsRef.current.captureContext;
     if (visible || !context) return;
+    const startingStructure = structureIdentity(latestPropsRef.current);
     let disposed = false;
     const stillCurrent = () => !disposed && !latestPropsRef.current.visible &&
       latestPropsRef.current.captureContext?.ownerId === context.ownerId &&
-      latestPropsRef.current.captureContext?.draftId === context.draftId;
+      latestPropsRef.current.captureContext?.draftId === context.draftId &&
+      structureIdentity(latestPropsRef.current) === startingStructure;
     void (async () => {
       const fallbackJournal = await OfflineCaptureStore.getPendingCapture(context);
       const native = !fallbackJournal && Platform.OS === 'android' ? await loadNativeAuctionCamera() : undefined;
@@ -323,6 +355,7 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
       recoveryPromptsRef.current.add(key);
       const current = latestPropsRef.current;
       const startingPhotos = JSON.stringify(current.lots);
+      if (current.lockedStructure) assertFixedLotStructure(journal, current.lots);
       const recovered = fallbackJournal ? fallbackJournal.lots as MixedLot[] : normalizeNativeLots(journal, current.lots);
       const count = recovered.reduce((total, lot) => total + lot.files.length + lot.extraFiles.length, 0);
       const videos = recovered.reduce((total, lot) => total + (lot.videoFile ? 1 : 0), 0);
@@ -340,6 +373,11 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
               if (!current.onAutoSave) throw new Error('Draft saving is unavailable. Reopen the report form.');
               const index = Math.min(current.activeLotIdx, Math.max(0, recovered.length - 1));
               if (!fallbackJournal) await OfflineCaptureStore.stageCameraActivity(journal);
+              if (!stillCurrent()) return;
+              if (JSON.stringify(latestPropsRef.current.lots) !== startingPhotos) {
+                Alert.alert('Draft changed', 'Your current photos changed. Reopen this draft to review the camera recovery before replacing them.');
+                return;
+              }
               await current.onAutoSave(recovered, index);
               if (!stillCurrent()) return;
               current.setLots(recovered);
@@ -353,7 +391,12 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
           })();
         } },
       ]);
-    })().catch(() => { /* Never consume or remove a journal that cannot be read. */ });
+    })().catch(error => {
+      // Keep incompatible journals; neither guess an assigned lot nor discard media.
+      if (error instanceof FixedLotStructureError && stillCurrent()) {
+        Alert.alert('Camera recovery needs review', 'The saved camera session does not match these assigned lots. Your draft and camera originals are unchanged. Contact support to recover the saved session.');
+      }
+    });
     return () => { disposed = true; };
   }, [visible, props.captureContext?.ownerId, props.captureContext?.draftId]);
 
@@ -363,21 +406,22 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
       setLaunching(false);
       setSavingDraft(false);
       setContextChanged(false);
-      setUseLegacyFallback(false);
+      setLaunchError(null);
     }
   }, [visible]);
 
   useEffect(() => {
-    // The legacy Android module can create/rekey/delete lot rows. Fixed upstream
-    // lots use the existing JS camera, whose controls preserve their identities.
-    if (!visible || Platform.OS !== 'android' || useLegacyFallback || lockedStructure) return;
+    // Every Android listing uses our native CameraX UI, including assigned lots.
+    // Do not silently switch camera engines when launch fails.
+    if (!visible || Platform.OS !== 'android') return;
 
     const launchId = launchIdRef.current + 1;
     launchIdRef.current = launchId;
     let disposed = false;
     const current = latestPropsRef.current;
+    const startingStructure = structureIdentity(current);
     const stillCurrent = () => !disposed && launchIdRef.current === launchId &&
-      latestPropsRef.current.visible && !latestPropsRef.current.lockedStructure &&
+      latestPropsRef.current.visible && structureIdentity(latestPropsRef.current) === startingStructure &&
       latestPropsRef.current.captureContext?.ownerId === current.captureContext?.ownerId &&
       latestPropsRef.current.captureContext?.draftId === current.captureContext?.draftId;
 
@@ -394,12 +438,21 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
     const launchNativeCamera = async () => {
       setLaunching(true);
       setContextChanged(false);
+      setLaunchError(null);
       let receivedResult = false;
 
       try {
-        const payload = buildNativePayload(current.lots, current.activeLotIdx, current.captureContext);
-        const { openAuctionCamera, acknowledgeCapture } = await loadNativeAuctionCamera();
+        const payload = buildNativePayload(current.lots, current.activeLotIdx, current.captureContext, current.lockedStructure, current.sourceLabels);
+        const { openAuctionCamera, acknowledgeCapture, getCameraCapabilities } = await loadNativeAuctionCamera();
         if (!stillCurrent()) return stale();
+        if (current.lockedStructure) {
+          const capabilities = await getCameraCapabilities?.();
+          if (!stillCurrent()) return stale();
+          if (capabilities?.lockedStructure !== true) {
+            setLaunchError({ title: 'Camera update required', message: 'Install the latest Asset Insight app update to use the native camera for assigned lots. Keep this app and its saved drafts; do not uninstall or clear its data.', canRetry: false });
+            return;
+          }
+        }
         const json = await openAuctionCamera(payload);
 
         if (!stillCurrent()) return stale();
@@ -416,6 +469,7 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
           latestPropsRef.current.onClose();
           return;
         }
+        if (current.lockedStructure) assertFixedLotStructure(parsed, current.lots);
         const nextLots = normalizeNativeLots(parsed, current.lots);
         const nextActiveIdx =
           nextLots.length > 0
@@ -463,9 +517,13 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
           return;
         }
 
-        console.warn('[Camera] Native auction camera unavailable, using fallback:', error);
-        Alert.alert('Camera Error', 'Native camera is unavailable. Opening the backup camera.');
-        setUseLegacyFallback(true);
+        if (error instanceof FixedLotStructureError || code === 'E_CAMERA_INPUT') {
+          setLaunchError({ title: 'Camera lot data needs review', message: 'The saved camera data could not be matched to this report. Your draft and camera originals are unchanged. Close the camera and reopen the draft; contact support if it still cannot be restored.', canRetry: false });
+          return;
+        }
+
+        console.warn('[Camera] Native auction camera could not open:', error);
+        setLaunchError({ title: 'Native camera could not open', message: 'Your draft and saved photos are unchanged. Check camera permission, then retry. If this continues, install the latest app update without uninstalling or clearing app data.', canRetry: true });
       } finally {
         if (!disposed && launchIdRef.current === launchId) {
           setLaunching(false);
@@ -479,11 +537,11 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
     return () => {
       disposed = true;
     };
-  }, [lockedStructure, useLegacyFallback, visible]);
+  }, [launchAttempt, visible]);
 
   if (!visible) return null;
 
-  if (Platform.OS !== 'android' || useLegacyFallback || lockedStructure) {
+  if (Platform.OS !== 'android') {
     return <LegacyCameraScreen {...props} />;
   }
 
@@ -497,6 +555,19 @@ const NativeAuctionCameraScreen: React.FC<CameraScreenProps> = (props) => {
               <Text style={styles.loadingText}>
                 This draft changed while the camera was open. Anything the camera captured stays with the original draft and is offered for recovery when that draft is reopened.
               </Text>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close camera" onPress={onClose} style={styles.closeButton}>
+                <Text style={styles.closeButtonText}>Close</Text>
+              </TouchableOpacity>
+            </>
+          ) : launchError ? (
+            <>
+              <Text style={styles.loadingTitle}>{launchError.title}</Text>
+              <Text style={styles.loadingText}>{launchError.message}</Text>
+              {launchError.canRetry ? (
+                <TouchableOpacity accessibilityRole="button" accessibilityLabel="Retry native camera" onPress={() => setLaunchAttempt(attempt => attempt + 1)} style={styles.closeButton}>
+                  <Text style={styles.closeButtonText}>Retry native camera</Text>
+                </TouchableOpacity>
+              ) : null}
               <TouchableOpacity accessibilityRole="button" accessibilityLabel="Close camera" onPress={onClose} style={styles.closeButton}>
                 <Text style={styles.closeButtonText}>Close</Text>
               </TouchableOpacity>

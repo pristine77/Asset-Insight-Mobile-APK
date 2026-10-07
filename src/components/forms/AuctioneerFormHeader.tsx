@@ -11,12 +11,12 @@ export default function AuctioneerFormHeader({ setup, disabled, onPress }: {
   const { colors } = useAppTheme();
   return <View style={[styles.container, { backgroundColor: colors.surface, borderColor: colors.border }]}>
     <Text style={[styles.title, { color: colors.text }]}>Contract {setup.contract.contractNo}{setup.kind === 'scheduleA' ? ' · Schedule A lots are locked' : ''}</Text>
-    <TouchableOpacity accessibilityRole="button" accessibilityLabel="Generate files & new lot"
+    <TouchableOpacity accessibilityRole="button" accessibilityLabel="Create Lot & Continue"
       accessibilityState={{ disabled }} style={[styles.button, { backgroundColor: colors.accent, opacity: disabled ? 0.5 : 1 }]}
       disabled={disabled} onPress={onPress}>
-      <Text style={[styles.buttonText, { color: colors.accentText }]}>Generate files &amp; new lot</Text>
+      <Text style={[styles.buttonText, { color: colors.accentText }]}>Create Lot &amp; Continue</Text>
     </TouchableOpacity>
-    <Text style={[styles.hint, { color: colors.textSecondary }]}>Drafts save on this device. The report continues processing; the next lot starts with empty media.</Text>
+    <Text style={[styles.hint, { color: colors.textSecondary }]}>Submit this report, then open a new form with the same contract and details. Processing continues in the background; add new photos to the next form.</Text>
   </View>;
 }
 

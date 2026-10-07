@@ -127,37 +127,40 @@ const AssetFormSheet = ({
   backgroundUploads = false,
 }: AssetFormSheetProps) => {
   const auctioneer = auctioneerControl?.setup;
+  const continuation = auctioneerControl?.continuationDetails;
   const { user } = useAuth();
   const { width, fontScale } = useWindowDimensions();
   const compactFields = width < 480 || fontScale > 1.3;
 
   // Form fields
-  const [clientName, setClientName] = useState(auctioneer?.contract.customerName || '');
-  const [effectiveDate, setEffectiveDate] = useState(auctioneer?.contract.eventDate?.slice(0, 10) || isoDate(new Date()));
-  const [appraisalPurpose, setAppraisalPurpose] = useState(auctioneer ? 'Auction listing and condition report' : '');
-  const [ownerName, setOwnerName] = useState(auctioneer?.contract.customerName || '');
-  const [appraiser, setAppraiser] = useState((user as any)?.username || '');
-  const [appraisalCompany, setAppraisalCompany] = useState((user as any)?.companyName || '');
-  const [industry, setIndustry] = useState(auctioneer?.contract.categories || '');
-  const [inspectionDate, setInspectionDate] = useState(isoDate(new Date()));
+  const [clientName, setClientName] = useState(continuation?.clientName ?? (auctioneer?.contract.customerName || ''));
+  const [effectiveDate, setEffectiveDate] = useState(continuation?.effectiveDate ?? (auctioneer?.contract.eventDate?.slice(0, 10) || isoDate(new Date())));
+  const [appraisalPurpose, setAppraisalPurpose] = useState(continuation?.appraisalPurpose ?? (auctioneer ? 'Auction listing and condition report' : ''));
+  const [ownerName, setOwnerName] = useState(continuation?.ownerName ?? (auctioneer?.contract.customerName || ''));
+  const [appraiser, setAppraiser] = useState(continuation?.appraiser ?? ((user as any)?.username || ''));
+  const [appraisalCompany, setAppraisalCompany] = useState(continuation?.appraisalCompany ?? ((user as any)?.companyName || ''));
+  const [industry, setIndustry] = useState(continuation?.industry ?? (auctioneer?.contract.categories || ''));
+  const [inspectionDate, setInspectionDate] = useState(continuation?.inspectionDate ?? isoDate(new Date()));
   const [contractNo, setContractNo] = useState(auctioneer?.contract.contractNo || '');
-  const [language, setLanguage] = useState<'en' | 'fr' | 'es'>('en');
-  const [currency, setCurrency] = useState(auctioneer ? 'CAD' : '');
+  const [language, setLanguage] = useState<'en' | 'fr' | 'es'>(continuation?.language ?? 'en');
+  const [currency, setCurrency] = useState(continuation?.currency ?? (auctioneer ? 'CAD' : ''));
   const [currencyLoading, setCurrencyLoading] = useState(false);
-  const [preparedFor, setPreparedFor] = useState(auctioneer?.contract.customerName || '');
-  const [factorsAgeCondition, setFactorsAgeCondition] = useState('');
-  const [factorsQuality, setFactorsQuality] = useState('');
-  const [factorsAnalysis, setFactorsAnalysis] = useState('');
-  const [includeDamageAnalysis, setIncludeDamageAnalysis] = useState(true);
-  const [bankPhotosEnabled, setBankPhotosEnabled] = useState(false);
-  const [watermarkImages, setWatermarkImages] = useState(DEFAULT_IMAGE_WATERMARK);
-  const [hiddenLocation, setHiddenLocation] = useState<HiddenLocationSnapshot | null>(auctioneer ? normalizeHiddenLocation(auctioneer.contract.location) : null);
+  const [preparedFor, setPreparedFor] = useState(continuation?.preparedFor ?? (auctioneer?.contract.customerName || ''));
+  const [factorsAgeCondition, setFactorsAgeCondition] = useState(continuation?.factorsAgeCondition ?? '');
+  const [factorsQuality, setFactorsQuality] = useState(continuation?.factorsQuality ?? '');
+  const [factorsAnalysis, setFactorsAnalysis] = useState(continuation?.factorsAnalysis ?? '');
+  const [includeDamageAnalysis, setIncludeDamageAnalysis] = useState(continuation?.includeDamageAnalysis ?? true);
+  const [bankPhotosEnabled, setBankPhotosEnabled] = useState(continuation?.bankPhotosEnabled ?? false);
+  const [watermarkImages, setWatermarkImages] = useState(continuation?.watermarkImages ?? DEFAULT_IMAGE_WATERMARK);
+  const [hiddenLocation, setHiddenLocation] = useState<HiddenLocationSnapshot | null>(() => continuation
+    ? normalizeHiddenLocation(continuation.location, continuation.latitude, continuation.longitude)
+    : auctioneer ? normalizeHiddenLocation(auctioneer.contract.location) : null);
 
   // Valuation methods
-  const [includeValuationTable, setIncludeValuationTable] = useState(false);
+  const [includeValuationTable, setIncludeValuationTable] = useState(continuation?.includeValuationTable ?? false);
   const [selectedValuationMethods, setSelectedValuationMethods] = useState<
     Array<'FML' | 'TKV' | 'OLV' | 'FLV'>
-  >(['FML']);
+  >(continuation?.selectedValuationMethods ?? ['FML']);
 
   // Lots state
   const [lots, setLotsRaw] = useState<MixedLot[]>(() => auctioneer ? auctioneerSeedLots(auctioneer) : []);
@@ -172,7 +175,7 @@ const AssetFormSheet = ({
   // Camera state
   const [cameraOpen, setCameraOpen] = useState(false);
   const [activeLotIdx, setActiveLotIdx] = useState(-1);
-  const [enhanceImages, setEnhanceImages] = useState(false); // Server-side enhancement toggle
+  const [enhanceImages, setEnhanceImages] = useState(continuation?.enhanceImages ?? false); // Server-side enhancement toggle
 
   // Submission state
   const [submitting, setSubmitting] = useState(false);
@@ -963,11 +966,11 @@ const AssetFormSheet = ({
 
   // Pre-fill user data
   useEffect(() => {
-    if (user && visible && !draftIdToLoad && !loadedDraftIdRef.current && !savedInputData) {
+    if (user && visible && !draftIdToLoad && !loadedDraftIdRef.current && !savedInputData && !continuation) {
       setAppraiser((user as any)?.username || '');
       setAppraisalCompany((user as any)?.companyName || '');
     }
-  }, [user, visible, draftIdToLoad, savedInputData]);
+  }, [user, visible, draftIdToLoad, savedInputData, continuation]);
 
   // Load saved input data when provided
   useEffect(() => {
@@ -1092,7 +1095,7 @@ const AssetFormSheet = ({
   };
 
   const handleSubmit = async (options: { forceNew?: boolean; nextLot?: boolean; replaceSubmissionId?: string; replacementSourceId?: string; newSubmissionFromId?: string } = {}) => {
-    if (submissionLockRef.current || saveLock.current || awaitingDraft || submitting || auctioneerControl?.accepted) return;
+    if (submissionLockRef.current || saveLock.current || awaitingDraft || submitting || uploadAcceptedRef.current || auctioneerControl?.accepted) return;
     if (options.nextLot && captureMode === 'offline') return;
     if (saveOnly) { await handleSaveOfflineAndClose(); return; }
     if (auctioneer && (options.forceNew || !hasValidAuctioneerLotStructure(auctioneer, lots))) return;
@@ -1388,14 +1391,14 @@ const AssetFormSheet = ({
         Alert.alert('Earlier upload accepted', 'The server returned the earlier report, not confirmation of your current edits. This draft and its originals are kept. Open Reports or Previews to review the earlier report before making further changes.');
         return;
       }
-      await OfflineCaptureStore.setSubmissionState(localDraft.id, 'accepted', (acceptedResponse as any).reportId);
-
       if (options.nextLot && auctioneerControl) {
         if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
-        await auctioneerControl.acceptAndContinue(acceptedResponse, modernDraft?.id);
-        setSubmitting(false);
+        const acceptanceSaved = OfflineCaptureStore.setSubmissionState(localDraft.id, 'accepted', (acceptedResponse as any).reportId);
+        void acceptanceSaved.catch(() => undefined); // Keep the original inventory if its local receipt cannot be saved.
+        await auctioneerControl.acceptAndContinue(acceptedResponse, modernDraft?.id, buildAutoSaveFormData(), acceptanceSaved);
         return;
       }
+      await OfflineCaptureStore.setSubmissionState(localDraft.id, 'accepted', (acceptedResponse as any).reportId);
 
       // Upload complete - show success immediately
       onSuccess?.();
@@ -1477,6 +1480,7 @@ const AssetFormSheet = ({
   };
 
   const resetForm = () => {
+    uploadAcceptedRef.current = false;
     draftIdentityRef.current = randomUUID();
     setReviewingSavedDraft(false); setDraftLoadError(undefined); reviewEventRef.current = randomUUID();
     setCaptureMode('online'); setManualSubmissionRequired(false); setLocalSavedAt(undefined); setLocalSaveError(undefined); setUploadPaused(false);
@@ -1584,7 +1588,7 @@ const AssetFormSheet = ({
       await saveOnDevice(() => {
         void resetForm();
         onClose();
-        Alert.alert('Saved on this device', 'Open Drafts → Offline captures → Open and submit to review your saved work. Nothing has been uploaded.');
+        Alert.alert('Saved on this device', 'Open Drafts → Offline captures → Open and submit to review your saved work. On supported Android builds, check Photo cloud backup for backup progress. Your report has not been submitted.');
       });
     } catch (error) {
       setLocalSaveError(error instanceof Error ? error.message : 'Save failed. Please try again.');
@@ -2071,7 +2075,7 @@ const AssetFormSheet = ({
           (submitting || (!saveOnly && lots.reduce((sum, lot) => sum + lot.files.length + lot.extraFiles.length, 0) === 0)) && styles.submitButtonDisabled,
         ]}
         onPress={() => void handleSubmit()}
-        accessibilityRole="button" accessibilityLabel={saveOnly ? 'Save offline asset report' : uploadPaused ? 'Resume upload' : 'Submit asset report'}
+        accessibilityRole="button" accessibilityLabel={saveOnly ? 'Save offline asset report' : uploadPaused ? 'Resume upload' : auctioneer ? 'Create Lot & Close' : 'Submit asset report'}
         disabled={submitting || (!saveOnly && lots.reduce((sum, lot) => sum + lot.files.length + lot.extraFiles.length, 0) === 0)}>
         {submitting ? (
           <>
@@ -2083,7 +2087,7 @@ const AssetFormSheet = ({
         ) : (
           <>
             <Feather name={saveOnly ? 'save' : 'send'} size={18} color="#fff" />
-            <Text style={styles.submitButtonText}>{saveOnly ? 'Save' : uploadPaused ? 'Resume upload' : 'Submit Report'}</Text>
+            <Text style={styles.submitButtonText}>{saveOnly ? 'Save' : uploadPaused ? 'Resume upload' : auctioneer ? 'Create Lot & Close' : 'Submit Report'}</Text>
           </>
         )}
       </TouchableOpacity>
@@ -2280,7 +2284,7 @@ const AssetFormSheet = ({
               (submitting || (!saveOnly && totalImages === 0)) && styles.submitButtonDisabled,
             ]}
             onPress={() => void handleSubmit()}
-            accessibilityRole="button" accessibilityLabel={saveOnly ? 'Save offline asset report' : uploadPaused ? 'Resume upload' : 'Submit asset report'}
+            accessibilityRole="button" accessibilityLabel={saveOnly ? 'Save offline asset report' : uploadPaused ? 'Resume upload' : auctioneer ? 'Create Lot & Close' : 'Submit asset report'}
             disabled={submitting || (!saveOnly && totalImages === 0)}>
             {submitting ? (
               <>
@@ -2291,7 +2295,7 @@ const AssetFormSheet = ({
               </>
             ) : (
               <>
-                <Text style={styles.submitButtonText}>{saveOnly ? 'Save' : uploadPaused ? 'Resume upload' : 'Submit Report'}</Text>
+                <Text style={styles.submitButtonText}>{saveOnly ? 'Save' : uploadPaused ? 'Resume upload' : auctioneer ? 'Create Lot & Close' : 'Submit Report'}</Text>
                 <Feather name={saveOnly ? 'save' : 'send'} size={18} color="#fff" />
               </>
             )}

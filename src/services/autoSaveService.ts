@@ -14,6 +14,7 @@ import type { OfflineCaptureMetadata, CaptureModePreference, MediaOwnership } fr
 import type { AuctioneerWorkItemSetup } from './auctioneerService';
 import type { AuctionManagementTaskPayload } from './auctionManagementService';
 import { setUploadOwner } from './uploadCancellation';
+import { flushBackupHandoff } from './captureBackupHandoff';
 
 const AUTO_SAVE_KEY = '@clearvalue_auto_save';
 const getAutoSaveImagesDir = (): string => `${FileSystem.documentDirectory || ''}auto_save_images/`;
@@ -797,12 +798,6 @@ const normalizeDraftForRead = async (draft: OfflineReportDraft): Promise<Offline
   };
 };
 
-const replaceOrAppendDraft = async (draft: OfflineReportDraft): Promise<OfflineReportDraft> => {
-  const existing = await OfflineCaptureStore.getDraft(draft.id);
-  return normalizeDraftForRead(await OfflineCaptureStore.saveDraft({ ...existing, ...draft,
-    createdAt: existing?.createdAt || draft.createdAt, localRevision: existing?.localRevision }));
-};
-
 export const AutoSaveService = {
   setOwner(ownerId: string | null) {
     setUploadOwner(ownerId);
@@ -913,24 +908,30 @@ export const AutoSaveService = {
       updatedAt: now,
     };
 
-    if (existing) return OfflineCaptureStore.updateDraft(id, (current) => ({ ...current, ...draft,
+    const saved = existing ? await OfflineCaptureStore.updateDraft(id, (current) => ({ ...current, ...draft,
       localRevision: current.localRevision, cloudId: current.cloudId, cloudSyncedAt: current.cloudSyncedAt,
       cloudSyncError: current.cloudSyncError, cloudSyncErrorKind: current.cloudSyncErrorKind,
       cloudSyncRetryAt: current.cloudSyncRetryAt, cloudSyncAttempts: current.cloudSyncAttempts,
       cloudSyncLastAttemptAt: current.cloudSyncLastAttemptAt,
-    }), args.explicitActivitySave);
-    return OfflineCaptureStore.saveDraft(draft, args.explicitActivitySave);
+    }), args.explicitActivitySave) : await OfflineCaptureStore.saveDraft(draft, args.explicitActivitySave);
+    await flushBackupHandoff();
+    return saved;
     });
   },
 
   async markDraftCloudSynced(
     id: string,
     cloudId: string,
-    expectedUpdatedAt?: string
+    expectedUpdatedAt?: string,
+    expectedOwnerId?: string,
+    expectedLocalRevision?: number
   ): Promise<void> {
+    if (expectedOwnerId && OfflineCaptureStore.getOwnerId() !== expectedOwnerId) return;
     const now = new Date().toISOString();
     await OfflineCaptureStore.updateDraft(id, (draft) =>
-        (!expectedUpdatedAt || draft.updatedAt === expectedUpdatedAt)
+        (!expectedOwnerId || draft.ownerId === expectedOwnerId) &&
+        (!expectedUpdatedAt || draft.updatedAt === expectedUpdatedAt) &&
+        (expectedLocalRevision === undefined || draft.localRevision === expectedLocalRevision)
           ? {
               ...draft,
               cloudId,
@@ -953,9 +954,17 @@ export const AutoSaveService = {
       retryAt?: number;
       attempts?: number;
       lastAttemptAt?: string;
+      expectedOwnerId?: string;
+      expectedUpdatedAt?: string;
+      expectedLocalRevision?: number;
     } = {}
   ): Promise<void> {
-    await OfflineCaptureStore.updateDraft(id, (draft) => ({
+    if (metadata.expectedOwnerId && OfflineCaptureStore.getOwnerId() !== metadata.expectedOwnerId) return;
+    await OfflineCaptureStore.updateDraft(id, (draft) =>
+      (metadata.expectedOwnerId && draft.ownerId !== metadata.expectedOwnerId) ||
+      (metadata.expectedUpdatedAt && draft.updatedAt !== metadata.expectedUpdatedAt) ||
+      (metadata.expectedLocalRevision !== undefined && draft.localRevision !== metadata.expectedLocalRevision)
+        ? draft : ({
               ...draft,
               cloudSyncError: message,
               cloudSyncErrorKind: metadata.kind,
@@ -966,6 +975,7 @@ export const AutoSaveService = {
   },
 
   async saveCloudDraftSnapshot(args: {
+    ownerId: string;
     id?: string;
     cloudId?: string;
     type: OfflineDraftType;
@@ -978,6 +988,10 @@ export const AutoSaveService = {
     createdAt?: string;
     updatedAt?: string;
   }): Promise<OfflineReportDraft> {
+    const ownerId = args.ownerId;
+    if (!ownerId || OfflineCaptureStore.getOwnerId() !== ownerId) {
+      throw new Error('The signed-in account changed. Reopen this draft from its owner account.');
+    }
     const now = new Date().toISOString();
     const contractNo = args.contractNo || args.formData.contractNo?.trim();
     const normalizedContractNo = args.normalizedContractNo || normalizeDraftContractNo(contractNo);
@@ -985,7 +999,8 @@ export const AutoSaveService = {
       throw new Error('Contract number is required before saving this draft.');
     }
 
-    return replaceOrAppendDraft({
+    const saved = await OfflineCaptureStore.createCloudDraft({
+      ownerId,
       id: args.id || makeDraftId(args.type),
       type: args.type,
       title: draftTitleFor(args.type, args.formData, args.title),
@@ -998,7 +1013,12 @@ export const AutoSaveService = {
       activeLotIdx: args.activeLotIdx,
       createdAt: args.createdAt || now,
       updatedAt: args.updatedAt || now,
-    });
+    }, ownerId);
+    const normalized = await normalizeDraftForRead(saved);
+    if (OfflineCaptureStore.getOwnerId() !== ownerId) {
+      throw new Error('The signed-in account changed while restoring this draft.');
+    }
+    return normalized;
   },
 
   async deleteDraft(id: string): Promise<void> {

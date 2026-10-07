@@ -8,6 +8,7 @@ import api from '../services/api';
 jest.mock('../context/AuthContext', () => ({ useAuth: jest.fn() }));
 jest.mock('../services/api', () => ({ __esModule: true, default: { patch: jest.fn(), delete: jest.fn() } }));
 jest.mock('@expo/vector-icons', () => ({ Feather: () => null }));
+jest.mock('../components/CaptureBackupPanel', () => () => null);
 jest.mock('../context/ThemeContext', () => ({ useAppTheme: () => ({
   colors: new Proxy({}, { get: () => '#222222' }),
 }) }));

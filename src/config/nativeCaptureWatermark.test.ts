@@ -78,7 +78,7 @@ describe('native capture watermark ownership', () => {
       expect(DEFAULT_IMAGE_WATERMARK).toBe(true);
       expect(restoreImageWatermarkPreference(false)).toBe(false);
       expect(restoreImageWatermarkPreference(true)).toBe(true);
-      expect(form).toContain('useState(DEFAULT_IMAGE_WATERMARK)');
+      expect(form).toContain('useState(continuation?.watermarkImages ?? DEFAULT_IMAGE_WATERMARK)');
       expect(form).toContain('setWatermarkImages((prev) => !prev)');
       expect(form).toContain('watermark_images: watermarkImages');
       expect(form).toContain('Add logo where missing');

@@ -18,18 +18,49 @@ class LotRepository private constructor(private val context: Context) {
     @Volatile private var journalFailure: Exception? = null
     /** Journal writes queued on ioExecutor and not yet finished. */
     private val pendingJournalWrites = java.util.concurrent.atomic.AtomicInteger(0)
+    private var fixedStructure: FixedLotStructure? = null
+    val isStructureLocked: Boolean get() = fixedStructure != null
+    fun canNavigateTo(number: Int): Boolean = fixedStructure?.contains(number) ?: (number >= 1)
+    fun lotLabel(number: Int): String = fixedStructure?.label(number) ?: "Lot $number"
+    fun fixedMode(number: Int): LotMode? = fixedStructure?.mode(number)
+    fun hasReachedFixedPhotoLimit(number: Int): Boolean = isStructureLocked && getEffectiveLots()
+        .getOrNull(number - 1)?.let { it.files.size + it.extraFiles.size >= 200 } == true
+
+    private fun validateStructure() {
+        fixedStructure?.let { fixed ->
+            fixed.validate(completedLots)
+            activeBuilder?.build()?.copy(lotNumber = activeLotNumberForSession)?.let { fixed.validateLot(it) }
+        }
+    }
+
+    /** An active builder replaces its saved row, never adds another imported lot. */
+    fun getEffectiveLots(): List<LotPayload> {
+        if (!isStructureLocked) return getAllLots()
+        validateStructure()
+        val active = activeBuilder?.build()?.copy(lotNumber = activeLotNumberForSession)
+        return completedLots.map { if (it.id == active?.id) active else it }
+    }
 
     fun configureCapture(payload: String?) {
-        val requested = try { org.json.JSONObject(payload ?: "{}").optJSONObject("captureContext") } catch (_: Exception) { null }
+        val root = payload?.trim()?.takeIf { it.startsWith("{") }?.let { org.json.JSONObject(it) }
+        val requested = root?.optJSONObject("captureContext")
+        val requestedStructure = FixedLotStructure.fromPayload(root)
+        val requestedIdentity = requested?.let {
+            require(it.optString("ownerId").isNotBlank() && it.optString("draftId").isNotBlank() && it.optString("sessionId").isNotBlank())
+            val pending = CaptureJournal.read(context, it.getString("ownerId"), it.getString("draftId"))
+            if (pending != null) {
+                val session = pending.getJSONObject("session")
+                require(!session.optBoolean("lockedStructure", false) || requestedStructure != null) { "The saved camera session has fixed imported lots" }
+                requestedStructure?.validateSession(session)
+            }
+            pending ?: it
+        }
         // Never inherit the singleton's photos from a different owner/form.
         completedLots.clear()
         activeBuilder = null
         journalFailure = null
-        captureIdentity = requested?.let {
-            require(it.optString("ownerId").isNotBlank() && it.optString("draftId").isNotBlank() && it.optString("sessionId").isNotBlank())
-            val pending = CaptureJournal.read(context, it.getString("ownerId"), it.getString("draftId"))
-            pending ?: it
-        }
+        fixedStructure = requestedStructure
+        captureIdentity = requestedIdentity
     }
 
     fun hasPendingJournal(): Boolean = captureIdentity?.let {
@@ -65,6 +96,7 @@ class LotRepository private constructor(private val context: Context) {
     }
 
     fun startNewLot(mode: LotMode): LotBuilder {
+        check(!isStructureLocked) { "Imported lots cannot be created or rekeyed by the camera" }
         activeBuilder = LotBuilder(context, mode)
         Log.d(TAG, "New lot started — mode=${mode.apiKey} id=${activeBuilder!!.lotId}")
         saveAsync()
@@ -76,7 +108,9 @@ class LotRepository private constructor(private val context: Context) {
         mode:     LotMode   = LotMode.SINGLE_LOT,
         focusBox: FocusBox? = null
     ) {
+        validateStructure()
         val builder = activeBuilder ?: startNewLot(mode)
+        require(!isStructureLocked || builder.primaryCount + builder.extraCount < 200) { "This lot already has 200 photos" }
         builder.addPrimaryPhoto(uri, focusBox)
         saveAsync()
     }
@@ -85,12 +119,15 @@ class LotRepository private constructor(private val context: Context) {
         uri:      Uri,
         mode:     LotMode   = LotMode.SINGLE_LOT
     ) {
+        validateStructure()
         val builder = activeBuilder ?: startNewLot(mode)
+        require(!isStructureLocked || builder.primaryCount + builder.extraCount < 200) { "This lot already has 200 photos" }
         builder.addExtraPhoto(uri)
         saveAsync()
     }
 
     fun setVideo(uri: Uri) {
+        validateStructure()
         activeBuilder?.setVideo(uri)
         // Written before this returns: the screen reports "video saved" straight
         // after, and a video is rare enough that the wait does not matter.
@@ -101,11 +138,16 @@ class LotRepository private constructor(private val context: Context) {
     fun isCapturePersisted(): Boolean =
         captureIdentity != null && journalFailure == null && pendingJournalWrites.get() == 0
 
-    fun removeFileFromActiveLot(uri: Uri): Boolean {
-        return activeBuilder?.removeFile(uri) ?: false
+    fun removeFileFromActiveLot(uri: Uri, lotNumber: Int? = null): Boolean {
+        validateStructure()
+        if (isStructureLocked && lotNumber != null && lotNumber != activeLotNumberForSession) return false
+        val removed = activeBuilder?.removeFile(uri) ?: false
+        if (removed) saveAsync()
+        return removed
     }
 
     fun replaceUriInCompletedLots(oldUri: Uri, newUri: Uri, w: Int = 0, h: Int = 0): Boolean {
+        validateStructure()
         val uriStr = oldUri.toString()
         var updated = false
 
@@ -161,13 +203,15 @@ class LotRepository private constructor(private val context: Context) {
         return updated
     }
 
-    fun removeFileFromCompletedLots(uri: Uri): Boolean {
+    fun removeFileFromCompletedLots(uri: Uri, lotNumber: Int? = null): Boolean {
+        validateStructure()
         val uriStr = uri.toString()
         var anyRemoved = false
 
         val iterator = completedLots.listIterator()
         while (iterator.hasNext()) {
             val lot = iterator.next()
+            if (isStructureLocked && lot.lotNumber != (lotNumber ?: activeLotNumberForSession)) continue
             val hasVideo   = lot.videoFile?.uri == uriStr
             val hasPrimary = lot.files.any      { it.uri == uriStr }
             val hasExtra   = lot.extraFiles.any { it.uri == uriStr }
@@ -177,7 +221,7 @@ class LotRepository private constructor(private val context: Context) {
                 val newExtra = lot.extraFiles.filterNot { it.uri == uriStr }
                 val newVideo = if (hasVideo) null else lot.videoFile
 
-                if (newFiles.isEmpty() && newExtra.isEmpty() && newVideo == null) {
+                if (!isStructureLocked && newFiles.isEmpty() && newExtra.isEmpty() && newVideo == null) {
                     iterator.remove()
                 } else {
                     iterator.set(
@@ -196,8 +240,12 @@ class LotRepository private constructor(private val context: Context) {
     }
 
     fun finaliseCurrentLot(lotNumber: Int = 1): LotPayload? {
+        validateStructure()
+        require(canNavigateTo(lotNumber)) { "The camera cannot create an additional imported lot" }
+        if (isStructureLocked && activeBuilder != null) require(lotNumber == activeLotNumberForSession) { "Captured media cannot be reassigned to another lot" }
         activeLotNumberForSession = lotNumber.coerceAtLeast(1)
         val payload = activeBuilder?.build()?.copy(lotNumber = lotNumber) ?: return null
+        fixedStructure?.validateLot(payload)
 
         // Replace existing lot with same unique ID if present (supports appending/editing)
         val existingIndex = completedLots.indexOfFirst { it.id == payload.id }
@@ -218,11 +266,18 @@ class LotRepository private constructor(private val context: Context) {
     }
 
     fun cancelCurrentLot() {
+        if (isStructureLocked) return
         activeBuilder = null
         Log.d(TAG, "Active lot cancelled")
     }
 
     fun prepareLotForEditing(lotNumber: Int, fallbackMode: LotMode = LotMode.SINGLE_LOT) {
+        validateStructure()
+        require(canNavigateTo(lotNumber)) { "This lot is not in the imported capture" }
+        if (isStructureLocked && activeBuilder != null && activeLotNumberForSession == lotNumber) return
+        if (isStructureLocked && activeBuilder != null && activeLotNumberForSession != lotNumber) {
+            finaliseCurrentLot(activeLotNumberForSession)
+        }
         activeLotNumberForSession = lotNumber.coerceAtLeast(1)
         val existing = completedLots.find { it.lotNumber == lotNumber }
         if (existing != null) {
@@ -277,11 +332,11 @@ class LotRepository private constructor(private val context: Context) {
     }
 
     /** The session as it is now, safe to hand to another thread. */
-    private data class JournalSnapshot(val activeLotNumber: Int, val lots: List<LotPayload>, val active: LotPayload?)
+    private data class JournalSnapshot(val activeLotNumber: Int, val lots: List<LotPayload>, val active: LotPayload?, val structure: FixedLotStructure?)
 
     private fun snapshotForJournal(): JournalSnapshot {
         val active = activeBuilder?.build()?.copy(lotNumber = activeLotNumberForSession)
-        return JournalSnapshot(activeLotNumberForSession, completedLots.toList(), active)
+        return JournalSnapshot(activeLotNumberForSession, completedLots.toList(), active, fixedStructure)
     }
 
     private fun writeJournal(identity: org.json.JSONObject, snapshot: JournalSnapshot) {
@@ -291,7 +346,7 @@ class LotRepository private constructor(private val context: Context) {
             if (index >= 0) current[index] = active else current.add(active)
         }
         try {
-            CaptureJournal.save(context, identity, org.json.JSONObject(buildSessionJson(snapshot.activeLotNumber, snapshot.lots, snapshot.active)),
+            CaptureJournal.save(context, identity, org.json.JSONObject(buildSessionJson(snapshot.activeLotNumber, snapshot.lots, snapshot.active, snapshot.structure)),
                 org.json.JSONArray(LotJsonSerializer.serialize(current)))
             journalFailure = null
         } catch (error: Exception) {
@@ -305,6 +360,9 @@ class LotRepository private constructor(private val context: Context) {
 
     /** Write the session now and return once it is on disk (or has failed). */
     fun saveSessionWithActiveSync(lotNumber: Int) {
+        validateStructure()
+        require(canNavigateTo(lotNumber))
+        if (isStructureLocked && activeBuilder != null) require(lotNumber == activeLotNumberForSession)
         activeLotNumberForSession = lotNumber.coerceAtLeast(1)
         captureIdentity?.let { identity ->
             val snapshot = snapshotForJournal()
@@ -332,14 +390,15 @@ class LotRepository private constructor(private val context: Context) {
     }
 
     private fun buildSessionJson(activeLotNumber: Int): String =
-        buildSessionJson(activeLotNumber, completedLots, activeBuilder?.build()?.copy(lotNumber = activeLotNumber.coerceAtLeast(1)))
+        buildSessionJson(activeLotNumber, completedLots, activeBuilder?.build()?.copy(lotNumber = activeLotNumber.coerceAtLeast(1)), fixedStructure)
 
     /** The session file's shape, from a snapshot so it can be built on any thread. */
-    private fun buildSessionJson(activeLotNumber: Int, lots: List<LotPayload>, active: LotPayload?): String {
+    private fun buildSessionJson(activeLotNumber: Int, lots: List<LotPayload>, active: LotPayload?, structure: FixedLotStructure?): String {
         val root = org.json.JSONObject()
         root.put("version", 2)
         root.put("activeLotNumber", activeLotNumber.coerceAtLeast(1))
         root.put("completedLots", org.json.JSONArray(AppGson.instance.toJson(lots)))
+        structure?.saveTo(root)
         active?.let { root.put("activeLot", org.json.JSONObject(AppGson.instance.toJson(it))) }
         return root.toString()
     }
@@ -357,6 +416,7 @@ class LotRepository private constructor(private val context: Context) {
             val trimmed = raw.trim()
 
             if (trimmed.startsWith("[")) {
+                require(!isStructureLocked) { "A legacy camera session cannot replace imported lots" }
                 val lots: List<LotPayload> = AppGson.instance.fromJson(trimmed, typeList)
                 completedLots.clear()
                 completedLots.addAll(lots)
@@ -369,6 +429,15 @@ class LotRepository private constructor(private val context: Context) {
                 val activeLotNumber = root.optInt("activeLotNumber", 1).coerceAtLeast(1)
                 val lotsJson = root.optJSONArray("completedLots")?.toString() ?: "[]"
                 val lots: List<LotPayload> = AppGson.instance.fromJson(lotsJson, typeList)
+                require(!root.optBoolean("lockedStructure", false) || isStructureLocked) { "Fixed camera session requires its original imported draft" }
+                fixedStructure?.let { fixed ->
+                    fixed.validateSession(root)
+                    fixed.validate(lots)
+                    require(fixed.contains(activeLotNumber))
+                    root.optJSONObject("activeLot")?.let { activeJson ->
+                        fixed.validateLot(AppGson.instance.fromJson(activeJson.toString(), LotPayload::class.java), activeLotNumber)
+                    }
+                }
                 completedLots.clear()
                 completedLots.addAll(lots)
                 activeBuilder = root.optJSONObject("activeLot")?.let { activeJson ->
@@ -381,11 +450,13 @@ class LotRepository private constructor(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Session restore failed: ${e.message}")
+            if (isStructureLocked) throw e
             null
         }
     }
 
     fun clearAllSync() {
+        check(!isStructureLocked) { "Imported capture originals must be preserved" }
         val lotPhotosDir = File(context.cacheDir, "lot_photos")
         val lotVideosDir = File(context.cacheDir, "lot_videos")
         lotPhotosDir.listFiles()?.forEach { it.delete() }
@@ -398,6 +469,7 @@ class LotRepository private constructor(private val context: Context) {
     fun clearLotsOnly() {
         completedLots.clear()
         activeBuilder = null
+        fixedStructure = null
         if (captureIdentity != null) {
             // JS acknowledges only after its SQLite draft transaction has committed.
             captureIdentity = null
@@ -424,6 +496,7 @@ class LotRepository private constructor(private val context: Context) {
                 AppGson.instance.fromJson(lotsArrayString, typeList)
             }
 
+            fixedStructure?.validate(lots)
             completedLots.clear()
             completedLots.addAll(lots)
             activeBuilder = null
@@ -433,11 +506,17 @@ class LotRepository private constructor(private val context: Context) {
             lots.size - 1
         } catch (e: Exception) {
             Log.e(TAG, "Failed to replace data: ${e.message}")
+            if (isStructureLocked) throw e
             -1
         }
     }
 
     fun updateExistingLotMode(lotNum: Int, newMode: LotMode) {
+        validateStructure()
+        if (isStructureLocked) {
+            require(fixedMode(lotNum) == newMode) { "An imported lot's capture mode cannot change" }
+            return
+        }
         var updated = false
         for (i in completedLots.indices) {
             if (completedLots[i].lotNumber == lotNum) {

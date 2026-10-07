@@ -25,6 +25,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAppTheme, type AppThemeColors } from '../context/ThemeContext';
+import { ensurePhotoPickerAccess } from '../utils/photoPickerAccess';
 import { collectSupportDiagnostics } from '../services/supportDiagnostics';
 import {
   createSupportConversation,
@@ -336,8 +337,7 @@ async function pickSupportMedia(
     Alert.alert('Attachment limit', `You can attach up to ${limit} files.`);
     return [];
   }
-  const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-  if (!permission.granted) {
+  if (!(await ensurePhotoPickerAccess())) {
     Alert.alert(
       'Photos permission required',
       'Allow photo library access in system settings to attach screenshots or videos.'

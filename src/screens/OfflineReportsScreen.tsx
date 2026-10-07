@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -13,27 +13,25 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 
 import AutoSaveService, {
-  AutoSaveFormData,
   OfflineDraftType,
   OfflineReportDraft,
-  SavedLotData,
-  SavedPhotoFileData,
-  SavedVideoFileData,
 } from '../services/autoSaveService';
 import OfflineQueueService, { OfflineQueueJob } from '../services/offlineQueueService';
 import OfflineCaptureStore from '../services/offlineCaptureStore';
 import OfflineCaptureList from '../components/OfflineCaptureList';
+import CaptureBackupPanel from '../components/CaptureBackupPanel';
 import { useBackgroundUploads } from '../components/useBackgroundUploads';
 import backgroundUploadManager, { describeBackgroundUpload } from '../services/backgroundUploadManager';
-import reportDraftService, { ReportDraft } from '../services/reportDraftService';
+import reportDraftService, { isVerifiedCloudBackupOfLocal, ReportDraft } from '../services/reportDraftService';
 import DraftSyncService from '../services/draftSyncService';
+import { hydrateCompleteCloudDraft } from '../services/cloudDraftRestore';
 import {
   canAttemptDraftCloudSync,
   getDraftCloudSyncMessage,
   isRecoverableDraftCloudError,
 } from '../services/draftCloudSyncState';
 import api from '../services/api';
-import type { ConnectivityStatus } from '../services/connectivityService';
+import { getSubmissionError, type ConnectivityStatus } from '../services/connectivityService';
 
 type LegacyFormType = 'asset' | 'realEstate';
 
@@ -77,7 +75,7 @@ type UnifiedDraftItem =
       title: string;
       contractNo: string;
       updatedAt: string;
-      status: 'Cloud saved';
+      status: 'Cloud saved' | 'Backup incomplete';
       counts: { lots: number; images: number; videos: number };
       cloud: ReportDraft;
     }
@@ -194,97 +192,23 @@ const isRecoverableQueueError = (job: OfflineQueueJob) =>
     String(job.lastError || '')
   );
 
+const hasCompleteCloudBackup = (cloud: ReportDraft) =>
+  cloud.storageMode !== 'local_media' && Array.isArray(cloud.media) &&
+  cloud.media.every((item) => !!item.url && !!item.uploadedAt && Number(item.verifiedSize) > 0);
+
 const isDraftCloudClean = (draft: OfflineReportDraft, cloud?: ReportDraft) => {
-  if (!cloud && !draft.cloudSyncedAt) return false;
-  const syncedAt = draft.cloudSyncedAt || cloud?.updatedAt;
+  // Server progress timestamps are not acknowledgements of this local revision.
+  if (cloud && !isVerifiedCloudBackupOfLocal(draft, cloud)) return false;
+  const syncedAt = draft.cloudSyncedAt;
   if (!syncedAt) return false;
   return new Date(syncedAt).getTime() >= new Date(draft.updatedAt).getTime();
 };
 
-// A draft the background upload line holds -- sending, waiting in line, paused
-// or needing attention -- is not cloud-synced by this screen (2026-10-02). That
-// sync ends by replacing the local draft with its cloud copy and deleting its
-// local photos, which the background upload reads and a Resume from the upload
-// bar sends again. syncOneDraft checks again after the cloud save, because
-// Submit can hand the draft over while that save is still running.
+// A queued/paused upload retains its exact local snapshot. Cloud backup never
+// replaces that snapshot or removes its original media.
 const heldByBackgroundUpload = (draftId: string) => Boolean(backgroundUploadManager.statusFor(draftId));
 
 
-const hydrateCloudLots = (cloud: ReportDraft): SavedLotData[] => {
-  const lots = (JSON.parse(JSON.stringify(cloud.lots || [])) as SavedLotData[]).map(
-    (lot, index): SavedLotData => ({
-      ...lot,
-      id: String(lot.id || `draft-lot-${index + 1}`),
-      mainImages: [] as SavedPhotoFileData[],
-      extraImages: [] as SavedPhotoFileData[],
-      videoFiles: [] as SavedVideoFileData[],
-    })
-  );
-  const lotById = new Map(lots.map((lot) => [String(lot.id), lot]));
-  const lotRank = new Map(lots.map((lot, index) => [String(lot.id), index]));
-  const slotRank = { main: 0, extra: 1, video: 2 } as const;
-  const media = [...(cloud.media || [])].sort((a, b) => {
-    const lot =
-      (lotRank.get(String(a.lotId || '')) ?? Number.MAX_SAFE_INTEGER) -
-      (lotRank.get(String(b.lotId || '')) ?? Number.MAX_SAFE_INTEGER);
-    const slot =
-      (slotRank[a.slot as keyof typeof slotRank] ?? 9) -
-      (slotRank[b.slot as keyof typeof slotRank] ?? 9);
-    const orderA = Number.isFinite(Number(a.originalOrder))
-      ? Number(a.originalOrder)
-      : Number(a.captureOrder ?? a.index ?? 0);
-    const orderB = Number.isFinite(Number(b.originalOrder))
-      ? Number(b.originalOrder)
-      : Number(b.captureOrder ?? b.index ?? 0);
-    return lot || slot || orderA - orderB || Number(a.index || 0) - Number(b.index || 0);
-  });
-
-  for (const item of media) {
-    if (!item.url || !item.lotId || !item.slot) continue;
-    const lot = lotById.get(String(item.lotId));
-    if (!lot) continue;
-
-    const photo: SavedPhotoFileData = {
-      uri: item.url,
-      originalUri: item.url,
-      displayUri: item.url,
-      name: item.name || `${item.slot}-${item.index}.jpg`,
-      type: item.mimeType || (item.slot === 'video' ? 'video/mp4' : 'image/jpeg'),
-      clientFileId: item.clientFileId,
-      localKey: item.localKey,
-      mediaId: item.mediaId || item.clientFileId,
-      lotId: item.lotId,
-      slot: item.slot === 'extra' ? 'extra' : 'main',
-      index: item.index,
-      captureOrder: item.captureOrder,
-      originalOrder: item.originalOrder,
-      size: item.verifiedSize || item.size,
-    };
-
-    if (item.slot === 'main') {
-      lot.mainImages.push(photo);
-    } else if (item.slot === 'extra') {
-      lot.extraImages.push(photo);
-    } else if (item.slot === 'video') {
-      lot.videoFiles.push({
-        uri: item.url,
-        name: item.name || `video-${item.index}.mp4`,
-        type: item.mimeType || 'video/mp4',
-        clientFileId: item.clientFileId,
-        localKey: item.localKey,
-        mediaId: item.mediaId || item.clientFileId,
-        lotId: item.lotId,
-        slot: 'video',
-        index: item.index,
-        captureOrder: item.captureOrder,
-        originalOrder: item.originalOrder,
-        size: item.verifiedSize || item.size,
-      });
-    }
-  }
-
-  return lots;
-};
 
 const OfflineReportsScreen = ({
   onOpenDrawer,
@@ -304,6 +228,15 @@ const OfflineReportsScreen = ({
   const [syncing, setSyncing] = useState(false);
   const [syncingDraftIds, setSyncingDraftIds] = useState<Set<string>>(new Set());
   const [sendingIds, setSendingIds] = useState<Set<string>>(new Set());
+  const openingDraft = useRef(false);
+  const [openingCloudId, setOpeningCloudId] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const loadRevision = useRef(0);
+  const loadsInFlight = useRef(0);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; loadRevision.current += 1; };
+  }, []);
   // Re-renders with every background upload change, so each card shows its
   // live status (services/backgroundUploadManager.ts).
   useBackgroundUploads();
@@ -320,14 +253,18 @@ const OfflineReportsScreen = ({
   } | null>(null);
 
   const syncOneDraft = useCallback(async (draft: OfflineReportDraft, force = false) => {
+    const owner = OfflineCaptureStore.getOwnerId();
+    if (!owner || draft.ownerId !== owner) return;
+    const isCurrent = () => mounted.current && OfflineCaptureStore.getOwnerId() === owner;
     if (!canAttemptDraftCloudSync(draft, { force }) || heldByBackgroundUpload(draft.id)) return;
     setSyncingDraftIds((prev) => new Set(prev).add(draft.id));
     try {
       const result = await DraftSyncService.syncDraft(draft, { force });
+      if (!isCurrent()) return;
       if (result.status === 'skipped') return;
       if (result.status === 'failed') {
         const latest = await AutoSaveService.getDraft(draft.id);
-        if (latest) {
+        if (latest && isCurrent()) {
           setDrafts((prev) => prev.map((item) => (item.id === latest.id ? latest : item)));
         }
         return;
@@ -335,31 +272,10 @@ const OfflineReportsScreen = ({
 
       const cloud = result.cloud;
       const current = await AutoSaveService.getDraft(draft.id);
-      if (current && current.updatedAt !== draft.updatedAt) {
-        // The form changed while this revision was uploading. Keep the newer
-        // local revision and let the next sync send it instead of overwriting it.
-        setDrafts((prev) => prev.map((item) => (item.id === current.id ? current : item)));
-        return;
-      }
-      if (heldByBackgroundUpload(draft.id)) return;
-
-      const saved = await AutoSaveService.saveCloudDraftSnapshot({
-        id: draft.id,
-        cloudId: cloud.id || cloud._id || '',
-        type: cloud.type,
-        title: cloud.title,
-        contractNo: cloud.contractNo,
-        normalizedContractNo: cloud.normalizedContractNo,
-        formData: cloud.formData,
-        lots: hydrateCloudLots(cloud),
-        activeLotIdx: cloud.activeLotIdx || 0,
-        createdAt: cloud.createdAt,
-        updatedAt: cloud.updatedAt,
-      });
-      // R2 is now the durable source. Remove the local byte cache only after
-      // every manifest row has been verified by the server.
-      await AutoSaveService.deleteDraftMedia(draft.id);
-      setDrafts((prev) => prev.map((item) => (item.id === saved.id ? saved : item)));
+      if (!current || !isCurrent()) return;
+      // Sync acknowledgement updates metadata only. Even a complete cloud copy
+      // must not replace device originals, current edits or an upload checkpoint.
+      setDrafts((prev) => prev.map((item) => (item.id === current.id ? current : item)));
       setCloudDrafts((prev) => {
         const key = draftKey(cloud.type, cloud.clientDraftId || cloud.id || cloud._id);
         const others = prev.filter((item) => draftKey(item.type, item.clientDraftId || item.id || item._id) !== key);
@@ -370,11 +286,13 @@ const OfflineReportsScreen = ({
     } catch {
       // DraftSyncService persists classified failures. This guard protects the
       // screen from a local snapshot/update failure without exposing raw Axios text.
-      const latest = await AutoSaveService.getDraft(draft.id);
-      if (latest) {
+      if (!isCurrent()) return;
+      const latest = await AutoSaveService.getDraft(draft.id).catch(() => null);
+      if (latest && isCurrent()) {
         setDrafts((prev) => prev.map((item) => (item.id === latest.id ? latest : item)));
       }
     } finally {
+      if (!isCurrent()) return;
       setSyncingDraftIds((prev) => {
         const next = new Set(prev);
         next.delete(draft.id);
@@ -384,6 +302,12 @@ const OfflineReportsScreen = ({
   }, []);
 
   const loadData = useCallback(async (syncAfterLoad = true) => {
+    const owner = OfflineCaptureStore.getOwnerId();
+    const revision = ++loadRevision.current;
+    const isCurrent = () => mounted.current && !!owner &&
+      OfflineCaptureStore.getOwnerId() === owner && revision === loadRevision.current;
+    loadsInFlight.current += 1;
+    try {
     const [nextDrafts, nextJobs, connectivity] = await Promise.all([
       OfflineCaptureStore.listSummaries().then(async (summaries) => {
         const online = summaries.filter((draft) => draft.captureMode !== 'offline' && !draft.manualSubmissionRequired);
@@ -394,9 +318,11 @@ const OfflineReportsScreen = ({
       OfflineQueueService.getJobs(),
       OfflineQueueService.getConnectivityStatus(),
     ]);
+    if (!isCurrent()) return;
 
     let nextSavedInputs: SavedInput[] = [];
     if (connectivity.status === 'online') {
+      if (!isCurrent()) return;
       try {
         const { data } = await api.get('/saved-inputs');
         nextSavedInputs = (data.data || []).filter((item: SavedInput) => !item.isDraft);
@@ -414,6 +340,7 @@ const OfflineReportsScreen = ({
       }
     }
 
+    if (!isCurrent()) return;
     setDrafts(nextDrafts);
     setJobs(nextJobs);
     setSavedInputs(nextSavedInputs);
@@ -434,7 +361,7 @@ const OfflineReportsScreen = ({
       nextJobs.flatMap((job) => job.fileUris || []),
       queueCounts
     )
-      .then(setStorageSummary)
+      .then((value) => { if (isCurrent()) setStorageSummary(value); })
       .catch(() => undefined);
 
     if (connectivity.status === 'online' && syncAfterLoad) {
@@ -445,11 +372,15 @@ const OfflineReportsScreen = ({
         ])
       );
       for (const draft of nextDrafts) {
+        if (!isCurrent()) return;
         const cloud = cloudByKey.get(draftKey(draft.type, draft.id));
         if (!isDraftCloudClean(draft, cloud)) {
           void syncOneDraft(draft);
         }
       }
+    }
+    } finally {
+      loadsInFlight.current -= 1;
     }
   }, [syncOneDraft]);
 
@@ -472,7 +403,8 @@ const OfflineReportsScreen = ({
       );
     });
     const timer = setInterval(() => {
-      void loadData();
+      // Do not invalidate a slow full-media restore every fifteen seconds.
+      if (loadsInFlight.current === 0) void loadData().catch(() => undefined);
     }, 15000);
 
     return () => {
@@ -544,7 +476,7 @@ const OfflineReportsScreen = ({
         title: cloud.title || cloud.contractNo,
         contractNo: cloud.contractNo,
         updatedAt: cloud.updatedAt,
-        status: 'Cloud saved',
+        status: hasCompleteCloudBackup(cloud) ? 'Cloud saved' : 'Backup incomplete',
         counts: getDraftCounts(cloud),
         cloud,
       });
@@ -610,7 +542,7 @@ const OfflineReportsScreen = ({
   }, [drafts, items, jobs.length]);
 
   const unsyncedDrafts = useMemo(
-    () => drafts.filter((draft) => !isDraftCloudClean(draft, cloudByKey.get(draftKey(draft.type, draft.normalizedContractNo || draft.contractNo)))),
+    () => drafts.filter((draft) => !isDraftCloudClean(draft, cloudByKey.get(draftKey(draft.type, draft.id)))),
     [cloudByKey, drafts]
   );
 
@@ -700,38 +632,82 @@ const OfflineReportsScreen = ({
   const submitLocalDraft = useCallback((draft: OfflineReportDraft) => {
     // Every draft uses the canonical form's complete settings, validation, and
     // same-ID upload flow. Opening this screen never submits or clears a draft.
-    onContinueDraft(draft.id, draft.type);
-  }, [onContinueDraft]);
-
-  const continueCloudDraft = useCallback(async (cloud: ReportDraft) => {
-    // Restoring from the cloud replaces the local draft and deletes its local
-    // media, so never while that draft is uploading in the background.
-    if (cloud.clientDraftId && backgroundUploadManager.isBusy(cloud.clientDraftId)) {
+    if (backgroundUploadManager.isBusy(draft.id)) {
       Alert.alert('Uploading in the background', 'This draft is uploading in the background. Pause it from the upload bar to edit it, or continue when the upload finishes.');
       return;
     }
-    // A paused upload of the local copy refers to the photos about to be
-    // replaced; it must not be resumable from the upload bar afterwards.
-    if (cloud.clientDraftId) backgroundUploadManager.forget(cloud.clientDraftId);
-    const local = await AutoSaveService.saveCloudDraftSnapshot({
-      id: cloud.clientDraftId,
-      cloudId: cloud.id || cloud._id,
-      type: cloud.type,
-      title: cloud.title,
-      contractNo: cloud.contractNo,
-      normalizedContractNo: cloud.normalizedContractNo,
-      formData: cloud.formData,
-      lots: hydrateCloudLots(cloud),
-      activeLotIdx: cloud.activeLotIdx || 0,
-      createdAt: cloud.createdAt,
-      updatedAt: cloud.updatedAt,
-    });
-    // The restored draft references R2 URLs, so any older local byte cache is
-    // no longer needed and cannot become a competing source of image order.
-    await AutoSaveService.deleteDraftMedia(local.id);
-    await loadData(false);
-    onContinueDraft(local.id, local.type);
-  }, [loadData, onContinueDraft]);
+    if (draft.ownerId !== OfflineCaptureStore.getOwnerId()) return;
+    onContinueDraft(draft.id, draft.type);
+  }, [onContinueDraft]);
+
+  const continueCloudDraft = useCallback(async (listed: ReportDraft) => {
+    if (openingDraft.current) return;
+    const ownerId = OfflineCaptureStore.getOwnerId();
+    const cloudId = listed.id || listed._id || '';
+    if (!ownerId || !cloudId) return;
+    const isCurrent = () => mounted.current && OfflineCaptureStore.getOwnerId() === ownerId;
+    const localId = listed.clientDraftId || `cloud-${cloudId}`;
+    const checkCanOpen = (draft: OfflineReportDraft) => {
+      if (!isCurrent() || draft.ownerId !== ownerId || draft.type !== listed.type) {
+        throw new Error('The signed-in account changed. Reopen drafts from the owner account.');
+      }
+      if (['accepted', 'submitted', 'discarded'].includes(draft.submissionState || '')) {
+        throw new Error('This draft is no longer editable. Check Reports or Previews; its saved media has not been changed.');
+      }
+      if (backgroundUploadManager.isBusy(draft.id)) {
+        throw new Error('This draft is uploading in the background. Pause it from the upload bar before opening it.');
+      }
+    };
+    openingDraft.current = true;
+    setOpeningCloudId(cloudId);
+    try {
+      // A local draft wins even if the list shows a newer cloud timestamp.
+      // Progress timestamps and partially uploaded manifests are not newer edits.
+      const existing = await AutoSaveService.getDraft(localId);
+      if (!isCurrent()) return;
+      if (existing) {
+        checkCanOpen(existing);
+        onContinueDraft(existing.id, existing.type);
+        return;
+      }
+      if (heldByBackgroundUpload(localId)) {
+        throw new Error('This saved upload is still held on this device. Open it from the upload bar; its original files have not been replaced.');
+      }
+      const cloud = await reportDraftService.get(cloudId);
+      if (!isCurrent()) return;
+      const lots = hydrateCompleteCloudDraft(cloud, {
+        cloudId, clientDraftId: listed.clientDraftId, type: listed.type,
+        revision: listed.revision, ownerId,
+      });
+      // The list can predate a local save or a paused upload. Never overwrite it.
+      const current = await AutoSaveService.getDraft(localId);
+      if (!isCurrent()) return;
+      if (current) {
+        checkCanOpen(current);
+        onContinueDraft(current.id, current.type);
+        return;
+      }
+      if (heldByBackgroundUpload(localId)) {
+        throw new Error('An upload now holds this draft. Keep its originals and open it from the upload bar.');
+      }
+      const local = await AutoSaveService.saveCloudDraftSnapshot({
+        ownerId, id: localId, cloudId, type: cloud.type, title: cloud.title,
+        contractNo: cloud.contractNo, normalizedContractNo: cloud.normalizedContractNo,
+        formData: cloud.formData, lots, activeLotIdx: cloud.activeLotIdx || 0,
+        createdAt: cloud.createdAt, updatedAt: cloud.updatedAt,
+      });
+      if (!isCurrent()) return;
+      checkCanOpen(local);
+      onContinueDraft(local.id, local.type);
+    } catch (error) {
+      if (!isCurrent()) return;
+      const feedback = getSubmissionError(error, 'Retry opening the draft');
+      Alert.alert('Draft could not be opened', feedback.message);
+    } finally {
+      openingDraft.current = false;
+      if (isCurrent()) setOpeningCloudId(null);
+    }
+  }, [onContinueDraft]);
 
   const deleteItem = useCallback((item: UnifiedDraftItem) => {
     if (item.source === 'local' && backgroundUploadManager.isBusy(item.draft.id)) {
@@ -787,6 +763,7 @@ const OfflineReportsScreen = ({
 
   const statusStyle = (status: UnifiedDraftItem['status']) => {
     if (status === 'Cloud saved') return { bg: '#D1FAE5', color: '#059669' };
+    if (status === 'Backup incomplete') return { bg: '#FEF3C7', color: '#92400E' };
     if (status === 'Failed') return { bg: '#FEE2E2', color: '#DC2626' };
     if (status === 'Syncing' || status === 'Uploading') return { bg: '#DBEAFE', color: '#2563EB' };
     if (status === 'Waiting to upload') return { bg: '#FEF3C7', color: '#B45309' };
@@ -848,6 +825,15 @@ const OfflineReportsScreen = ({
           </View>
         ) : null}
 
+        {item.source === 'cloud' && item.status === 'Backup incomplete' ? (
+          <View style={[styles.errorBox, styles.retryBox]}>
+            <Text style={[styles.errorText, styles.retryText]}>
+              Some originals are not confirmed in this backup. Keep the original device and its photos.
+              Opening will check the latest backup; an incomplete copy will not replace your draft.
+            </Text>
+          </View>
+        ) : null}
+
         {item.source === 'local' && item.draft.cloudSyncError ? (
           <View style={[styles.errorBox, recoverableDraftError && styles.retryBox]}>
             <Feather
@@ -900,11 +886,7 @@ const OfflineReportsScreen = ({
             <>
               <TouchableOpacity
                 style={[styles.primaryAction, { backgroundColor: cfg.color }]}
-                onPress={() =>
-                  item.cloud && isDraftCloudClean(item.draft, item.cloud)
-                    ? continueCloudDraft(item.cloud)
-                    : onContinueDraft(item.draft.id, item.draft.type)
-                }
+                onPress={() => submitLocalDraft(item.draft)}
                 activeOpacity={0.88}
               >
                 <Feather name="edit-3" size={15} color="#FFFFFF" />
@@ -926,11 +908,17 @@ const OfflineReportsScreen = ({
           ) : item.source === 'cloud' ? (
             <TouchableOpacity
               style={[styles.primaryAction, { backgroundColor: cfg.color }]}
-              onPress={() => continueCloudDraft(item.cloud)}
+              onPress={() => { void continueCloudDraft(item.cloud); }}
+              disabled={openingCloudId !== null}
+              accessibilityRole="button"
+              accessibilityLabel={openingCloudId === (item.cloud.id || item.cloud._id) ? 'Opening draft' : 'Continue'}
+              accessibilityState={{ disabled: openingCloudId !== null, busy: openingCloudId === (item.cloud.id || item.cloud._id) }}
               activeOpacity={0.88}
             >
-              <Feather name="download-cloud" size={15} color="#FFFFFF" />
-              <Text style={styles.primaryActionText}>Continue</Text>
+              {openingCloudId === (item.cloud.id || item.cloud._id)
+                ? <ActivityIndicator size="small" color="#FFFFFF" />
+                : <Feather name="download-cloud" size={15} color="#FFFFFF" />}
+              <Text style={styles.primaryActionText}>{openingCloudId === (item.cloud.id || item.cloud._id) ? 'Opening…' : 'Continue'}</Text>
             </TouchableOpacity>
           ) : item.source === 'queue' ? (
             <TouchableOpacity
@@ -1117,6 +1105,7 @@ const OfflineReportsScreen = ({
           </View>
         ) : null}
 
+        <CaptureBackupPanel />
         <OfflineCaptureList onOpen={onContinueDraft} />
         {loading ? (
           <View style={styles.loadingState}>

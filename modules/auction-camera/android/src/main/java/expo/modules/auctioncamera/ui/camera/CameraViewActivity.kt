@@ -291,12 +291,20 @@ class CameraViewActivity : BaseActivity() {
             return
         }
         // Restore before observers can initialize an empty builder and checkpoint it.
-        val restoredLifecycleSession = (savedInstanceState != null || viewModel.repository.hasPendingJournal()) && viewModel.restoreSessionIfAvailable()
-        if (!restoredLifecycleSession && initialPayload != null && initialPayload.isNotEmpty() && initialPayload != "[]") {
-            viewModel.loadFromPayload(initialPayload)
-        } else if (!restoredLifecycleSession) {
-            if (viewModel.captureMode.value == null) viewModel.setCaptureMode(CaptureMode.BUNDLE)
-            viewModel.setInitialLotNumber(viewModel.currentLotNumber.value ?: 1)
+        val restoredLifecycleSession = try {
+            val restored = (savedInstanceState != null || viewModel.repository.hasPendingJournal()) && viewModel.restoreSessionIfAvailable()
+            if (!restored && initialPayload != null && initialPayload.isNotEmpty() && initialPayload != "[]") {
+                viewModel.loadFromPayload(initialPayload)
+            } else if (!restored) {
+                if (viewModel.captureMode.value == null) viewModel.setCaptureMode(CaptureMode.BUNDLE)
+                viewModel.setInitialLotNumber(viewModel.currentLotNumber.value ?: 1)
+            }
+            restored
+        } catch (error: Exception) {
+            Log.e("AuctionCameraTiming", "The saved camera structure does not match this draft", error)
+            setResult(RESULT_CANCELED, Intent().putExtra(expo.modules.auctioncamera.CameraPayloadStore.EXTRA_ERROR_CODE, "E_CAMERA_INPUT"))
+            finish()
+            return
         }
         binding = ActivityCameraViewBinding.inflate(layoutInflater)
         setContentView(binding.root)
@@ -439,7 +447,13 @@ class CameraViewActivity : BaseActivity() {
 
     private fun triggerBundleCaptureFromHardware() {
         if (!::binding.isInitialized) return
-        onCaptureModeButtonTapped(CaptureMode.BUNDLE, binding.textViewBundle)
+        val mode = viewModel.repository.fixedMode(viewModel.currentLotNumber.value ?: 1)?.toCaptureMode() ?: CaptureMode.BUNDLE
+        val button = when (mode) {
+            CaptureMode.BUNDLE -> binding.textViewBundle
+            CaptureMode.ITEM -> binding.textViewItem
+            CaptureMode.PHOTO -> binding.textViewPhoto
+        }
+        onCaptureModeButtonTapped(mode, button)
     }
 
     override fun onResume() {
@@ -549,7 +563,8 @@ class CameraViewActivity : BaseActivity() {
         viewModel.extraCount.observe(this) { updateCounterBar() }
         viewModel.totalCount.observe(this) { updateCounterBar() }
         viewModel.currentLotNumber.observe(this) { lotNum ->
-            binding.textViewLot.text = "Lot $lotNum"
+            binding.textViewLot.text = viewModel.repository.lotLabel(lotNum)
+            updateFixedLotControls(lotNum)
 
             if (hasProcessedLotRestore && lotNum == previousLotNumber) return@observe
 
@@ -1707,6 +1722,10 @@ class CameraViewActivity : BaseActivity() {
     }
 
     private fun onCaptureModeButtonTapped(mode: CaptureMode, btn: View, isExtra: Boolean = false) {
+        if (viewModel.repository.isStructureLocked && !isExtra && viewModel.getLotExistingMode() != mode) {
+            toast("This imported lot keeps its saved capture mode. Use its highlighted capture button.")
+            return
+        }
         if (!::engine.isInitialized) return
         if (currentCameraMode == CameraMode.VIDEO) return
         animateModeButtonTap(btn)
@@ -1749,6 +1768,10 @@ class CameraViewActivity : BaseActivity() {
     }
 
     private fun fireCapture(mode: CaptureMode, isExtra: Boolean = false) {
+        if (viewModel.repository.hasReachedFixedPhotoLimit(viewModel.currentLotNumber.value ?: 1)) {
+            toast("This lot already has 200 photos. Remove a photo before taking another; your saved photos are unchanged.")
+            return
+        }
         if (!::engine.isInitialized) return
         if (engine.isRecording()) return
         if (!captureInFlight.compareAndSet(false, true)) return
@@ -1780,6 +1803,21 @@ class CameraViewActivity : BaseActivity() {
         currentCaptureMode = mode
         highlightCaptureModeButton(mode)
         updateModeSubtitle(mode)
+    }
+
+    private fun updateFixedLotControls(lotNumber: Int) {
+        if (!viewModel.repository.isStructureLocked) return
+        val mode = viewModel.repository.fixedMode(lotNumber)?.toCaptureMode()
+        currentCaptureMode = mode
+        for ((button, candidate) in listOf(binding.textViewBundle to CaptureMode.BUNDLE,
+            binding.textViewItem to CaptureMode.ITEM, binding.textViewPhoto to CaptureMode.PHOTO)) {
+            button.isEnabled = candidate == mode
+            button.alpha = if (button.isEnabled) 1f else 0.35f
+        }
+        binding.imageLeftArrow.isEnabled = lotNumber > 1
+        binding.imageRightArrow.isEnabled = viewModel.repository.canNavigateTo(lotNumber + 1)
+        binding.imageLeftArrow.alpha = if (binding.imageLeftArrow.isEnabled) 1f else 0.35f
+        binding.imageRightArrow.alpha = if (binding.imageRightArrow.isEnabled) 1f else 0.35f
     }
 
     private fun clearCaptureModeHighlights() {

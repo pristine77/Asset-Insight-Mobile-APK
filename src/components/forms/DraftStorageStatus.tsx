@@ -15,7 +15,7 @@ export default function DraftStorageStatus({ saving, error, onRetry, onClose }: 
         <Text accessibilityRole={error ? 'alert' : undefined} accessibilityLiveRegion="polite" style={[styles.title, { color: colors.text }]}>
           {error || (saving ? 'Saving on this device…' : 'Opening saved draft…')}
         </Text>
-        <Text style={{ color: colors.textSecondary }}>{saving ? 'Please wait until saving finishes. No photos are being uploaded.' : 'Your saved details, lots and photo order will be restored for review. Nothing uploads automatically.'}</Text>
+        <Text style={{ color: colors.textSecondary }}>{saving ? 'Please wait until the local save finishes. Cloud backup is separate; this does not submit the report.' : 'Your saved details, lots and photo order will be restored for review. Cloud backup does not submit the report.'}</Text>
         {error && <TouchableOpacity accessibilityRole="button" onPress={onRetry} style={styles.button}><Text style={{ color: colors.accent }}>Retry opening draft</Text></TouchableOpacity>}
         {!saving && <TouchableOpacity accessibilityRole="button" onPress={onClose} style={styles.button}><Text style={{ color: colors.accent }}>Close</Text></TouchableOpacity>}
       </View>

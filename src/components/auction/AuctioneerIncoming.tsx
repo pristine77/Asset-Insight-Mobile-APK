@@ -227,7 +227,6 @@ export default function AuctioneerIncoming({ refreshVersion = 0, onOpenReport }:
       />
       {setup?.reportType === 'asset' && (
         <AssetFormSheet
-          key={setup.workItemId}
           visible
           onClose={close}
           onSuccess={close}
@@ -237,7 +236,6 @@ export default function AuctioneerIncoming({ refreshVersion = 0, onOpenReport }:
       )}
       {setup?.reportType === 'lotListing' && (
         <LotListingFormSheet
-          key={setup.workItemId}
           visible
           onClose={close}
           onSuccess={close}

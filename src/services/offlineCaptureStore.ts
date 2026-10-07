@@ -7,6 +7,7 @@ import type { OfflineReportDraft } from './autoSaveService';
 import type { CaptureContext, NativeCaptureJournal, OfflineDraftCounts, OfflineSubmissionState } from './offlineCaptureTypes';
 import type { MixedLot } from '../components/camera/types';
 import { activityBatch, activityCounts, observeActivity, type ActivityState, type DeviceActivity } from './reportActivityObservation';
+import { backupContent, backupOriginalUri, isBackupCandidate } from './captureBackupSnapshot';
 
 const LEGACY_DRAFTS = '@clearvalue_offline_report_drafts_v1';
 const LEGACY_AUTOSAVE = '@clearvalue_auto_save';
@@ -15,6 +16,17 @@ const schema = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS capture_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS capture_backup_outbox (
+  owner_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL,
+  PRIMARY KEY(owner_id,draft_id,revision)
+);
+CREATE TABLE IF NOT EXISTS capture_backup_media_refs (
+  owner_id TEXT NOT NULL, draft_id TEXT NOT NULL, uri TEXT NOT NULL,
+  PRIMARY KEY(owner_id,draft_id,uri)
+);
+CREATE TABLE IF NOT EXISTS capture_backup_seeded (
+  owner_id TEXT NOT NULL, draft_id TEXT NOT NULL, PRIMARY KEY(owner_id,draft_id)
+);
 CREATE TABLE IF NOT EXISTS report_activity_outbox (
   owner_id TEXT NOT NULL, event_id TEXT NOT NULL, data TEXT NOT NULL,
   PRIMARY KEY(owner_id,event_id)
@@ -120,6 +132,7 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
   let database: Promise<SQLiteDatabase> | undefined;
   let initialized: Promise<void> | undefined;
   let writeTail: Promise<unknown> = Promise.resolve();
+  const savedListeners = new Set<() => void>();
   const db = () => (database ??= openDatabase());
   const requireOwner = () => {
     if (!ownerId) throw new Error('Sign in to the draft owner account before saving or uploading.');
@@ -181,7 +194,7 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
     return row ? { ...readJson<OfflineReportDraft>(row.data), ownerId: expected, localRevision: row.revision } : null;
   }
 
-  async function persist(draft: OfflineReportDraft, expected: string, legacyId?: string, explicitSave = false): Promise<OfflineReportDraft> {
+  async function persist(draft: OfflineReportDraft, expected: string, legacyId?: string, explicitSave = false, createOnly = false): Promise<OfflineReportDraft> {
     await initialize();
     assertOwner(expected);
     if (draft.ownerId && draft.ownerId !== expected) throw new Error('This draft belongs to another account.');
@@ -192,6 +205,7 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
     await database.withExclusiveTransactionAsync(async (tx) => {
       assertOwner(expected);
       const old = await tx.getFirstAsync<DraftRow>('SELECT data,revision FROM capture_drafts WHERE owner_id = ? AND id = ?', expected, draft.id);
+      if (createOnly && old) throw new Error('This draft is already saved on this device. Open its local copy; it has not been replaced.');
       const previous = old ? readJson<OfflineReportDraft>(old.data) : null;
       if (old && draft.localRevision != null && draft.localRevision !== old.revision) throw new Error('This draft changed while saving. Reopen it before retrying.');
       const revision = (old?.revision || 0) + 1;
@@ -231,6 +245,28 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
         expected, draft.id, draft.type, revision, draft.updatedAt, JSON.stringify(saved));
       await tx.runAsync('INSERT OR REPLACE INTO capture_summaries(owner_id,draft_id,type,updated_at,hidden,data) VALUES(?,?,?,?,?,?)',
         expected, draft.id, draft.type, draft.updatedAt, hidden(saved) ? 1 : 0, JSON.stringify(summary(saved)));
+      if (isBackupCandidate(saved) && (!previous || !isBackupCandidate(previous) || backupContent(previous) !== backupContent(saved))) {
+        // Atomic with the local save: process death cannot silently lose queue intent.
+        await tx.runAsync(`INSERT INTO capture_backup_outbox(owner_id,draft_id,revision,data) VALUES(?,?,?,?)`,
+          expected, draft.id, revision, JSON.stringify(saved));
+        await tx.runAsync('INSERT OR IGNORE INTO capture_backup_seeded(owner_id,draft_id) VALUES(?,?)', expected, draft.id);
+        const refs = new Set<string>();
+        for (const lot of saved.lots) for (const media of [...lot.mainImages, ...lot.extraImages, ...(lot.videoFiles || [])]) {
+          const value = backupOriginalUri(media);
+          if (value && /^(file|content):/i.test(value)) refs.add(value);
+        }
+        const values = [...refs];
+        for (let offset = 0; offset < values.length; offset += 100) {
+          const batch = values.slice(offset, offset + 100);
+          await tx.runAsync(`INSERT OR IGNORE INTO capture_backup_media_refs(owner_id,draft_id,uri) VALUES ${batch.map(() => '(?,?,?)').join(',')}`,
+            ...batch.flatMap(uri => [expected, draft.id, uri]));
+        }
+      }
+      if (saved.submissionState === 'discarded' && previous?.submissionState !== 'discarded') {
+        // A durable stop command, not permission to resurrect/upload a deleted draft.
+        await tx.runAsync(`INSERT INTO capture_backup_outbox(owner_id,draft_id,revision,data) VALUES(?,?,?,?)`,
+          expected, draft.id, revision, JSON.stringify(saved));
+      }
       const oldLots = new Map((previous?.lots || []).map((lot) => [lot.id, lot]));
       const oldPositions = new Map((previous?.lots || []).map((lot, index) => [lot.id, index]));
       const nextLotIds = new Set(draft.lots.map((lot) => lot.id));
@@ -269,6 +305,7 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
         expected, new Date().toISOString(), legacyId);
     });
     assertOwner(expected);
+    for (const listener of savedListeners) { try { listener(); } catch { /* The committed draft remains authoritative. */ } }
     return saved;
   }
 
@@ -276,6 +313,38 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
     setOwner(value: string | null) { ownerId = value?.trim() || null; },
     getOwnerId() { return ownerId; },
     initialize,
+    subscribeSaved(listener: () => void) { savedListeners.add(listener); return () => { savedListeners.delete(listener); }; },
+    async seedBackups() {
+      const expected = requireOwner(); await initialize();
+      await serialize(async () => { assertOwner(expected); await (await db()).withExclusiveTransactionAsync(async tx => { await tx.runAsync(`
+        INSERT OR IGNORE INTO capture_backup_outbox(owner_id,draft_id,revision,data)
+        SELECT d.owner_id,d.id,d.revision,d.data FROM capture_drafts d
+        JOIN capture_summaries s ON s.owner_id=d.owner_id AND s.draft_id=d.id
+        WHERE d.owner_id=? AND s.hidden=0 AND d.type IN ('asset','lotListing')
+          AND NOT EXISTS (SELECT 1 FROM capture_backup_seeded q WHERE q.owner_id=d.owner_id AND q.draft_id=d.id)
+          AND (json_extract(d.data,'$.captureMode')='offline' OR json_extract(d.data,'$.manualSubmissionRequired')=1)`, expected);
+        await tx.runAsync(`INSERT OR IGNORE INTO capture_backup_media_refs(owner_id,draft_id,uri)
+          SELECT m.owner_id,m.draft_id,COALESCE(NULLIF(json_extract(m.data,'$.originalUri'),''),m.uri)
+          FROM capture_media m JOIN capture_backup_outbox b ON b.owner_id=m.owner_id AND b.draft_id=m.draft_id
+          WHERE m.owner_id=?`, expected);
+        // Seed legacy captures once, not on every foreground/auth restart. Ordinary
+        // content saves already journal each new revision atomically above.
+        await tx.runAsync(`INSERT OR IGNORE INTO capture_backup_seeded(owner_id,draft_id)
+          SELECT owner_id,draft_id FROM capture_backup_outbox WHERE owner_id=?`, expected);
+      }); });
+    },
+    async pendingBackups(limit = 10, excluded: string[] = []): Promise<OfflineReportDraft[]> {
+      const expected = requireOwner(); await initialize();
+      const skip = excluded.slice(0, 200);
+      const rows = await (await db()).getAllAsync<{ data: string }>(`SELECT data FROM capture_backup_outbox WHERE owner_id=?${skip.length ? ` AND draft_id NOT IN (${skip.map(() => '?').join(',')})` : ''} ORDER BY rowid LIMIT ?`, expected, ...skip, Math.min(20, Math.max(1, limit)));
+      assertOwner(expected); return rows.map(row => readJson<OfflineReportDraft>(row.data));
+    },
+    async acknowledgeBackupQueue(id: string, revision: number, expected: string) {
+      assertOwner(expected); await initialize();
+      await serialize(async () => { assertOwner(expected); await (await db()).runAsync(
+        'DELETE FROM capture_backup_outbox WHERE owner_id=? AND draft_id=? AND revision=?', expected, id, revision
+      ); });
+    },
     async stageCameraActivity(journal: NativeCaptureJournal & { activity?: unknown[] }) {
       const expected = requireOwner(); if (journal.ownerId !== expected) throw new Error('Camera owner changed.');
       if (!Array.isArray(journal.activity)) return;
@@ -372,12 +441,21 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
       return rows.map((row) => ({ ...readJson<OfflineDraftSummary>(row.data), inventoryError: row.message || undefined }));
     },
     async saveDraft(draft: OfflineReportDraft, explicitSave = false) { const expected = requireOwner(); return serialize(() => persist(draft, expected, undefined, explicitSave)); },
+    async createCloudDraft(draft: OfflineReportDraft, expectedOwner: string) {
+      assertOwner(expectedOwner);
+      if (!expectedOwner || draft.ownerId !== expectedOwner) throw new Error('Sign in to the draft owner account before restoring.');
+      // The absence check and insert share the store writer and SQLite transaction.
+      // A late cloud response cannot replace a capture, edit, or hidden accepted draft.
+      return serialize(() => persist(draft, expectedOwner, undefined, false, true));
+    },
     async updateDraft(id: string, change: (draft: OfflineReportDraft) => OfflineReportDraft, explicitSave = false) {
       const expected = requireOwner();
       return serialize(async () => {
         const draft = await readDraft(id, expected);
         if (!draft) throw new Error('The saved draft is unavailable.');
-        return persist(change(draft), expected, undefined, explicitSave);
+        const next = change(draft);
+        if (next === draft) return draft;
+        return persist(next, expected, undefined, explicitSave);
       });
     },
     async deleteDraft(id: string) {
@@ -476,6 +554,7 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
       const rows = await (await db()).getAllAsync<{ data: string }>('SELECT data FROM capture_media');
       const legacy = await (await db()).getAllAsync<{ data: string }>('SELECT data FROM capture_legacy WHERE kind != ?', 'source');
       const pending = await (await db()).getAllAsync<{ data: string }>('SELECT data FROM capture_pending_camera');
+      const backupRefs = await (await db()).getAllAsync<{ uri: string }>('SELECT uri FROM capture_backup_media_refs');
       const keep = new Set<string>();
       const visit = (value: unknown) => {
         if (typeof value === 'string' && /^(file|content|ph):\/\//.test(value)) keep.add(value);
@@ -483,6 +562,7 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
         else if (value && typeof value === 'object') Object.values(value).forEach(visit);
       };
       [...rows, ...legacy, ...pending].forEach((row) => { try { visit(JSON.parse(row.data)); } catch { /* retained raw quarantine */ } });
+      backupRefs.forEach(row => keep.add(row.uri));
       return [...keep];
     },
   };

@@ -1,7 +1,7 @@
 import api from './api';
 import type { OfflineReportDraft, SavedPhotoFileData } from './autoSaveService';
 import OfflineCaptureStore from './offlineCaptureStore';
-import reportDraftService, { type CloudDraftMedia, type ReportDraft } from './reportDraftService';
+import reportDraftService, { isVerifiedCloudBackupOfLocal, type CloudDraftMedia, type ReportDraft } from './reportDraftService';
 import { uploadLocalFileToPresignedUrl } from './directR2UploadService';
 import { pauseActiveUploads, setUploadOwner } from './uploadCancellation';
 
@@ -135,7 +135,7 @@ it('keeps presigned PUT confirmation separate from multipart and already uploade
   await reportDraftService.upsertFromLocalDraft(draft);
   expect(uploadLocalFileToPresignedUrl).toHaveBeenCalledTimes(1);
   expect(uploadLocalFileToPresignedUrl).toHaveBeenCalledWith(expect.objectContaining({ uri: photo(0).uri }), 'https://storage.invalid/presigned', 'image/jpeg');
-  expect(confirmationCalls().map(([, body]) => body)).toEqual([{ clientFileIds: ['photo-0'] }]);
+  expect(confirmationCalls().flatMap(([, body]) => (body as any).clientFileIds).sort()).toEqual(['photo-0', 'photo-2']);
   expect(multipartCalls().map(([, body]) => metadataFor(body).map((item) => item.clientFileId))).toEqual([['photo-1']]);
   expect(cloud.media?.every((item) => item.uploadedAt && item.url)).toBe(true);
 });
@@ -299,4 +299,130 @@ it.each([
 ])('preserves offline and ownership upload gates %j', async (values) => {
   await expect(reportDraftService.upsertFromLocalDraft(draftWith(values))).rejects.toThrow();
   expect(api.post).not.toHaveBeenCalled();
+});
+
+it.each(['lot', 'photo', 'missing'] as const)('rejects bad local %s references before any metadata write', async (kind) => {
+  const draft = draftWith();
+  if (kind === 'lot') draft.lots.push({ ...draft.lots[0], mainImages: [] });
+  if (kind === 'photo') draft.lots[0].mainImages.push(photo());
+  if (kind === 'missing') draft.lots[0].mainImages[0] = photo(0, { missing: true });
+  await expect(reportDraftService.upsertFromLocalDraft(draft)).rejects.toThrow();
+  expect(api.post).not.toHaveBeenCalled();
+});
+
+it.each(['missing', 'extra', 'moved', 'owner', 'revision', 'draft', 'client', 'submission', 'size'] as const)(
+  'does not acknowledge a successful transport with %s snapshot mismatch', async (kind) => {
+    const draft = draftWith();
+    jest.mocked(api.get).mockImplementation(async () => {
+      const result = apiResponse();
+      const saved = result.data.data;
+      if (kind === 'missing') saved.media = [];
+      if (kind === 'extra') saved.media.push({ ...saved.media[0], clientFileId: 'unexpected', index: 1, originalOrder: 1 });
+      if (kind === 'moved') saved.media[0].slot = 'extra';
+      if (kind === 'owner') saved.user = 'someone-else';
+      if (kind === 'revision') saved.revision++;
+      if (kind === 'draft') saved.id = 'other-cloud';
+      if (kind === 'client') saved.clientDraftId = 'other-local';
+      if (kind === 'submission') saved.formData.clientSubmissionId = 'other-submission';
+      if (kind === 'size') saved.media[0].verifiedSize++;
+      return result;
+    });
+    const original = JSON.stringify(draft);
+    await expect(reportDraftService.upsertFromLocalDraft(draft)).rejects.toThrow();
+    expect(JSON.stringify(draft)).toBe(original);
+  }
+);
+
+it('allows an unknown-size legacy original only after the server measures and verifies its actual size', async () => {
+  const draft = draftWith({ lots: [{ ...draftWith().lots[0], mainImages: [photo(0, { size: undefined })] }] });
+  onMultipart = async () => {
+    cloud.media = cloud.media?.map((item) => uploaded({ ...item, size: 800 }));
+    return apiResponse();
+  };
+  expect((await reportDraftService.upsertFromLocalDraft(draft)).media?.[0].verifiedSize).toBe(800);
+});
+
+it.each(['unconfirmed', 'legacy-zero-size'] as const)('confirms an alreadyUploaded %s object without uploading original bytes again', async (state) => {
+  const draft = draftWith({ lots: [{ ...draftWith().lots[0], mainImages: [photo(0, { size: undefined })] }] });
+  await expect(reportDraftService.upsertFromLocalDraft(draft)).rejects.toThrow('could not be verified');
+  cloud.media = cloud.media?.map((item) => ({ ...item, size: 0, verifiedSize: state === 'legacy-zero-size' ? 0 : undefined,
+    uploadedAt: state === 'legacy-zero-size' ? '2026-10-06T10:00:00.000Z' : undefined,
+    url: state === 'legacy-zero-size' ? 'https://storage.invalid/original.jpg' : undefined }));
+  const beforeUploads = multipartCalls().length;
+  const originalPost = jest.mocked(api.post).getMockImplementation()!;
+  jest.mocked(api.post).mockImplementation(async (url, body: any, config) => {
+    if (String(url).endsWith('/media/confirm')) {
+      cloud.media = cloud.media?.map((item) => ({ ...uploaded(item), size: 0, verifiedSize: 800 }));
+      return apiResponse();
+    }
+    return originalPost(url, body, config);
+  });
+  targetFor = (item) => ({ clientFileId: item.clientFileId, alreadyUploaded: true });
+  const saved = await reportDraftService.upsertFromLocalDraft(draft);
+  expect(saved.media?.[0].verifiedSize).toBe(800);
+  expect(confirmationCalls()).toHaveLength(1);
+  expect(multipartCalls()).toHaveLength(beforeUploads);
+  expect(uploadLocalFileToPresignedUrl).not.toHaveBeenCalled();
+});
+
+it('only regards an exact complete cloud manifest as a backup of all224local originals', async () => {
+  const draft = draftWith({ lots: [{ ...draftWith().lots[0], mainImages: Array.from({ length: 224 }, (_, index) => photo(index)) }] });
+  const saved = await reportDraftService.upsertFromLocalDraft(draft);
+  expect(isVerifiedCloudBackupOfLocal(draft, saved)).toBe(true);
+  expect(isVerifiedCloudBackupOfLocal(draft, { ...saved, media: [] })).toBe(false);
+  expect(isVerifiedCloudBackupOfLocal(draft, { ...saved, media: saved.media?.slice(0, 50) })).toBe(false);
+  expect(isVerifiedCloudBackupOfLocal(draft, { ...saved, media: saved.media?.map((item, index) => index === 0 ? { ...item, clientFileId: 'other-photo' } : item) })).toBe(false);
+  expect(isVerifiedCloudBackupOfLocal(draft, { ...saved, media: saved.media?.map((item, index) => index === 0 ? { ...item, lotId: 'other-lot' } : item) })).toBe(false);
+  expect(isVerifiedCloudBackupOfLocal(draft, { ...saved, media: saved.media?.map((item, index) => index === 0 ? { ...item, verifiedSize: 0 } : item) })).toBe(false);
+});
+
+it('never uses another draft, owner or type as local backup evidence', async () => {
+  const draft = draftWith();
+  const saved = await reportDraftService.upsertFromLocalDraft(draft);
+  for (const different of [{ clientDraftId: 'other-draft' }, { user: 'owner-b' }, { type: 'lotListing' as const },
+    { lots: [] }, { storageMode: 'local_media' as const }, { storageMode: 'smart_upload' as const }]) {
+    expect(isVerifiedCloudBackupOfLocal(draft, { ...saved, ...different })).toBe(false);
+  }
+  expect(isVerifiedCloudBackupOfLocal({ ...draft, cloudId: 'other-cloud' }, saved)).toBe(false);
+});
+
+it('holds the original metadata snapshot when the caller edits its draft mid-upload', async () => {
+  const draft = draftWith();
+  onMultipart = async (body) => {
+    draft.formData.clientSubmissionId = 'new-edits';
+    draft.lots[0].mainImages.push(photo(1));
+    const ids = new Set(metadataFor(body).map((item) => item.clientFileId));
+    cloud.media = cloud.media?.map((item) => ids.has(item.clientFileId) ? uploaded(item) : item);
+    return apiResponse();
+  };
+  const saved = await reportDraftService.upsertFromLocalDraft(draft);
+  expect(saved.formData.clientSubmissionId).toBe('stable-submission');
+  expect(saved.media).toHaveLength(1);
+  expect(draft.lots[0].mainImages).toHaveLength(2);
+});
+
+it('rejects an account switch after the final receipt arrives', async () => {
+  jest.mocked(api.get).mockImplementation(async () => {
+    const result = apiResponse();
+    jest.mocked(OfflineCaptureStore.getOwnerId).mockReturnValue('owner-b');
+    return result;
+  });
+  await expect(reportDraftService.upsertFromLocalDraft(draftWith())).rejects.toThrow('owns this draft');
+});
+
+it('fresh detail reads validate exact returned draft and owner', async () => {
+  expect((await reportDraftService.get('cloud-draft')).id).toBe('cloud-draft');
+  expect(api.get).toHaveBeenLastCalledWith('/report-drafts/cloud-draft', { signal: expect.any(AbortSignal) });
+  cloud.user = 'someone-else';
+  await expect(reportDraftService.get('cloud-draft')).rejects.toThrow('different signed-in account');
+  cloud.user = 'owner-a'; cloud.id = 'other-draft';
+  await expect(reportDraftService.get('cloud-draft')).rejects.toThrow('different draft');
+});
+
+it('never returns cloud detail into a different account after a delayed GET', async () => {
+  jest.mocked(api.get).mockImplementation(async () => {
+    jest.mocked(OfflineCaptureStore.getOwnerId).mockReturnValue('owner-b');
+    return apiResponse();
+  });
+  await expect(reportDraftService.get('cloud-draft')).rejects.toThrow('account changed');
 });

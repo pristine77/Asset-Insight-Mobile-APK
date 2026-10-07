@@ -58,7 +58,7 @@ export default function OfflineCaptureList({ onOpen }: { onOpen: (id: string, ty
   const visible = items.slice(page * 20, (page + 1) * 20);
   return <View style={styles.section}>
     <Text style={[styles.title, { color: colors.text }]}>Offline captures · {items.length}</Text>
-    <Text style={{ color: colors.textSecondary }}>Photos remain on this device. Only operational counts and status sync automatically. Open a draft to review and submit.</Text>
+    <Text style={{ color: colors.textSecondary }}>Photos remain on this device. On supported Android builds, cloud backup runs separately; check Photo cloud backup for verified progress and Pause/Resume. Open a draft to review and submit the report yourself.</Text>
     {error ? <Text accessibilityRole="alert" style={{ color: colors.danger }}>{error}</Text> : null}
     {visible.map((item) => {
       // The background upload line knows more than the stored state: a draft
@@ -70,10 +70,10 @@ export default function OfflineCaptureList({ onOpen }: { onOpen: (id: string, ty
       <Text style={{ color: colors.text }}>Saved on this device · {new Date(item.updatedAt).toLocaleString()}</Text>
       <Text style={{ color: colors.textSecondary }}>{item.counts.lots} lots · {item.counts.images} photos · {item.counts.extraImages} report-only{item.counts.missingImages ? ` · ${item.counts.missingImages} missing` : ''}</Text>
       {background ? <Text accessibilityLiveRegion="polite" style={{ color: background.status === 'attention' ? colors.warning : colors.info }}>Background upload: {describeBackgroundUpload(background)}</Text>
-        : needsExplicitUploadResume(item.submissionState) ? <Text style={{ color: colors.warning }}>Upload needs your confirmation — open the draft, then tap Resume upload. Nothing uploads automatically.</Text> : null}
+        : needsExplicitUploadResume(item.submissionState) ? <Text style={{ color: colors.warning }}>Report submission needs your confirmation — open the draft, then tap Resume upload. Cloud backup does not submit it.</Text> : null}
       {item.inventoryError ? <Text accessibilityRole="alert" style={{ color: colors.warning }}>{item.inventoryError}</Text> : null}
       <View style={styles.actions}>
-        <TouchableOpacity accessibilityRole="button" accessibilityHint="Review saved data first. Photos upload only after you tap Submit." onPress={() => onOpen(item.id, item.type)} style={styles.button}><Text style={{ color: colors.accent }}>Open and submit</Text></TouchableOpacity>
+        <TouchableOpacity accessibilityRole="button" accessibilityHint="Review saved data first. The report is submitted only after you tap Submit; cloud backup is separate." onPress={() => onOpen(item.id, item.type)} style={styles.button}><Text style={{ color: colors.accent }}>Open and submit</Text></TouchableOpacity>
         <TouchableOpacity accessibilityRole="button" accessibilityState={{ expanded: expanded === item.id }} onPress={() => setExpanded(expanded === item.id ? undefined : item.id)} style={styles.button}><Text style={{ color: colors.text }}>Lot counts</Text></TouchableOpacity>
         <TouchableOpacity accessibilityRole="button" accessibilityState={{ disabled: busy }} accessibilityHint={busy ? 'Uploading in the background. Pause it from the upload bar first.' : undefined}
           disabled={busy} onPress={() => remove(item)} style={[styles.button, busy && styles.disabled]}><Text style={{ color: colors.danger }}>Discard</Text></TouchableOpacity>

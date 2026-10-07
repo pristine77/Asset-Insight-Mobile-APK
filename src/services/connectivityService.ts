@@ -66,7 +66,7 @@ export function getServerErrorMessage(error: any): string {
   return typeof error?.message === 'string' ? error.message.trim() : '';
 }
 
-function actionableErrorMessage(error: any): string {
+export function actionableErrorMessage(error: any): string {
   const message = getServerErrorMessage(error);
   // Proxy/storage HTML, transport diagnostics and bare status codes are not
   // instructions a person can use. Keep specific plain-language validation.

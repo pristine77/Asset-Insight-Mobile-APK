@@ -7,7 +7,7 @@ import AuctioneerFormBoundary from './AuctioneerFormBoundary';
 import auctioneerService, { type AuctioneerReportType, type AuctioneerWorkItemSetup } from '../../services/auctioneerService';
 import assetService from '../../services/assetService';
 import lotListingService from '../../services/lotListingService';
-import AutoSaveService from '../../services/autoSaveService';
+import AutoSaveService, { type AutoSaveFormData } from '../../services/autoSaveService';
 import OfflineQueueService from '../../services/offlineQueueService';
 import OfflineCaptureStore from '../../services/offlineCaptureStore';
 import reportDraftService from '../../services/reportDraftService';
@@ -39,12 +39,13 @@ jest.mock('../camera/NativeAuctionCameraScreen', () => {
 jest.mock('./LotManager', () => {
   const React = require('react');
   const { View, Text, TouchableOpacity } = require('react-native');
-  return { __esModule: true, default: ({ lots, lockedStructure, onOpenCamera }: any) => <View>
+  return { __esModule: true, default: ({ lots, setLots, lockedStructure, onOpenCamera }: any) => <View>
     <Text testID="mock-lot-count">{lots.length}</Text>
     <Text testID="mock-photo-count">{lots.reduce((sum: number, lot: any) => sum + lot.files.length, 0)}</Text>
     <Text testID="mock-restored-lots">{JSON.stringify(lots)}</Text>
     <Text testID="mock-locked">{String(Boolean(lockedStructure))}</Text>
     <TouchableOpacity accessibilityRole="button" accessibilityLabel="Open mock lot camera" onPress={() => onOpenCamera(0)}><Text>Camera</Text></TouchableOpacity>
+    <TouchableOpacity accessibilityRole="button" accessibilityLabel="Add fresh test photo" onPress={() => setLots([{ id: 'fresh-capture-lot', mode: 'single_lot', files: [{ uri: 'file:///fresh-photo.jpg', name: 'fresh.jpg', type: 'image/jpeg' }], extraFiles: [], coverIndex: 0 }])}><Text>Add fresh test photo</Text></TouchableOpacity>
   </View> };
 });
 jest.mock('../../services/api', () => ({ __esModule: true, default: { get: jest.fn(), post: jest.fn() } }));
@@ -94,6 +95,10 @@ function draft(type: AuctioneerReportType) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  jest.mocked(auctioneerService.getSetup).mockReset();
+  jest.mocked(auctioneerService.continueWorkItem).mockReset();
+  jest.mocked(assetService.createAssetReport).mockReset();
+  jest.mocked(lotListingService.createLotListing).mockReset();
   mockOwner = 'owner';
   setUploadOwner(mockOwner);
   jest.spyOn(Alert, 'alert').mockImplementation(() => {});
@@ -674,18 +679,22 @@ describe.each(['asset', 'lotListing'] as const)('%s offline save then review', t
   });
 });
 
-describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next', (type) => {
-  async function mount(submissionState?: 'ready' | 'uploading' | 'paused') {
+describe.each(['asset', 'lotListing'] as const)('%s incoming create-and-continue', (type) => {
+  async function mount(submissionState?: 'ready' | 'uploading' | 'paused', fields: AutoSaveFormData = {}, reflectSetup = false) {
     const current = setup(type);
     jest.mocked(auctioneerService.getSetup).mockResolvedValue(current);
-    jest.mocked(AutoSaveService.getDraft).mockResolvedValue({ ...draft(type), submissionState } as any);
+    jest.mocked(AutoSaveService.getDraft).mockResolvedValue({ ...draft(type), formData: { ...draft(type).formData, ...fields }, submissionState } as any);
     jest.mocked(auctioneerService.continueWorkItem).mockResolvedValue(successor(current));
     const Form = type === 'asset' ? AssetFormSheet : LotListingFormSheet;
     const changed = jest.fn();
     const closed = jest.fn();
-    await render(<Form visible auctioneer={current} draftIdToLoad="local-parent" onClose={closed} onAuctioneerSetupChange={changed} />);
+    function Navigation() {
+      const [active, setActive] = useState(current);
+      return <Form visible auctioneer={active} draftIdToLoad="local-parent" onClose={closed} onAuctioneerSetupChange={next => { changed(next); if (reflectSetup) setActive(next); }} />;
+    }
+    const view = await render(<Navigation />);
     await waitFor(() => expect(screen.getByTestId('mock-photo-count').props.children).toBe(1));
-    return { current, changed, closed, upload: type === 'asset' ? assetService.createAssetReport : lotListingService.createLotListing };
+    return { current, changed, closed, view, upload: type === 'asset' ? assetService.createAssetReport : lotListingService.createLotListing };
   }
 
   it('passes the source structure lock through the real form camera boundary', async () => {
@@ -698,7 +707,7 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
   it('never starts separate work for an unavailable accepted Incoming report', async () => {
     const { upload, closed } = await mount();
     jest.mocked(upload).mockRejectedValueOnce({ response: { status: 409, data: { code: 'UPLOAD_SESSION_REPORT_UNAVAILABLE', data: { accepted: true, reportAvailable: false, canCreateSeparate: true } } } });
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(Alert.alert).toHaveBeenCalledWith('Earlier report unavailable', expect.stringContaining('Incoming'), [{ text: 'Keep Draft', style: 'cancel' }]));
     expect(upload).toHaveBeenCalledTimes(1);
     expect(auctioneerService.continueWorkItem).not.toHaveBeenCalled();
@@ -709,17 +718,32 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
   it('does not continue or remove a draft whose edited fields received an earlier acceptance', async () => {
     const { upload, closed } = await mount();
     jest.mocked(upload).mockResolvedValueOnce({ jobId: 'job-parent', reportId: 'report-parent', message: 'Already accepted', accepted: true, alreadyQueued: true } as any);
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(Alert.alert).toHaveBeenCalledWith('Earlier upload accepted', expect.any(String)));
     expect(auctioneerService.continueWorkItem).not.toHaveBeenCalled();
     expect(closed).not.toHaveBeenCalled();
     expect(AutoSaveService.removeDraftRecordOnly).not.toHaveBeenCalled();
   });
 
+  it.each([
+    {}, { reportId: 'placeholder', jobId: 'job-parent', accepted: false },
+    { reportId: 'placeholder', jobId: 'job-parent', accepted: true, phase: 'uploading' },
+    { reportId: 'placeholder', jobId: 'job-parent', readyToComplete: true },
+  ])('keeps the complete draft when Continue receives an unconfirmed receipt %#', async receipt => {
+    const { upload, changed } = await mount();
+    jest.mocked(upload).mockResolvedValueOnce(receipt as any);
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(Alert.alert).toHaveBeenCalled());
+    expect(auctioneerService.continueWorkItem).not.toHaveBeenCalled();
+    expect(changed).not.toHaveBeenCalled();
+    expect(AutoSaveService.removeDraftRecordOnly).not.toHaveBeenCalled();
+    expect(screen.getByTestId('mock-photo-count').props.children).toBe(1);
+  });
+
   it('keeps the fixed Incoming identity instead of offering a separate changed upload', async () => {
     const { upload } = await mount('paused');
     jest.mocked(upload).mockRejectedValueOnce({ response: { status: 409, data: { code: 'SUBMISSION_MANIFEST_CHANGED' } } });
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(Alert.alert).toHaveBeenCalledWith('Upload needs checking', expect.stringContaining('Incoming work must keep its assigned upload'), [{ text: 'Keep Draft', style: 'cancel' }]));
     expect(upload).toHaveBeenCalledTimes(1);
     expect(jest.mocked(upload).mock.calls[0][0].client_submission_id).toBe('submission-parent');
@@ -729,7 +753,7 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
   it('switches an Online saved Incoming draft to local Save when Offline is newly selected', async () => {
     const { upload, closed } = await mount();
     await fireEvent.press(screen.getByRole('radio', { name: 'Offline capture' }));
-    expect(screen.queryByRole('button', { name: 'Generate files & new lot' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Create Lot & Continue' })).toBeNull();
     await fireEvent.press(screen.getByRole('button', { name: type === 'asset' ? 'Save offline asset report' : 'Save offline lot listing' }));
     await waitFor(() => expect(closed).toHaveBeenCalledTimes(1));
     expect(upload).not.toHaveBeenCalled();
@@ -737,11 +761,11 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
     expect(reportDraftService.upsertFromLocalDraft).not.toHaveBeenCalled();
   });
 
-  it('waits for actual server acceptance, carries only the contract, and mounts an empty next form', async () => {
+  it('waits for actual server acceptance, keeps the contract, and mounts an empty next form', async () => {
     const { current, changed, closed, upload } = await mount();
     let accept!: (value: any) => void;
     jest.mocked(upload).mockReturnValueOnce(new Promise((resolve) => { accept = resolve; }));
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     expect(auctioneerService.continueWorkItem).not.toHaveBeenCalled();
     expect(changed).not.toHaveBeenCalled();
     expect(upload).toHaveBeenCalledTimes(1);
@@ -757,13 +781,139 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
     expect(AutoSaveService.removeDraftRecordOnly).toHaveBeenCalledWith('local-parent');
     expect(AutoSaveService.cleanupOrphanedMedia).not.toHaveBeenCalled();
     expect(screen.getByLabelText(type === 'asset' ? 'Contract number' : 'Contract number, required').props.value).toBe('93530.3-A');
-    expect(screen.getByRole('button', { name: 'Generate files & new lot' }).props.accessibilityState?.disabled).toBe(true);
+    expect(screen.getByRole('button', { name: 'Create Lot & Continue' }).props.accessibilityState?.disabled).toBe(true);
+  });
+
+  it('carries current edited details and settings through the parent setup update, but never old media or submission identity', async () => {
+    const { upload, changed } = await mount(undefined, {
+      clientName: 'Saved client', ownerName: 'Edited owner', appraiser: 'Edited appraiser', appraisalCompany: 'Edited company',
+      appraisalPurpose: 'Edited purpose', preparedFor: 'Edited recipient', industry: 'Edited industry',
+      effectiveDate: '2026-10-05', inspectionDate: '2026-10-04', salesDate: '2026-10-09',
+      location: 'Edited yard', latitude: 50, longitude: -100, language: 'fr', currency: 'USD',
+      includeDamageAnalysis: false, enhanceImages: true, bankPhotosEnabled: false, watermarkImages: false,
+      factorsAgeCondition: 'Edited age', factorsQuality: 'Edited quality', factorsAnalysis: 'Edited analysis',
+      includeValuationTable: true, selectedValuationMethods: ['TKV', 'OLV'],
+    }, true);
+    if (type === 'asset') {
+      await fireEvent.press(screen.getByRole('tab', { name: 'Details' }));
+      await fireEvent.changeText(screen.getByLabelText('Client name, required'), 'Latest client');
+      await fireEvent.changeText(screen.getByLabelText('Owner name'), '');
+    } else {
+      await fireEvent.press(screen.getByRole('switch', { name: 'Include all lot photos in the condition report' }));
+      await fireEvent.press(screen.getByRole('switch', { name: 'Add the company logo to photos that don’t have it' }));
+    }
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+    expect(auctioneerService.getSetup).toHaveBeenCalledTimes(1);
+    expect(AutoSaveService.getDraft).toHaveBeenCalledTimes(2); // boundary + original form, never the successor
+    if (type === 'asset') {
+      expect(screen.getByLabelText('Client name, required').props.value).toBe('Latest client');
+      expect(screen.getByLabelText('Owner name').props.value).toBe('');
+      expect(screen.getByLabelText('Appraiser name, required').props.value).toBe('Edited appraiser');
+      expect(screen.getByLabelText('Appraisal company').props.value).toBe('Edited company');
+      await fireEvent.press(screen.getByRole('tab', { name: 'Images' }));
+    } else {
+      expect(screen.getByRole('switch', { name: 'Include all lot photos in the condition report' }).props.accessibilityState.checked).toBe(true);
+      expect(screen.getByRole('switch', { name: 'Add the company logo to photos that don’t have it' }).props.accessibilityState.checked).toBe(true);
+    }
+    expect(screen.getByTestId('mock-lot-count').props.children).toBe(0);
+    expect(screen.getByTestId('mock-photo-count').props.children).toBe(0);
+    jest.mocked(AutoSaveService.saveDraft).mockImplementation(async input => ({ ...input, ownerId: 'owner', id: input.id || 'unexpected-missing-id' }) as any);
+    await fireEvent.press(screen.getByRole('button', { name: 'Add fresh test photo' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(upload).toHaveBeenCalledTimes(2));
+    const [first, second] = jest.mocked(upload).mock.calls;
+    const { client_submission_id: _oldId, auctioneer_work_item_id: _oldWork, progress_id: _oldProgress, mixed_lots: _oldLots, ...firstDetails } = first[0];
+    const { client_submission_id, auctioneer_work_item_id, progress_id, mixed_lots, ...nextDetails } = second[0];
+    expect(nextDetails).toEqual(firstDetails);
+    expect(client_submission_id).toBe('submission-next');
+    expect(auctioneer_work_item_id).toBe('work-next');
+    expect(progress_id).toBe('submission-next');
+    expect(second[1]).toHaveLength(1);
+    expect(second[1][0].files.map(file => file.uri)).toEqual(['file:///fresh-photo.jpg']);
+    expect(mixed_lots?.[0]).not.toHaveProperty('source_key');
+    const nextDraft = jest.mocked(AutoSaveService.saveDraft).mock.calls.at(-1)![0];
+    expect(nextDraft.id).not.toBe('local-parent');
+    expect(nextDraft.formData.clientSubmissionId).toBe('submission-next');
+    expect(nextDraft.formData.supersedesClientSubmissionId).toBeUndefined();
+  });
+
+  it.each(['receipt', 'cleanup'] as const)('opens the next form while old %s persistence is still pending', async stage => {
+    const { changed, upload } = await mount();
+    let finish!: () => void;
+    const delayed = new Promise<void>(resolve => { finish = resolve; });
+    if (stage === 'receipt') jest.mocked(OfflineCaptureStore.setSubmissionState).mockImplementation(async (_id, state) => state === 'accepted' ? delayed as any : undefined);
+    else jest.mocked(AutoSaveService.removeDraftRecordOnly).mockReturnValueOnce(delayed);
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText('Report accepted')).toBeNull();
+    expect(screen.getByLabelText(type === 'asset' ? 'Contract number' : 'Contract number, required').props.value).toBe('93530.3-A');
+    expect(upload).toHaveBeenCalledTimes(1);
+    if (stage === 'receipt') expect(AutoSaveService.removeDraftRecordOnly).not.toHaveBeenCalled();
+    await act(async () => { finish(); });
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps originals when the local accepted receipt fails without blocking the new form', async () => {
+    const { changed } = await mount();
+    jest.mocked(OfflineCaptureStore.setSubmissionState).mockImplementation(async (_id, state) => { if (state === 'accepted') throw new Error('Disk unavailable'); return undefined as any; });
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+    expect(AutoSaveService.removeDraftRecordOnly).not.toHaveBeenCalled();
+    expect(AutoSaveService.deleteDraft).not.toHaveBeenCalled();
+    expect(AutoSaveService.cleanupOrphanedMedia).not.toHaveBeenCalled();
+  });
+
+  it('does not clean up an old record when its local receipt finishes after account change', async () => {
+    const { changed } = await mount();
+    let complete!: () => void;
+    jest.mocked(OfflineCaptureStore.setSubmissionState).mockImplementation(async (_id, state) => {
+      if (state === 'accepted') await new Promise<void>(resolve => { complete = resolve; });
+      return undefined as any;
+    });
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+    mockOwner = 'other-owner'; setUploadOwner(mockOwner);
+    await act(async () => { complete(); });
+    expect(AutoSaveService.removeDraftRecordOnly).not.toHaveBeenCalled();
+  });
+
+  it('ignores a continuation response after account change', async () => {
+    const { current, changed } = await mount();
+    let complete!: (value: AuctioneerWorkItemSetup) => void;
+    jest.mocked(auctioneerService.continueWorkItem).mockReturnValueOnce(new Promise(resolve => { complete = resolve; }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(auctioneerService.continueWorkItem).toHaveBeenCalledTimes(1));
+    mockOwner = 'other-owner'; setUploadOwner(mockOwner);
+    await act(async () => { complete(successor(current)); });
+    expect(changed).not.toHaveBeenCalled();
+    expect(AutoSaveService.removeDraftRecordOnly).not.toHaveBeenCalled();
+  });
+
+  it('double taps neither upload twice nor open two successors, and leaves no accepted form to autosave', async () => {
+    const { current, upload, changed } = await mount();
+    let accept!: (value: unknown) => void;
+    let complete!: (value: AuctioneerWorkItemSetup) => void;
+    jest.mocked(upload).mockReturnValueOnce(new Promise(resolve => { accept = resolve as any; }));
+    jest.mocked(auctioneerService.continueWorkItem).mockReturnValueOnce(new Promise(resolve => { complete = resolve; }));
+    const submit = screen.getByRole('button', { name: 'Create Lot & Continue' });
+    await fireEvent.press(submit);
+    await fireEvent.press(submit);
+    expect(upload).toHaveBeenCalledTimes(1);
+    await act(async () => { accept({ accepted: true, reportId: 'report-parent', jobId: 'job-parent' }); });
+    await waitFor(() => expect(auctioneerService.continueWorkItem).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('button', { name: 'Create Lot & Continue' })).toBeNull();
+    expect(screen.queryByTestId('mock-photo-count')).toBeNull();
+    await act(async () => { complete(successor(current)); });
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(changed).toHaveBeenCalledTimes(1);
   });
 
   it('retries only continuation after acceptance, without uploading or clearing the original form twice', async () => {
     const { changed, upload } = await mount();
     jest.mocked(auctioneerService.continueWorkItem).mockRejectedValueOnce(new Error('Connection lost during continuation'));
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'Retry new lot' })).toBeTruthy());
     expect(changed).not.toHaveBeenCalled();
     expect(AutoSaveService.removeDraftRecordOnly).not.toHaveBeenCalled();
@@ -774,10 +924,25 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
     expect(jest.mocked(auctioneerService.continueWorkItem).mock.calls).toEqual([['work-parent', 'report-parent'], ['work-parent', 'report-parent']]);
   });
 
+  it.each([
+    [{ message: 'Request failed with status code 409', response: { status: 409, data: { message: 'This contract is no longer assigned to you in Incoming.' } } }, 'This contract is no longer assigned to you in Incoming.'],
+    [{ message: 'Request failed with status code 503' }, 'Could not confirm the next form.'],
+  ] as const)('shows actionable continuation failure without losing the accepted report %#', async (failure, expected) => {
+    const { changed, upload } = await mount();
+    jest.mocked(auctioneerService.continueWorkItem).mockRejectedValueOnce(failure);
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(screen.getByText(new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))).toBeTruthy());
+    expect(screen.queryByText(/status code/i)).toBeNull();
+    expect(screen.queryByTestId('mock-photo-count')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Retry new lot' })).toBeTruthy();
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(changed).not.toHaveBeenCalled();
+  });
+
   it('does not call continue or queue an upload when generate-and-next is offline', async () => {
     const { changed, upload } = await mount();
     jest.mocked(OfflineQueueService.getConnectivityStatus).mockResolvedValue({ status: 'offline' } as any);
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(Alert.alert).toHaveBeenCalledWith('Connection required', expect.any(String)));
     expect(upload).not.toHaveBeenCalled();
     expect(OfflineQueueService.enqueueAssetReport).not.toHaveBeenCalled();
@@ -790,11 +955,11 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
   it('keeps the same report submission identity and photos after a pre-acceptance failure', async () => {
     const { upload, changed } = await mount();
     jest.mocked(upload).mockRejectedValueOnce(new Error('Upload interrupted'));
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(Alert.alert).toHaveBeenCalledWith('Upload failed', expect.any(String)));
     expect(auctioneerService.continueWorkItem).not.toHaveBeenCalled();
     expect(screen.getByTestId('mock-photo-count').props.children).toBe(1);
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
     expect(jest.mocked(upload).mock.calls.map(([details]) => details.client_submission_id)).toEqual(['submission-parent', 'submission-parent']);
   });
@@ -803,7 +968,7 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
     const { upload } = await mount();
     let resolveConnectivity!: (value: any) => void;
     jest.mocked(OfflineQueueService.getConnectivityStatus).mockReturnValueOnce(new Promise((resolve) => { resolveConnectivity = resolve; }));
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(OfflineQueueService.getConnectivityStatus).toHaveBeenCalledTimes(1));
     mockOwner = nextOwner;
     setUploadOwner(nextOwner);
@@ -817,7 +982,7 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
     const { upload } = await mount();
     let resolveConnectivity!: (value: any) => void;
     jest.mocked(OfflineQueueService.getConnectivityStatus).mockReturnValueOnce(new Promise((resolve) => { resolveConnectivity = resolve; }));
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(OfflineQueueService.getConnectivityStatus).toHaveBeenCalledTimes(1));
     pauseActiveUploads();
     await act(async () => { resolveConnectivity({ status: 'online' }); });
@@ -829,7 +994,7 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming generate-and-next',
     const { upload } = await mount();
     let saveReady!: () => void;
     jest.mocked(OfflineCaptureStore.setSubmissionState).mockImplementationOnce(() => new Promise((resolve) => { saveReady = () => resolve(undefined as any); }));
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(OfflineCaptureStore.setSubmissionState).toHaveBeenCalledWith('local-parent', 'ready'));
     expect(upload).not.toHaveBeenCalled();
     await act(async () => { saveReady(); });
@@ -950,9 +1115,9 @@ it('keeps modern draft identity after the parent clears its consumed draft point
   }
   await render(<DraftNavigation />);
   await waitFor(() => expect(screen.getByTestId('mock-photo-count').props.children).toBe(1));
-  expect(screen.getByRole('button', { name: 'Generate files & new lot' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Create Lot & Continue' })).toBeTruthy();
   expect(auctioneerService.getSetup).toHaveBeenCalledTimes(1);
-  await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+  await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
   await waitFor(() => expect(auctioneerService.continueWorkItem).toHaveBeenCalledWith('work-parent', 'report-parent'));
   expect(jest.mocked(lotListingService.createLotListing).mock.calls[0][0].auctioneer_work_item_id).toBe('work-parent');
 });

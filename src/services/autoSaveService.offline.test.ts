@@ -12,7 +12,7 @@ jest.mock('./localMediaStore', () => ({ LocalMediaStore: {
 } }));
 jest.mock('./offlineCaptureStore', () => ({ __esModule: true, default: {
   setOwner: jest.fn(), getOwnerId: jest.fn(), initialize: jest.fn(), getDraft: jest.fn(),
-  saveDraft: jest.fn(), updateDraft: jest.fn(), listDrafts: jest.fn(),
+  saveDraft: jest.fn(), createCloudDraft: jest.fn(), updateDraft: jest.fn(), listDrafts: jest.fn(),
 } }));
 
 let saved: Map<string, OfflineReportDraft>;
@@ -117,4 +117,35 @@ it('fences the original owner before asynchronous storage initialization', async
   await expect(saving).rejects.toThrow('account changed');
   expect(LocalMediaStore.importMedia).not.toHaveBeenCalled();
   expect(OfflineCaptureStore.saveDraft).not.toHaveBeenCalled();
+});
+
+it('late cloud success and failure cannot mark a newer revision clean or failed', async () => {
+  const initial = await AutoSaveService.saveDraft(form());
+  const latest = { ...initial, localRevision: 9, title: 'Latest title', cloudSyncError: undefined };
+  saved.set(initial.id, latest);
+  await AutoSaveService.markDraftCloudSynced(initial.id, 'cloud-id', initial.updatedAt, 'owner', 8);
+  await AutoSaveService.markDraftCloudSyncError(initial.id, 'Old upload failed', {
+    expectedOwnerId: 'owner', expectedUpdatedAt: initial.updatedAt, expectedLocalRevision: 8,
+  });
+  expect(saved.get(initial.id)).toEqual(latest);
+  jest.mocked(OfflineCaptureStore.getOwnerId).mockReturnValue('other');
+  jest.mocked(OfflineCaptureStore.updateDraft).mockClear();
+  await AutoSaveService.markDraftCloudSynced(initial.id, 'cloud-id', undefined, 'owner');
+  await AutoSaveService.markDraftCloudSyncError(initial.id, 'Old account failed', { expectedOwnerId: 'owner' });
+  expect(OfflineCaptureStore.updateDraft).not.toHaveBeenCalled();
+});
+
+it('uses owner-bound create-only storage for cloud restoration and never overwrites through saveDraft', async () => {
+  const args = {
+    ownerId: 'owner', id: 'cloud-only', cloudId: 'server-id', type: 'asset' as const,
+    contractNo: '00000', formData: { contractNo: '00000' }, lots: [], activeLotIdx: 0,
+  };
+  jest.mocked(OfflineCaptureStore.createCloudDraft).mockImplementation(async draft => draft);
+  const result = await AutoSaveService.saveCloudDraftSnapshot(args);
+  expect(result.id).toBe('cloud-only');
+  expect(OfflineCaptureStore.createCloudDraft).toHaveBeenCalledWith(expect.objectContaining({ ownerId: 'owner' }), 'owner');
+  expect(OfflineCaptureStore.saveDraft).not.toHaveBeenCalled();
+  jest.mocked(OfflineCaptureStore.getOwnerId).mockReturnValue('other');
+  await expect(AutoSaveService.saveCloudDraftSnapshot(args)).rejects.toThrow('account changed');
+  expect(OfflineCaptureStore.createCloudDraft).toHaveBeenCalledTimes(1);
 });

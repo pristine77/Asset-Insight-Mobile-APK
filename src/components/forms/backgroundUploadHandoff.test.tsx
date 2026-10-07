@@ -329,11 +329,11 @@ describe.each(['asset', 'lotListing'] as const)('%s Incoming work on the Dashboa
     return { closed, changed };
   }
 
-  it('Generate files & new lot still waits in the form for the server to accept the report', async () => {
+  it('Create Lot & Continue still waits in the form for the server to accept the report', async () => {
     const { closed, changed } = await mountIncoming();
     let accept!: (value: any) => void;
     jest.mocked(upload).mockReturnValueOnce(new Promise((resolve) => { accept = resolve; }));
-    await fireEvent.press(screen.getByRole('button', { name: 'Generate files & new lot' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
     expect(backgroundUploadManager.getSnapshot().active).toBeNull();
     expect(auctioneerService.continueWorkItem).not.toHaveBeenCalled();
@@ -346,11 +346,11 @@ describe.each(['asset', 'lotListing'] as const)('%s Incoming work on the Dashboa
     expect(backgroundUploadManager.getSnapshot()).toMatchObject({ active: null, queued: [], held: [], notices: [] });
   });
 
-  it('an ordinary Submit of Incoming work also stays in the form', async () => {
+  it('Create Lot & Close of Incoming work also stays in the form until acceptance', async () => {
     const { closed } = await mountIncoming();
     let accept!: (value: any) => void;
     jest.mocked(upload).mockReturnValueOnce(new Promise((resolve) => { accept = resolve; }));
-    await fireEvent.press(screen.getByRole('button', { name: type === 'asset' ? 'Submit asset report' : 'Submit lot listing' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Close' }));
     await waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
     expect(backgroundUploadManager.getSnapshot().active).toBeNull();
     expect(closed).not.toHaveBeenCalled();

@@ -94,7 +94,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             val restored = runCatching { CaptureMode.valueOf(savedMode) }.getOrNull()
             if (restored != null) _captureMode.value = restored
         }
-        refreshLotState()
+        // A rejected pending journal leaves an intentionally unloaded fixed session.
+        // Its next Activity must reach configure/restore and report that error, not
+        // fail while constructing the ViewModel before recovery can run.
+        if (!repository.isStructureLocked || repository.completedLotCount > 0) refreshLotState()
     }
 
     fun refresh() { refreshLotState() }
@@ -271,6 +274,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     // ─────────────────────────────────────────────────────────────────────────
 
     fun setCaptureMode(mode: CaptureMode) {
+        if (repository.isStructureLocked && repository.fixedMode(_currentLotNumber.value ?: 1)?.toCaptureMode() != mode) return
         _captureMode.value = mode
         saveCaptureMode(mode)
         val lotMode = mode.toLotMode()
@@ -278,6 +282,16 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun requestCapture(requestedMode: CaptureMode, isExtra: Boolean = false): Boolean {
+        if (repository.isStructureLocked) {
+            val lotNum = _currentLotNumber.value ?: 1
+            val mode = repository.fixedMode(lotNum) ?: return false
+            if (repository.hasReachedFixedPhotoLimit(lotNum)) return false
+            if (!isExtra && requestedMode != mode.toCaptureMode()) return false
+            if (repository.getActiveBuilder() == null) repository.prepareLotForEditing(lotNum, mode)
+            pendingIsExtra = isExtra
+            pendingCaptureMode = mode.toCaptureMode()
+            return true
+        }
         pendingIsExtra = isExtra
         pendingCaptureMode = requestedMode
         val current = _captureMode.value
@@ -321,6 +335,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun goToNextLot() {
         val currentNum = _currentLotNumber.value ?: 1
+        if (!repository.canNavigateTo(currentNum + 1)) return
         // Finalize current
         repository.finaliseCurrentLot(currentNum)
         registerCompletedLot()
@@ -339,6 +354,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun confirmNextLot() {
+        if (!repository.canNavigateTo((_currentLotNumber.value ?: 1) + 1)) return
         if (lotHasMedia()) {
             repository.finaliseCurrentLot(_currentLotNumber.value ?: 1)
             registerCompletedLot()
@@ -350,6 +366,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
     private fun executeNextLot() {
         val nextNum = (_currentLotNumber.value ?: 1) + 1
+        if (!repository.canNavigateTo(nextNum)) return
         _currentLotNumber.value = nextNum
         activeLotNumber = nextNum
         viewingCompletedLotIndex = null
@@ -389,7 +406,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         val uris    = urisForLotNumber(lotNum)
         val allLots = repository.getAllLots()
         _currentLotNumber.value     = lotNum
-        _activeLotLabel.value       = "Lot $lotNum"
+        _activeLotLabel.value       = repository.lotLabel(lotNum)
         _currentLotPhotoCount.value = uris.size
         _currentLotUris.value       = uris
 
@@ -452,6 +469,17 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
         pendingIsExtra = false
         pendingCaptureMode = null
+
+        if (repository.isStructureLocked) {
+            val lotNum = _currentLotNumber.value ?: 1
+            val lotMode = checkNotNull(repository.fixedMode(lotNum))
+            if (repository.getActiveBuilder() == null) repository.prepareLotForEditing(lotNum, lotMode)
+            if (isExtra) repository.addExtraPhoto(uri, lotMode)
+            else repository.addPrimaryPhoto(uri, lotMode, focusBox)
+            refreshCompletedLots()
+            refreshLotState()
+            return
+        }
 
         // If we're capturing into a PAST lot, viewingNum won't be null
         if (viewingNum != null) {
@@ -543,7 +571,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
             CaptureMode.PHOTO  -> LotMode.PER_PHOTO
         }
 
-        if (repository.getActiveBuilder() == null) {
+        if (repository.isStructureLocked && repository.getActiveBuilder() == null) {
+            repository.prepareLotForEditing(_currentLotNumber.value ?: 1, lotMode)
+        } else if (repository.getActiveBuilder() == null) {
             repository.startNewLot(lotMode)
         }
         repository.setVideo(uri)
@@ -551,9 +581,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
         refreshLotState()
     }
 
-    fun deleteMedia(uri: Uri) {
-        val removedActive = repository.removeFileFromActiveLot(uri)
-        val removedCompleted = repository.removeFileFromCompletedLots(uri)
+    fun deleteMedia(uri: Uri, displayedLotNumber: Int? = null) {
+        val targetLot = if (repository.isStructureLocked) displayedLotNumber ?: (_currentLotNumber.value ?: 1) else null
+        val removedActive = repository.removeFileFromActiveLot(uri, targetLot)
+        val removedCompleted = repository.removeFileFromCompletedLots(uri, targetLot)
         if (removedActive || removedCompleted) {
             rebuildIndexMap()
             refreshCompletedLots()
@@ -582,6 +613,24 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun refreshLotState() {
         val lotNum  = _currentLotNumber.value ?: 1
+        if (repository.isStructureLocked) {
+            val rows = repository.getEffectiveLots()
+            // A gallery ViewModel may be created while a different fixed lot is active.
+            val row = rows.getOrNull(lotNum - 1) ?: return
+            _mainCount.value = row.files.size
+            _extraCount.value = row.extraFiles.size
+            _activeLotPhotoCount.value = row.files.size
+            _activeLotLabel.value = repository.lotLabel(lotNum)
+            _currentLotIndex.value = lotNum - 1
+            val uris = row.files.map { Uri.parse(it.uri) } + row.extraFiles.map { Uri.parse(it.uri) } + listOfNotNull(row.videoFile?.uri?.let(Uri::parse))
+            _currentLotPhotoCount.value = uris.size
+            _currentLotUris.value = uris
+            _lots.value = rows.map { LotLegacy(repository.lotLabel(it.lotNumber), it.files.size) }
+            _captureMode.value = row.mode?.toCaptureMode()
+            _viewedLotMode.value = row.mode?.toCaptureMode()
+            refreshTotalCount()
+            return
+        }
         val allLots = repository.getAllLots()
         val builder = repository.getActiveBuilder()
 
@@ -643,6 +692,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun refreshTotalCount() {
+        if (repository.isStructureLocked) {
+            _totalCount.postValue(repository.getEffectiveLots().sumOf { it.files.size + it.extraFiles.size })
+            return
+        }
         var total = 0
         repository.getAllLots().forEach { lot ->
             total += lot.files.size
@@ -656,6 +709,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun getDisplayedLotUris(): List<Uri> {
         val lotNum = viewingCompletedLotIndex ?: (_currentLotNumber.value ?: 1)
+        if (repository.isStructureLocked) {
+            val row = repository.getEffectiveLots().getOrNull(lotNum - 1) ?: return emptyList()
+            return row.files.map { Uri.parse(it.uri) } + row.extraFiles.map { Uri.parse(it.uri) } + listOfNotNull(row.videoFile?.uri?.let(Uri::parse))
+        }
         return urisForLotNumber(lotNum)
     }
 
@@ -680,6 +737,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
 
     fun getLotExistingMode(): CaptureMode? {
         val lotNum  = _currentLotNumber.value ?: 1
+        repository.fixedMode(lotNum)?.let { return it.toCaptureMode() }
         val lot = getLotsForNumber(lotNum).firstOrNull { it.files.isNotEmpty() }
         if (lot != null) {
             return when (lot.mode) {
@@ -717,6 +775,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun handleNewLotFromLock(requestedMode: CaptureMode) {
+        if (repository.isStructureLocked) return
         if (lotHasMedia()) {
             repository.finaliseCurrentLot(_currentLotNumber.value ?: 1)
             registerCompletedLot()
@@ -746,6 +805,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun handleNewLotFromMismatch(requestedMode: CaptureMode) {
+        if (repository.isStructureLocked) return
         if (lotHasMedia()) {
             repository.finaliseCurrentLot(_currentLotNumber.value ?: 1)
             registerCompletedLot()
@@ -775,7 +835,10 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun ensureBundleLotOpen() {
-        if (repository.getActiveBuilder() == null) repository.startNewLot(LotMode.SINGLE_LOT)
+        if (repository.getActiveBuilder() == null) {
+            if (repository.isStructureLocked) repository.prepareLotForEditing(_currentLotNumber.value ?: 1)
+            else repository.startNewLot(LotMode.SINGLE_LOT)
+        }
     }
 
     private fun CaptureMode.toLotMode() = when (this) {

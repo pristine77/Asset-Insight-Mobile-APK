@@ -17,6 +17,7 @@ import { useAuth } from "../context/AuthContext";
 import { useAppTheme, type AppThemeColors } from "../context/ThemeContext";
 import api from "../services/api";
 import AccountPrivacyLinks from "../components/AccountPrivacyLinks";
+import CaptureBackupPanel from '../components/CaptureBackupPanel';
 
 interface ProfileScreenProps {
   onOpenDrawer: () => void;
@@ -394,6 +395,7 @@ const ProfileScreen = ({ onOpenDrawer, onBack }: ProfileScreenProps) => {
               </TouchableOpacity>
             </View>
           )}
+          <CaptureBackupPanel />
           <AccountPrivacyLinks />
         </ScrollView>
       </KeyboardAvoidingView>

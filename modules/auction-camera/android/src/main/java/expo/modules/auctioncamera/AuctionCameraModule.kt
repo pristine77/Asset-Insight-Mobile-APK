@@ -26,6 +26,7 @@ class AuctionCameraModule : Module() {
 
     override fun definition() = ModuleDefinition {
         Name("AuctionCameraModule")
+        AsyncFunction("getCameraCapabilities") { mapOf("lockedStructure" to true) }
         Events("uploadProgress")
         AsyncFunction("getContentUriInfo") { value: String ->
             val context = appContext.reactContext ?: error("Application context unavailable")

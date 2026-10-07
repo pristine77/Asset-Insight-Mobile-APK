@@ -30,7 +30,7 @@ it.each(['ready', 'uploading', 'paused'])('shows explicit resume guidance for an
   }] as any);
   const open = jest.fn();
   await render(<OfflineCaptureList onOpen={open} />);
-  await waitFor(() => expect(screen.getByText('Upload needs your confirmation — open the draft, then tap Resume upload. Nothing uploads automatically.')).toBeTruthy());
+  await waitFor(() => expect(screen.getByText('Report submission needs your confirmation — open the draft, then tap Resume upload. Cloud backup does not submit it.')).toBeTruthy());
   expect(screen.getByText('1 lots · 2 photos · 1 report-only')).toBeTruthy();
   expect(open).not.toHaveBeenCalled();
   await fireEvent.press(screen.getByRole('button', { name: 'Open and submit' }));
@@ -44,7 +44,7 @@ it('does not label an ordinary unsubmitted saved draft as an interrupted upload'
   }] as any);
   await render(<OfflineCaptureList onOpen={jest.fn()} />);
   await waitFor(() => expect(screen.getByText('Offline captures · 1')).toBeTruthy());
-  expect(screen.queryByText(/Upload needs your confirmation/)).toBeNull();
+  expect(screen.queryByText(/Report submission needs your confirmation/)).toBeNull();
 });
 
 /*
@@ -100,7 +100,7 @@ describe('captures in the background upload line', () => {
     expect(screen.getByText('Background upload: Uploading 45 of 160')).toBeTruthy();
     expect(screen.getByText('Background upload: Waiting in line')).toBeTruthy();
     // A capture outside the line keeps the stored-state guidance.
-    expect(screen.getAllByText(/Upload needs your confirmation/)).toHaveLength(1);
+    expect(screen.getAllByText(/Report submission needs your confirmation/)).toHaveLength(1);
     const discard = screen.getAllByRole('button', { name: 'Discard' });
     expect(discard.map((button) => Boolean(button.props.accessibilityState?.disabled))).toEqual([true, true, false]);
     await fireEvent.press(discard[0]);

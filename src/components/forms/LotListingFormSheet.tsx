@@ -89,17 +89,18 @@ const LotListingFormSheet = ({
   backgroundUploads = false,
 }: LotListingFormSheetProps) => {
   const auctioneer = auctioneerControl?.setup;
+  const continuation = auctioneerControl?.continuationDetails;
   const [recoveredAuctionTask, setRecoveredAuctionTask] = useState<AuctionManagementTaskPayload>();
   const auctionManagementTask = suppliedAuctionManagementTask || recoveredAuctionTask;
 
   // Form fields
   const [contractNo, setContractNo] = useState(auctioneer?.contract.contractNo || '');
-  const [salesDate, setSalesDate] = useState(auctioneer?.contract.eventDate?.slice(0, 10) || isoDate(new Date()));
-  const [location, setLocation] = useState(() => normalizeHiddenLocation(auctioneer?.contract.location).location);
-  const [latitude, setLatitude] = useState<number | undefined>(undefined);
-  const [longitude, setLongitude] = useState<number | undefined>(undefined);
-  const [bankPhotosEnabled, setBankPhotosEnabled] = useState(false);
-  const [watermarkImages, setWatermarkImages] = useState(DEFAULT_IMAGE_WATERMARK);
+  const [salesDate, setSalesDate] = useState(continuation?.salesDate ?? (auctioneer?.contract.eventDate?.slice(0, 10) || isoDate(new Date())));
+  const [location, setLocation] = useState(() => normalizeHiddenLocation(continuation?.location ?? auctioneer?.contract.location).location);
+  const [latitude, setLatitude] = useState<number | undefined>(continuation?.latitude);
+  const [longitude, setLongitude] = useState<number | undefined>(continuation?.longitude);
+  const [bankPhotosEnabled, setBankPhotosEnabled] = useState(continuation?.bankPhotosEnabled ?? false);
+  const [watermarkImages, setWatermarkImages] = useState(continuation?.watermarkImages ?? DEFAULT_IMAGE_WATERMARK);
   const [auctionCloseContract, setAuctionCloseContract] = useState(false);
   const [auctionServiceSelections, setAuctionServiceSelections] = useState<Record<number, string[]>>({});
 
@@ -858,7 +859,7 @@ const LotListingFormSheet = ({
     destination: AuctionManagementDestination = 'LottingBoard',
     options: { forceNew?: boolean; nextLot?: boolean; replaceSubmissionId?: string; replacementSourceId?: string; newSubmissionFromId?: string } = {}
   ) => {
-    if (submissionLockRef.current || saveLock.current || awaitingDraft || submitting || auctioneerControl?.accepted) return;
+    if (submissionLockRef.current || saveLock.current || awaitingDraft || submitting || uploadAcceptedRef.current || auctioneerControl?.accepted) return;
     if (options.nextLot && captureMode === 'offline') return;
     if (saveOnly) { await handleSaveOfflineAndClose(); return; }
     if (auctioneer && (options.forceNew || !hasValidAuctioneerLotStructure(auctioneer, lots))) return;
@@ -1081,14 +1082,14 @@ const LotListingFormSheet = ({
         Alert.alert('Earlier upload accepted', 'The server returned the earlier report, not confirmation of your current edits. This draft and its originals are kept. Open Reports or Previews to review the earlier report before making further changes.');
         return;
       }
-      await OfflineCaptureStore.setSubmissionState(localDraft.id, 'accepted', (acceptedResponse as any).reportId);
-
       if (options.nextLot && auctioneerControl) {
         if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
-        await auctioneerControl.acceptAndContinue(acceptedResponse, modernDraft?.id);
-        setSubmitting(false);
+        const acceptanceSaved = OfflineCaptureStore.setSubmissionState(localDraft.id, 'accepted', (acceptedResponse as any).reportId);
+        void acceptanceSaved.catch(() => undefined); // Keep the original inventory if its local receipt cannot be saved.
+        await auctioneerControl.acceptAndContinue(acceptedResponse, modernDraft?.id, buildAutoSaveFormData(), acceptanceSaved);
         return;
       }
+      await OfflineCaptureStore.setSubmissionState(localDraft.id, 'accepted', (acceptedResponse as any).reportId);
 
       // Upload complete - close immediately, don't wait for server processing
       setSubmitting(false);
@@ -1158,6 +1159,7 @@ const LotListingFormSheet = ({
   };
 
   const resetForm = async () => {
+    uploadAcceptedRef.current = false;
     setRecoveredAuctionTask(undefined);
     draftIdentityRef.current = randomUUID();
     setReviewingSavedDraft(false); setDraftLoadError(undefined); reviewEventRef.current = randomUUID();
@@ -1205,7 +1207,7 @@ const LotListingFormSheet = ({
       await saveOnDevice(() => {
         void resetForm();
         onClose();
-        Alert.alert('Saved on this device', 'Open Drafts → Offline captures → Open and submit to review your saved work. Nothing has been uploaded.');
+        Alert.alert('Saved on this device', 'Open Drafts → Offline captures → Open and submit to review your saved work. On supported Android builds, check Photo cloud backup for backup progress. Your report has not been submitted.');
       });
     } catch (error) {
       setLocalSaveError(error instanceof Error ? error.message : 'Save failed. Please try again.');
@@ -1243,17 +1245,17 @@ const LotListingFormSheet = ({
           disabled={!canSubmit || submitting || savingDraftPreview}
           onPress={() => void handleSubmit('LottingBoard', { nextLot: true })} /> : null}
         {/* Header */}
-        <View style={styles.header}>
+        <View style={[styles.header, auctioneer && styles.importedHeader]}>
           <TouchableOpacity onPress={handleClose} style={styles.closeBtn} accessibilityRole="button" accessibilityLabel="Close lot listing">
             <Feather name="x" size={24} color="#374151" />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>{isAuctionManagementMode ? 'Auction Management' : 'Lot Listing'}</Text>
-          <View style={styles.headerActions}>
+          <View style={[styles.headerActions, auctioneer && styles.importedHeaderActions]}>
             {isAuctionManagementMode ? (
               <View style={styles.headerSpacer} />
             ) : (
               <>
-                <TouchableOpacity
+                {!auctioneer ? <TouchableOpacity
                   accessibilityRole="button"
                   accessibilityLabel="Save lot listing draft"
                   style={[
@@ -1268,17 +1270,17 @@ const LotListingFormSheet = ({
                     <Feather name="cloud" size={15} color="#6D28D9" />
                   )}
                   <Text style={styles.headerDraftBtnText}>Draft</Text>
-                </TouchableOpacity>
+                </TouchableOpacity> : null}
                 <TouchableOpacity
                   accessibilityRole="button"
-                  accessibilityLabel={saveOnly ? 'Save offline lot listing' : uploadPaused ? 'Resume upload' : 'Submit lot listing'}
-                  style={[styles.submitBtn, ((!saveOnly && !canSubmit) || savingDraftPreview) && styles.submitBtnDisabled]}
+                  accessibilityLabel={saveOnly ? 'Save offline lot listing' : uploadPaused ? 'Resume upload' : auctioneer ? 'Create Lot & Close' : 'Submit lot listing'}
+                  style={[styles.submitBtn, auctioneer && styles.importedSubmitBtn, ((!saveOnly && !canSubmit) || savingDraftPreview) && styles.submitBtnDisabled]}
                   onPress={() => void handleSubmit()}
                   disabled={(!saveOnly && !canSubmit) || submitting || savingDraftPreview}>
                   {submitting ? (
                     <ActivityIndicator size="small" color="#fff" />
                   ) : (
-                    <Text style={styles.submitBtnText}>{saveOnly ? 'Save' : uploadPaused ? 'Resume upload' : 'Submit'}</Text>
+                    <Text style={styles.submitBtnText}>{saveOnly ? 'Save' : uploadPaused ? 'Resume upload' : auctioneer ? 'Create Lot & Close' : 'Submit'}</Text>
                   )}
                 </TouchableOpacity>
               </>
@@ -1681,6 +1683,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
   },
+  importedHeader: { flexWrap: 'wrap' },
+  importedHeaderActions: { flexBasis: '100%', paddingTop: 8 },
+  importedSubmitBtn: { flex: 1 },
   headerSpacer: {
     width: 80,
   },
@@ -1718,6 +1723,7 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontWeight: '700',
     fontSize: 14,
+    textAlign: 'center',
   },
   progressOverlay: {
     ...StyleSheet.absoluteFillObject,

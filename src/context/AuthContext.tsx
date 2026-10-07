@@ -2,11 +2,12 @@ import React, { createContext, useContext, useState, useEffect, ReactNode, useCa
 import authService, { User, LoginCredentials, type AuthResponse } from "../services/authService";
 import offlineQueueService from "../services/offlineQueueService";
 import { unregisterStoredPushTokenFromServer } from "../services/notificationService";
-import deviceAccessService from "../services/deviceAccessService";
+import deviceAccessService, { type ApprovedDeviceAccess } from "../services/deviceAccessService";
 import NetInfo from '@react-native-community/netinfo';
 import OfflineCaptureStore from '../services/offlineCaptureStore';
 import AutoSaveService from '../services/autoSaveService';
 import OfflineCaptureSync from '../services/offlineCaptureSync';
+import CaptureBackupService from '../services/captureBackupService';
 import { pauseActiveUploads } from '../services/uploadCancellation';
 import { captureAuthOperation, invalidateAuthOperations, staleAuthOperation } from '../services/authSessionOperation';
 import {
@@ -44,6 +45,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     assertCurrent();
     const owner = next ? String(next._id || (next as any).id || '') : null;
     if (OfflineCaptureStore.getOwnerId() !== owner) {
+      if (OfflineCaptureStore.getOwnerId() || !owner) await CaptureBackupService.deactivate();
+      assertCurrent();
       pauseActiveUploads();
       OfflineCaptureSync.cleanup();
       offlineQueueService.cleanup();
@@ -73,6 +76,8 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       const restricted = await getPersistedDeviceAccess();
       if (generation !== authEpoch.current) return;
       if (restricted) {
+        await CaptureBackupService.deactivate();
+        if (generation !== authEpoch.current) return;
         setDeviceAccess(restricted);
         setUser(null);
         AutoSaveService.setOwner(null);
@@ -84,7 +89,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       if (isAuth) {
         await refreshUser();
         if (generation === authEpoch.current && OfflineCaptureStore.getOwnerId()) offlineQueueService.init();
-      }
+      } else await CaptureBackupService.deactivate();
     } catch (err) {
       console.error("Auth check failed:", err);
     } finally {
@@ -101,6 +106,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     return subscribeDeviceAccess((state) => {
       setDeviceAccess(state);
       if (state) {
+        void CaptureBackupService.deactivate();
         authEpoch.current++;
         invalidateAuthOperations();
         setLoading(false);
@@ -116,6 +122,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   useEffect(() => {
     return subscribeSessionInvalidated(() => {
+      void CaptureBackupService.deactivate();
       authEpoch.current++;
       invalidateAuthOperations();
       setLoading(false);
@@ -162,9 +169,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     }
   };
 
-  const exchangeApproval = useCallback(async (assertCurrent = captureAuthOperation()) => {
+  const exchangeApproval = useCallback(async (assertCurrent = captureAuthOperation(), approved?: ApprovedDeviceAccess) => {
     assertCurrent();
-    const response = await deviceAccessService.exchange(assertCurrent);
+    const response = await deviceAccessService.exchange(assertCurrent, approved);
     assertCurrent();
     await bindUser(response.user, assertCurrent);
     setDeviceAccess(null);
@@ -176,9 +183,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     const generation = authEpoch.current;
     const assertCurrent = captureAuthOperation();
     const response = await deviceAccessService.register(assertCurrent);
-    if ((response as unknown as { authState?: string }).authState === "approved") {
+    if (response.authState === "approved") {
       assertCurrent();
-      await exchangeApproval(assertCurrent);
+      await exchangeApproval(assertCurrent, response);
       return;
     }
     if (generation === authEpoch.current) setDeviceAccess(response);

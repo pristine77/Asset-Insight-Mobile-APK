@@ -171,7 +171,7 @@ class LotGalleryActivity : BaseActivity(), TextureView.SurfaceTextureListener {
         binding.btnDelete.setOnClickListener {
             if (photos.isNotEmpty()) {
                 val uriToDelete = photos[currentIdx]
-                viewModel.deleteMedia(uriToDelete)
+                viewModel.deleteMedia(uriToDelete, lotNumber)
                 photos.removeAt(currentIdx)
                 if (photos.isEmpty()) finish() else {
                     currentIdx = currentIdx.coerceAtMost(photos.size - 1)
@@ -297,11 +297,11 @@ class LotGalleryActivity : BaseActivity(), TextureView.SurfaceTextureListener {
     private fun showMedia(index: Int, isRotationRestore: Boolean) {
         if (!isRotationRestore) { pendingVideoPosition = 0; pendingVideoResume = true }
         if (photos.isEmpty()) {
-            binding.tvHeader.text = "Lot $lotNumber \u2013 No media"; binding.ivMainPhoto.setImageDrawable(null)
+            binding.tvHeader.text = "${viewModel.repository.lotLabel(lotNumber)} \u2013 No media"; binding.ivMainPhoto.setImageDrawable(null)
             binding.videoView.visibility = View.GONE; binding.videoControlBar.visibility = View.GONE; return
         }
         currentIdx = index.coerceIn(0, photos.lastIndex)
-        binding.tvHeader.text = "Lot $lotNumber \u2013 ${currentIdx + 1}/${photos.size}"
+        binding.tvHeader.text = "${viewModel.repository.lotLabel(lotNumber)} \u2013 ${currentIdx + 1}/${photos.size}"
         val uri = photos[currentIdx]; val isVideo = isVideoUri(uri)
         if (isVideo) showVideo(uri) else showPhoto(uri)
         thumbAdapter.setSelected(currentIdx); scrollThumbsToCentre(currentIdx)

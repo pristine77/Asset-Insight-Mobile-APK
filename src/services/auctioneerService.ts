@@ -86,7 +86,9 @@ export function isEditableAuctioneerSetup(setup: AuctioneerWorkItemSetup, type: 
 export function validateAuctioneerSuccessor(previous: AuctioneerWorkItemSetup, next: AuctioneerWorkItemSetup): void {
   if (!isEditableAuctioneerSetup(next, previous.reportType) || next.workItemId === previous.workItemId ||
       next.clientSubmissionId === previous.clientSubmissionId || next.contract.id !== previous.contract.id ||
-      next.contract.contractNo !== previous.contract.contractNo || next.kind !== 'unknown' || next.lots.length !== 0) {
+      next.contract.contractNo !== previous.contract.contractNo ||
+      (Boolean(previous.contract.eventId) && next.contract.eventId !== previous.contract.eventId) ||
+      next.kind !== 'unknown' || next.lots.length !== 0) {
     throw new Error('The next work item is not a fresh lot. The accepted report is safe; reload Incoming to check its status.');
   }
 }

@@ -3,6 +3,12 @@ import { requireNativeModule } from 'expo-modules-core';
 // This resolves to the AuctionCameraModule registered via Name("AuctionCameraModule") in Kotlin
 const AuctionCamera = requireNativeModule('AuctionCameraModule');
 
+// Older installed binaries must not silently ignore the imported-lot lock.
+export async function getCameraCapabilities(): Promise<{ lockedStructure: boolean }> {
+  if (typeof AuctionCamera.getCameraCapabilities !== 'function') return { lockedStructure: false };
+  return AuctionCamera.getCameraCapabilities();
+}
+
 /**
  * Opens the native Auction Camera activity.
  * @param initialPayload Optional JSON string of existing lots to seed the camera session.

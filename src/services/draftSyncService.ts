@@ -31,39 +31,48 @@ async function syncDraft(
 ): Promise<DraftCloudSyncResult> {
   if (!canAttemptDraftCloudSync(draft, options)) return { status: 'skipped' };
   if (!draft.ownerId || draft.ownerId !== OfflineCaptureStore.getOwnerId()) return { status: 'skipped' };
+  const ownerId = draft.ownerId;
+  const updatedAt = draft.updatedAt;
+  const localRevision = draft.localRevision;
+  const key = `${ownerId}:${draft.id}`;
 
-  const active = inFlightDrafts.get(draft.id);
+  const active = inFlightDrafts.get(key);
   if (active) return active;
 
   const operation = (async (): Promise<DraftCloudSyncResult> => {
     try {
       const cloud = await reportDraftService.upsertFromLocalDraft(draft);
-      if (draft.ownerId !== OfflineCaptureStore.getOwnerId()) return { status: 'skipped' };
+      if (ownerId !== OfflineCaptureStore.getOwnerId()) return { status: 'skipped' };
       await AutoSaveService.markDraftCloudSynced(
         draft.id,
         cloud.id || cloud._id || '',
-        draft.updatedAt
+        updatedAt,
+        ownerId,
+        localRevision
       );
       return { status: 'synced', cloud };
     } catch (error: any) {
-      if (draft.ownerId !== OfflineCaptureStore.getOwnerId()) return { status: 'skipped' };
+      if (ownerId !== OfflineCaptureStore.getOwnerId()) return { status: 'skipped' };
       const failure = classifyDraftCloudSyncError(error, draft.cloudSyncAttempts || 0);
       await AutoSaveService.markDraftCloudSyncError(draft.id, failure.message, {
         kind: failure.kind,
         retryAt: failure.retryAt,
         attempts: failure.attempts,
         lastAttemptAt: failure.lastAttemptAt,
+        expectedUpdatedAt: updatedAt,
+        expectedOwnerId: ownerId,
+        expectedLocalRevision: localRevision,
       });
       return { status: 'failed', failure };
     }
   })();
 
-  inFlightDrafts.set(draft.id, operation);
+  inFlightDrafts.set(key, operation);
   try {
     return await operation;
   } finally {
-    if (inFlightDrafts.get(draft.id) === operation) {
-      inFlightDrafts.delete(draft.id);
+    if (inFlightDrafts.get(key) === operation) {
+      inFlightDrafts.delete(key);
     }
   }
 }
