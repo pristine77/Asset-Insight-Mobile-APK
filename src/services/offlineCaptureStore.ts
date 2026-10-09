@@ -8,6 +8,7 @@ import type { CaptureContext, NativeCaptureJournal, OfflineDraftCounts, OfflineS
 import type { MixedLot } from '../components/camera/types';
 import { activityBatch, activityCounts, observeActivity, type ActivityState, type DeviceActivity } from './reportActivityObservation';
 import { backupContent, backupOriginalUri, isBackupCandidate } from './captureBackupSnapshot';
+import type { DurableContinuationIntent } from './durableContinuationTypes';
 
 const LEGACY_DRAFTS = '@clearvalue_offline_report_drafts_v1';
 const LEGACY_AUTOSAVE = '@clearvalue_auto_save';
@@ -16,6 +17,10 @@ const schema = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS capture_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS report_upload_continuations (
+  owner_id TEXT NOT NULL, id TEXT NOT NULL, parent_work_item_id TEXT NOT NULL, data TEXT NOT NULL,
+  PRIMARY KEY(owner_id,id), UNIQUE(owner_id,parent_work_item_id)
+);
 CREATE TABLE IF NOT EXISTS capture_backup_outbox (
   owner_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL,
   PRIMARY KEY(owner_id,draft_id,revision)
@@ -133,6 +138,7 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
   let initialized: Promise<void> | undefined;
   let writeTail: Promise<unknown> = Promise.resolve();
   const savedListeners = new Set<() => void>();
+  const continuationListeners = new Set<() => void>();
   const db = () => (database ??= openDatabase());
   const requireOwner = () => {
     if (!ownerId) throw new Error('Sign in to the draft owner account before saving or uploading.');
@@ -314,6 +320,7 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
     getOwnerId() { return ownerId; },
     initialize,
     subscribeSaved(listener: () => void) { savedListeners.add(listener); return () => { savedListeners.delete(listener); }; },
+    subscribeContinuations(listener: () => void) { continuationListeners.add(listener); return () => { continuationListeners.delete(listener); }; },
     async seedBackups() {
       const expected = requireOwner(); await initialize();
       await serialize(async () => { assertOwner(expected); await (await db()).withExclusiveTransactionAsync(async tx => { await tx.runAsync(`
@@ -400,6 +407,47 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
       });
     },
     async getDraft(id: string) { return readDraft(id, requireOwner()); },
+    async listContinuations(): Promise<DurableContinuationIntent[]> {
+      const expected = requireOwner(); await initialize();
+      const rows = await (await db()).getAllAsync<{ data: string }>('SELECT data FROM report_upload_continuations WHERE owner_id=? ORDER BY rowid', expected);
+      assertOwner(expected); return rows.map(row => readJson<DurableContinuationIntent>(row.data));
+    },
+    async prepareContinuation(intent: DurableContinuationIntent): Promise<DurableContinuationIntent> {
+      const expected = requireOwner();
+      if (intent.ownerId !== expected) throw new Error('The signed-in account changed.');
+      return serialize(async () => {
+        const parent = await readDraft(intent.parentDraftId, expected);
+        if (!parent || parent.captureId !== intent.parentCaptureId || parent.formData.clientSubmissionId !== intent.parentClientSubmissionId ||
+            parent.localRevision !== intent.parentRevision || parent.formData.auctioneerWorkItemId !== intent.parentWorkItemId || hidden(parent)) {
+          throw new Error('The saved parent changed before Continue. Reopen its original draft.');
+        }
+        const row = await (await db()).getFirstAsync<{ data: string }>('SELECT data FROM report_upload_continuations WHERE owner_id=? AND parent_work_item_id=?', expected, intent.parentWorkItemId);
+        const old = row ? readJson<DurableContinuationIntent>(row.data) : undefined;
+        if (old && (old.parentDraftId !== intent.parentDraftId || old.parentCaptureId !== intent.parentCaptureId || old.parentClientSubmissionId !== intent.parentClientSubmissionId)) {
+          throw new Error('This work item already has a different saved Continue request. Open it from Drafts.');
+        }
+        if (old && old.stage !== 'prepared') throw new Error('This Continue request is already staged. Retry opening its next lot from Drafts; do not submit it again.');
+        const next = old ? { ...intent, id: old.id, successorDraftId: old.successorDraftId, successorCaptureId: old.successorCaptureId, createdAt: old.createdAt } : intent;
+        assertOwner(expected);
+        await (await db()).runAsync('INSERT INTO report_upload_continuations(owner_id,id,parent_work_item_id,data) VALUES(?,?,?,?) ON CONFLICT(owner_id,id) DO UPDATE SET data=excluded.data', expected, next.id, next.parentWorkItemId, JSON.stringify(next));
+        assertOwner(expected); continuationListeners.forEach(listener => listener()); return next;
+      });
+    },
+    async updateContinuation(id: string, change: (intent: DurableContinuationIntent) => DurableContinuationIntent): Promise<DurableContinuationIntent> {
+      const expected = requireOwner();
+      return serialize(async () => {
+        await initialize(); assertOwner(expected);
+        const row = await (await db()).getFirstAsync<{ data: string }>('SELECT data FROM report_upload_continuations WHERE owner_id=? AND id=?', expected, id);
+        if (!row) throw new Error('The saved Continue request is unavailable.');
+        const old = readJson<DurableContinuationIntent>(row.data), next = change(old);
+        if (next.id !== old.id || next.ownerId !== expected || next.type !== old.type || next.parentRevision !== old.parentRevision || next.parentDraftId !== old.parentDraftId || next.parentWorkItemId !== old.parentWorkItemId ||
+            next.parentCaptureId !== old.parentCaptureId || next.parentClientSubmissionId !== old.parentClientSubmissionId ||
+            next.successorDraftId !== old.successorDraftId || next.successorCaptureId !== old.successorCaptureId) throw new Error('The Continue identity changed.');
+        assertOwner(expected);
+        await (await db()).runAsync('UPDATE report_upload_continuations SET data=? WHERE owner_id=? AND id=?', JSON.stringify({ ...next, updatedAt: new Date().toISOString() }), expected, id);
+        assertOwner(expected); continuationListeners.forEach(listener => listener()); return next;
+      });
+    },
     async recordDraftOpened(id: string, eventId: string) {
       const expected = requireOwner();
       if (!/^[a-zA-Z0-9._:-]{1,160}$/.test(eventId)) throw new Error('Invalid review event identity.');
@@ -548,6 +596,20 @@ export function createOfflineCaptureStore(openDatabase: DatabaseFactory, legacyS
       return store.updateDraft(id, (draft) => ['accepted', 'submitted'].includes(draft.submissionState || '') && !['accepted', 'submitted', 'discarded'].includes(state) ? draft : ({ ...draft, submissionState: state, reportId: reportId || draft.reportId,
         submissionError: error, ...(state === 'ready' ? { submissionRequestedAt: draft.submissionRequestedAt || new Date().toISOString() } : {}),
         ...(['submitted', 'accepted'].includes(state) ? { submittedAt: new Date().toISOString() } : {}) }));
+    },
+    async recordTransferAcceptance(id: string, revision: number, captureId: string, submissionId: string, reportId: string) {
+      const expected = requireOwner();
+      return serialize(async () => {
+        const draft = await readDraft(id, expected);
+        if (!draft || draft.captureId !== captureId || draft.formData.clientSubmissionId !== submissionId) {
+          throw new Error('The accepted upload belongs to an earlier saved capture. Your current draft and originals are kept.');
+        }
+        if (['accepted', 'submitted'].includes(draft.submissionState || '') && draft.reportId === reportId) return;
+        if (draft.localRevision !== revision || hidden(draft)) {
+          throw new Error('This draft changed after the upload was saved. Check Previews; the current draft and originals are kept.');
+        }
+        await persist({ ...draft, submissionState: 'accepted', reportId, submissionError: undefined, submittedAt: new Date().toISOString() }, expected);
+      });
     },
     async getProtectedMediaUris(): Promise<string[]> {
       await initialize();

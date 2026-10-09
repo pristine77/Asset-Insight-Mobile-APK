@@ -12,6 +12,7 @@ import { cancellableUploadRequest, createUploadOperation, setUploadOwner, type U
 import OfflineCaptureStore from '../services/offlineCaptureStore';
 import type { OfflineReportDraft } from '../services/autoSaveService';
 import type { DirectUploadProgressCallback, DirectUploadProgressStage } from '../services/directR2UploadService';
+import durableReportTransfer from '../services/durableReportTransfer';
 
 jest.mock('@expo/vector-icons', () => ({ Feather: () => null }));
 jest.mock('react-native-safe-area-context', () => ({ useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 24, left: 0 }) }));
@@ -81,6 +82,7 @@ afterEach(async () => {
   await cleanup();
   backgroundUploadManager.resetForTests();
   jest.useRealTimers();
+  jest.restoreAllMocks();
 });
 
 async function showBar() {
@@ -92,6 +94,31 @@ async function showBar() {
 it('takes no room when nothing is uploading, paused or reported', async () => {
   await showBar();
   expect(screen.queryByTestId('upload-bar')).toBeNull();
+});
+
+it('shows a rehydrated native queue even before Android starts its first worker', async () => {
+  jest.spyOn(backgroundUploadManager, 'getSnapshot').mockReturnValue({ active: null, held: [], notices: [], queued: [{
+    id: 'durable:queued', draftId: 'queued', type: 'asset', title: 'Saved capture', status: 'queued', percent: 0,
+    completedFiles: 0, totalFiles: 224, pausing: false, canPause: true, durable: true,
+  }] });
+  await showBar();
+  expect(screen.getByText('In line: Saved capture · 224 files')).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Pause upload of Saved capture' })).toBeTruthy();
+});
+
+it('retains Resume after a durable attention notice was dismissed and waits for safe release before Open', async () => {
+  jest.spyOn(backgroundUploadManager, 'getSnapshot').mockReturnValue({ active: null, queued: [], notices: [], held: [{
+    id: 'durable:held', draftId: 'held', type: 'asset', title: 'Held capture', status: 'attention', percent: 50,
+    completedFiles: 112, totalFiles: 224, pausing: false, canPause: false, durable: true,
+  }] });
+  let release!: () => void;
+  jest.spyOn(durableReportTransfer, 'releaseForEditing').mockReturnValue(new Promise(resolve => { release = resolve; }));
+  const opened = await showBar();
+  expect(screen.getByRole('button', { name: 'Resume upload of Held capture' })).toBeTruthy();
+  await fireEvent.press(screen.getByRole('button', { name: 'Open Held capture' }));
+  expect(opened).not.toHaveBeenCalled();
+  await act(async () => { release(); });
+  expect(opened).toHaveBeenCalledWith('held', 'asset');
 });
 
 it('shows the running upload with its count and progress; Pause stops it and offers Resume and Open', async () => {

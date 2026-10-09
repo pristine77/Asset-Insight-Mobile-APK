@@ -17,6 +17,7 @@ import { setUploadOwner } from '../services/uploadCancellation';
 
 jest.mock('@expo/vector-icons', () => ({ Feather: () => null }));
 jest.mock('../components/CaptureBackupPanel', () => () => null);
+jest.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: { _id: 'owner' } }) }));
 jest.mock('react-native-safe-area-context', () => ({ SafeAreaView: require('react-native').View }));
 jest.mock('../context/ThemeContext', () => ({ useAppTheme: () => ({ colors: { text: '#111', textSecondary: '#555', warning: '#a50', accent: '#c00', info: '#25e' } }) }));
 jest.mock('@react-native-community/netinfo', () => ({ __esModule: true, default: { fetch: jest.fn(async () => ({ isConnected: true })), addEventListener: jest.fn(() => () => undefined) } }));
@@ -29,6 +30,7 @@ jest.mock('../services/autoSaveService', () => ({ __esModule: true, default: {
 jest.mock('../services/offlineCaptureStore', () => ({ __esModule: true, default: {
   getOwnerId: jest.fn(() => 'owner'), listSummaries: jest.fn(), listLegacyDrafts: jest.fn(async () => []), listLegacyJobs: jest.fn(async () => []),
   setSubmissionState: jest.fn(async () => undefined),
+  listContinuations: jest.fn(async () => []), subscribeContinuations: () => () => undefined,
 } }));
 jest.mock('../services/offlineQueueService', () => ({ __esModule: true, default: {
   getJobs: jest.fn(async () => []), getConnectivityStatus: jest.fn(async () => ({ status: 'online' })), subscribe: jest.fn(() => () => undefined),

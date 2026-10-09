@@ -66,6 +66,18 @@ export type DirectUploadSessionResponse = {
   }>;
 };
 
+/** The exact normal upload request, after file-size validation and session admission. */
+export type PreparedReportTransfer = {
+  endpoint: '/asset' | '/lot-listing';
+  details: Record<string, any>;
+  session: DirectUploadSessionResponse;
+  files: Array<DirectUploadFile & { fileId: string; size: number }>;
+};
+export type ReportTransferHandoff = ((prepared: PreparedReportTransfer, operation: UploadOperation) => Promise<void>) & {
+  /** Resolve the immutable saved sources before declaring sizes to the server. */
+  prepareFiles?: (files: DirectUploadFile[], operation: UploadOperation) => Promise<DirectUploadFile[]>;
+};
+
 const DIRECT_UPLOAD_CONCURRENCY = 4;
 const DIRECT_UPLOAD_RETRIES = 2;
 const DIRECT_UPLOAD_SESSION_REFRESH_RETRIES = 1;
@@ -539,14 +551,19 @@ async function performReportUpload(args: {
   files: DirectUploadFile[];
   onProgress?: DirectUploadProgressCallback;
   operation?: UploadOperation;
-}): Promise<{ jobId: string; reportId: string; message: string; phase?: string; status?: string; alreadyQueued?: boolean }> {
+  handoff?: ReportTransferHandoff;
+}): Promise<{ jobId: string; reportId?: string; message: string; phase?: string; status?: string; alreadyQueued?: boolean; backgroundStaged?: boolean }> {
   const operation = args.operation || createUploadOperation();
   operation.assertActive();
   // Freeze the JSON request, including nested lot settings, before callbacks or
   // preparation can change caller state. Signed-target refreshes are exact retries.
   const details: Record<string, any> = JSON.parse(JSON.stringify(args.details));
   // Size resolution must not mutate the caller's saved draft, order or media identity.
-  const files = args.files.map((file) => ({ ...file }));
+  const clonedFiles = args.files.map((file) => ({ ...file }));
+  const files = args.handoff?.prepareFiles ? await cancellableUploadTask(operation,
+    () => args.handoff!.prepareFiles!(clonedFiles, operation), () => undefined,
+    { idleTimeoutMs: 30_000, message: 'Reading the saved upload took too long. Your draft and originals are kept. Retry when device storage responds.' }) : clonedFiles;
+  operation.assertActive();
   const totalFiles = args.files.length;
   let lastPercent = -1;
   let lastStage: DirectUploadProgressStage | undefined;
@@ -676,6 +693,15 @@ async function performReportUpload(args: {
       phase: session.processed || session.status === "processed" ? "done" : "processing",
       status: session.status || "processing",
     };
+  }
+  if (args.handoff) {
+    operation.assertActive();
+    await args.handoff({ endpoint: args.endpoint, details, session,
+      files: files.map((file, index) => ({ ...file, fileId: manifest[index].fileId, size: runtimeFileSizes[index] })),
+    }, operation);
+    // This is a durable device receipt, never server acceptance. The caller may
+    // close the editor but must retain the draft and every original.
+    return { jobId: session.jobId, message: 'Upload saved on this device and scheduled.', backgroundStaged: true };
   }
   let uploadById = new Map(session.files.map((file) => [file.fileId, file]));
 

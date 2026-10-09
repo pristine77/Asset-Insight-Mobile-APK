@@ -20,6 +20,8 @@ import useDeviceDraftSave from './useDeviceDraftSave';
 import DraftStorageStatus from './DraftStorageStatus';
 import OfflineCaptureStore from '../../services/offlineCaptureStore';
 import { prepareOfflineSubmission } from '../../services/offlineSubmissionService';
+import durableReportTransfer from '../../services/durableReportTransfer';
+import durableContinuationService from '../../services/durableContinuationService';
 import { assertReportUploadAccepted, isExistingReportUploadReceipt } from '../../services/reportUploadReceipt';
 import { showUploadManifestRecovery, uploadConflictSource } from './uploadManifestRecovery';
 import { createUploadOperation, pauseUploadOperation, type UploadOperation } from '../../services/uploadCancellation';
@@ -874,20 +876,25 @@ const LotListingFormSheet = ({
       (sum, lot) => sum + lot.files.length + (lot.extraFiles?.length || 0) + (lot.videoFile ? 1 : 0),
       0
     );
-    // Background hand-off (2026-10-02, services/backgroundUploadManager.ts):
+    // Legacy in-app hand-off (services/backgroundUploadManager.ts):
     // an ordinary Submit or Resume from the Dashboard is saved, checked and
     // handed to the upload line, and the form closes. Incoming work and
     // Auction Management tasks keep waiting here for acceptance, and so do the
     // explicit separate/replace choices. A draft whose
     // last background attempt needs a decision runs here once, where the
-    // prompts can appear; this attempt uses up that mark.
+    // prompts can appear; this attempt uses up that mark. Supported Android
+    // device-file submissions use the durable scheduler below. Continue reserves
+    // its independent next form after that durable handoff.
     const plannedDraftId = currentDraftId || draftIdentityRef.current;
     // Never save over, or send a second time, a draft the line is sending.
     if (backgroundUploadManager.isBusy(plannedDraftId)) {
       Alert.alert(ALREADY_UPLOADING_TITLE, ALREADY_UPLOADING_MESSAGE);
       return;
     }
-    let background = backgroundUploads && !auctioneer && !isAuctionManagementMode && !options.nextLot && !options.forceNew
+    const durable = durableReportTransfer.available() && lots.every(lot =>
+      [...lot.files, ...(lot.extraFiles || [])].every(file => /^(file|content):\/\//.test(getPhotoUploadUri(file))) &&
+      (!lot.videoFile || /^(file|content):\/\//.test(lot.videoFile.uri)));
+    let background = !durable && backgroundUploads && !auctioneer && !isAuctionManagementMode && !options.nextLot && !options.forceNew
       && !options.replaceSubmissionId && !options.newSubmissionFromId;
     if (backgroundUploads && backgroundUploadManager.prefersForeground(plannedDraftId)) {
       background = false;
@@ -1058,7 +1065,7 @@ const LotListingFormSheet = ({
       operation.assertActive();
       if (options.nextLot && connectivity.status === 'offline') {
         setSubmitting(false);
-        Alert.alert('Connection required', 'Keep this lot open and retry when online. A new lot starts only after the server accepts this report.');
+        Alert.alert('Connection required', durable ? 'Keep this lot open and retry when online. The saved upload and its next lot need a short server reservation.' : 'Keep this lot open and retry when online. A new lot starts only after the server accepts this report.');
         return;
       }
       if (connectivity.status === 'offline') {
@@ -1071,8 +1078,14 @@ const LotListingFormSheet = ({
         if (!operation.isActive() || recoveryScopeRef.current !== attemptRecoveryScope || OfflineCaptureStore.getOwnerId() !== attemptOwner) return;
         setUploadProgress(progress);
         if (detail) setUploadStatus(detail);
-      }, { operation });
+      }, { operation, ...(durable ? { handoff: options.nextLot && auctioneer
+        ? durableContinuationService.handoff(localDraft, contractNo.trim() || 'Lot listing', auctioneer)
+        : durableReportTransfer.handoff(localDraft, contractNo.trim() || 'Lot listing') } : {}) });
       operation.assertActive();
+      if (acceptedResponse.backgroundStaged) {
+        if (options.nextLot && auctioneerControl) { await auctioneerControl.continueQueued(localDraft.id); return; }
+        setSubmitting(false); await resetForm(); onClose(); return;
+      }
       assertReportUploadAccepted(acceptedResponse);
       uploadAccepted = true;
       uploadAcceptedRef.current = true;
@@ -1106,6 +1119,16 @@ const LotListingFormSheet = ({
       if (OfflineCaptureStore.getOwnerId() !== attemptOwner) {
         setSubmitting(false);
         return;
+      }
+      if (durable && options.nextLot && auctioneerControl && draftSaved) {
+        try {
+          const intent = await durableContinuationService.forParent(attemptDraftId);
+          if (intent && intent.stage !== 'prepared') { await auctioneerControl.continueQueued(attemptDraftId); return; }
+        } catch {
+          setSubmitting(false);
+          Alert.alert('Continue needs checking', 'The saved upload status could not be read. Keep its originals and retry this Continue request from Drafts; do not submit another copy.');
+          return;
+        }
       }
       if (uploadAccepted) {
         setSubmitting(false);
@@ -2380,6 +2403,6 @@ export default function LotListingFormWithAuctioneer(props: LotListingFormSheetP
     draftIdToLoad={sessionDraftId} onClose={props.onClose} onSetupChange={props.onAuctioneerSetupChange}>
     {(control) => <LotListingFormSheet {...props} auctioneerControl={control}
       auctionManagementTask={control ? undefined : props.auctionManagementTask}
-      draftIdToLoad={control && !control.restoreDraft ? undefined : sessionDraftId} />}
+      draftIdToLoad={control?.draftIdToLoad || (control && !control.restoreDraft ? undefined : sessionDraftId)} />}
   </AuctioneerFormBoundary>;
 }

@@ -1,5 +1,60 @@
 # Offline capture — Asset and Lot Listing
 
+## Explicit durable Android Submit — 2026-10-08 (local; release pending)
+
+An offline capture is still saved locally and never submits merely because
+connectivity returns, the app reopens or an autosave completes. After review, an
+explicit **Submit** with local originals on a new Android binary now stages an
+immutable native transfer: save the full draft, reserve its normal server upload
+session, obtain a session-scoped grant, then commit the native queue. Only that
+durable receipt closes the form and permits the next independent form. It is
+labelled saved/scheduled, not accepted; server acceptance remains separately
+validated against owner, capture/submission identity and local revision.
+
+Android can continue that explicitly authorized transfer through ordinary
+navigation, process loss, reboot and temporary network loss. Explicit Pause or
+Offline holds work; logout/account changes revoke native authority. Reopening
+only rehydrates status and never resumes held work. Resume is explicit and uses
+the same session, including receipt reconciliation after an uncertain completion.
+Force-stop and Android/OEM restrictions can defer work; keep the original device
+and do not uninstall or clear app data. Drafts/Upload status offer Pause, Resume
+and safe Open; editing stays blocked until the native snapshot is released, and
+uncertain acceptance requires Resume before release. Original bytes/references
+are retained after both failure and acceptance.
+
+Incoming standard Submit preserves its frozen assignment. Supported Android
+**Create Lot & Continue** durably stages the parent and makes a short protected
+same-contract server reservation before opening the next form; it does not wait
+for media bytes or claim acceptance. A separate owner-bound SQLite intent records
+the carried editable details and independent successor IDs without changing the
+parent's frozen revision. The empty successor is saved create-only before display;
+later edits/photos are never overwritten on reservation replay.
+
+Pending **Continue requests** remain in Drafts/Incoming after process death or
+parent acceptance. Reopening only reads this journal. Explicit Retry reconciles
+the exact native parent and same reservation without rerunning upload or rotating
+its grant. A confirmed absent native row returns to the saved original for explicit
+Submit, while uncertainty remains blocked. Bound parent uploads allow Pause/Resume
+but not editing/release; originals remain retained. Backend continuation support
+must precede the new app binary.
+
+Remote-only media, iOS and older binaries retain the existing in-app foreground
+path and acceptance-first Continue with an explicit **Keep the app open** message. These
+rules supersede older foreground/no-reconnect wording only for the new explicit
+durable Submit path. Camera quality/layouts, report layouts, approval and delivery
+remain unchanged. The independent private capture-backup feature remains
+**disabled**; this work does not enable automatic backup or automatic submission.
+
+Backend transfer support must precede a new native binary. No production access,
+customer repair/mutation, push, deployment or signed release was performed.
+All 111 Jest suites / 1,378 tests, TypeScript and both Hermes exports pass, including
+rendered Asset/Lot queued Continue, saved-child isolation, owner/navigation fences,
+explicit recovery and actual SQLite journal checks. Scoped ESLint has zero errors
+/ 34 warnings. Local verification receipts were retained separately;
+see `README.android.md` and
+`modules/report-transfer/README.md` for detailed verification and the native
+physical-device/OEM/real-media endurance boundaries.
+
 ## Durable Android cloud backup — 2026-10-06 (local; release pending)
 
 Saved offline/manual-submit Asset and Lot captures now stage an independent

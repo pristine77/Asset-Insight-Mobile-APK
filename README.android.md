@@ -1,5 +1,125 @@
 # Android local development
 
+## Pristine source export — 2026-10-09
+
+Integrated source `dc73c68` as content-only changes. Explicit durable Android
+report submission, queued Incoming Continue and reviewed specification edits are
+included. Provider usage/accounting and cost/multiplier calculations are excluded.
+Pristine Bank and add-logo defaults, bounded decoding, immutable asynchronous
+camera snapshots, fixed-lot locks, September controls, 3000px standard captures
+and 720p/30fps video remain preserved. Private capture backup stays disabled.
+
+Both native exports pass TypeScript and 1,430 tests / 115 suites. Android/iOS
+Hermes exports pass from the Front-End native copy, with source-map checks against
+the exported application. The new report-transfer module, camera, application and
+instrumentation Kotlin compile offline. An initial concurrent run timed out two
+existing 100-lot preview tests; unchanged focused and full reruns passed without
+changing their timeouts. No physical device, emulator, live provider, signing or
+store release was exercised. Backend endpoints must precede a new native binary.
+
+## Reviewed Asset/Lot specification edits — 2026-10-08 (local)
+
+The preview editor now synchronizes each general spec edit/blank/deletion with
+earlier CR/Excel manual overrides and all matching legacy deletion collections.
+Primary serial retains its existing root/alias policy. Deleted fields retain
+suppression metadata; deleting all fields sends an explicit empty spec map.
+Re-entry clears only the matching suppression. Saved lot/photo/cover identities,
+unrelated details, approval/release gates and generated layouts stay unchanged.
+
+The backend's `condition_report_specs_reviewed: true` marker means the canonical
+reviewed table is authoritative. The editor retains this flag, displays explicit
+blanks, and does not invent category placeholders for an empty reviewed table.
+Add field remains available; legacy unreviewed previews still show placeholders.
+Overall/bare Length/Width/Height match only for an unambiguous category registry;
+Internal/Cargo/Bed/Working and explicitly distinct dimensions remain separate.
+The corresponding web editor now preserves narrative text containing “visible”,
+matching native's existing standalone-label-only normalization.
+
+Focused native verification: 40 tests / three suites and TypeScript pass;
+scoped lint has zero errors / nine existing warnings. Rendered tests cover both
+Asset/Lot payloads, stale overrides, blank/deleted dimensions, delete-last/save/
+reopen/explicit re-entry, and original-media preservation. The matching web
+focused gate is 59 tests / five files and typecheck. Final isolated native full
+verification passes 1,395 tests / 112 suites, typecheck and Android/iOS production
+Hermes exports. An earlier concurrent run timed out in the existing 100-lot
+preview case (1,394 pass / one failure); unchanged focused 21/21 and isolated
+full reruns passed, with no timeout relaxation. The cause remains unproven.
+Eight web-browser flows also use the actual backend normalization, with real
+XLSX readback and visual CR PDF checks; these are not physical native-device
+tests. Local verification logs and artifacts were retained separately.
+Backend API/workers must precede web/new mobile
+binary. No live report repair/regeneration, provider call, push, deployment,
+camera change or physical-device certification is implied. All prior durable
+Submit/Continue changes remain intact.
+
+## Durable report submission — 2026-10-08 (local; release pending)
+
+On a new Android binary, Asset/Lot **Submit** with local captured/restored media
+saves the exact owner-bound draft, reserves the normal frozen upload session and
+obtains a session-only grant before handing its immutable media manifest to
+`modules/report-transfer`. The form closes only after the native durable enqueue
+receipt; that receipt means **saved and scheduled**, not server acceptance.
+Another independent report can then be captured while Android uploads the first.
+Incoming ordinary Submit uses the same assigned source identities. **Create Lot
+& Continue** now saves a separate owner-bound SQLite continuation intent before
+enqueue, then calls protected `POST /auctioneer/work-items/:id/continue-upload`
+with that exact session. This short foreground reservation opens a server-validated
+same-contract successor without waiting for the parent's media bytes or acceptance.
+The successor is persisted create-only before display, with current editable
+details/settings but new draft/capture/submission identities and no inherited media.
+It is never an unassigned substitute, and no queued receipt is treated as accepted.
+
+Drafts and Incoming show pending **Continue requests**, even if the parent later
+becomes accepted/hidden. Reopening does not submit or reserve anything. Explicit
+Retry checks the exact native parent then replays the same reservation, never
+another upload or scoped-grant rotation. A confirmed missing native row reopens
+the original saved parent for an explicit Submit; an uncertain row stays blocked.
+Lost reservation responses/local-save failures retain the same successor identity;
+replay cannot overwrite a successor's later edits or photos. Parent journal
+checkpoints never increment its frozen revision. Bound parents cannot be released
+for editing; Pause/Resume remains available. Assignment changes and account/navigation
+changes fail closed without deleting originals.
+
+Android 14+ uses user-initiated data-transfer jobs, with WorkManager on older
+Android. One native transfer runs at a time. Native state survives React teardown,
+ordinary process loss and reboot; network/system retries retain the same frozen
+session. Explicit Pause/Offline and logout stop its authority. Reopening only
+reads status: held work needs explicit Resume, which refreshes its scoped grant.
+Force-stop requires reopening and Android/OEM restrictions can defer execution;
+there is no uninterrupted-background guarantee. Remote-only media, iOS and older
+binaries retain the existing foreground path and explicitly say **Keep the app
+open**; their Continue still waits for server acceptance before reserving a successor.
+This section supersedes older no-reconnect/foreground-only wording only
+for an explicitly submitted, durably staged Android report, not unsent drafts.
+
+The upload bar and Drafts restore progress/held status. Paused snapshots stay
+locked until native release succeeds; uncertain completion cannot be released
+for editing and instead requires Resume to reconcile acceptance. Repeated Submit
+and Resume taps are coalesced. Native receipts and local acceptance writes check
+owner, draft/capture/submission identity and saved revision. Original references
+and bytes remain retained; a later edited draft is never hidden by an old receipt.
+No normal access/refresh token is persisted by the transfer module. Private
+capture backup remains **disabled** and independent; this does not enable it.
+
+Roll out the backend transfer endpoints before a **new native binary**; no OTA
+can add this scheduler. No production access, customer mutation, push, deployment
+or signed release was performed. JavaScript verification covers both form types,
+Incoming identity/Continue, duplicate taps, late owner changes, lost enqueue
+acknowledgement, revision-fenced acceptance, durable rehydration, safe edit release
+and explicit versus system/lifecycle pauses. The additional rendered Asset/Lot
+checks cover pre-acceptance successor handoff, saved child identities/fields and
+empty media, setup acknowledgment, missing native enqueue, lost reservation
+response and account changes. Recovery-panel checks cover unmount/account races,
+read-failure Retry and containment in Incoming's scroll list; actual SQLite tests
+verify parent revision/original preservation and accepted-hidden journal recovery.
+All 111 Jest suites / 1,378 tests, TypeScript and isolated Android/iOS Hermes
+exports pass; scoped ESLint has zero errors / 34 warnings. Verification receipts
+were retained separately. The native
+worker is unchanged by the Continue extension; rendered tests and bundle exports
+do not certify physical phones, real-media endurance or live assignments. See
+`modules/report-transfer/README.md` for the separate native instrumentation and
+remaining physical-device/OEM/real-media endurance boundaries.
+
 ## Pristine source export — 2026-10-07
 
 Integrated source `c43c079` as content-only changes, without source Git history,

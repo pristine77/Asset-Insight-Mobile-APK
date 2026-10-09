@@ -1,8 +1,8 @@
 /**
- * Explicit Submit hands one frozen report to an in-app background upload line.
- * One upload runs at a time; navigation may continue. Interruption, Offline,
- * restart and reconnect NEVER resume it. Resume is an explicit user action.
- * Owner switches clear this in-memory line while preserving durable drafts.
+ * Shared status for the Android durable transfer scheduler and the older
+ * in-app FIFO. The FIFO still requires explicit Resume after interruption or
+ * restart. Android owns temporary system/network recovery for its explicitly
+ * submitted immutable jobs. Offline/user/account pauses stop both paths.
  */
 import type { OfflineDraftType, OfflineReportDraft } from './autoSaveService';
 import { assertReportUploadAccepted, isExistingReportUploadReceipt } from './reportUploadReceipt';
@@ -16,6 +16,7 @@ import {
   type UploadOperation,
 } from './uploadCancellation';
 import { isUploadManifestConflict } from '../components/forms/uploadManifestRecovery';
+import durableReportTransfer from './durableReportTransfer';
 
 /*
  * The upload stack is required when it is first used, not imported at the top.
@@ -74,6 +75,8 @@ export type BackgroundUploadRequest = {
 };
 
 export type BackgroundUploadEntry = {
+  /** Android owns this immutable transfer even when JavaScript is stopped. */
+  durable?: boolean;
   id: string;
   draftId: string;
   type: OfflineDraftType;
@@ -142,7 +145,7 @@ const isActiveReportConflict = (error: any) =>
 /** Short status for a Drafts card: "Uploading 45 of 160", "Waiting in line" and so on. */
 export function describeBackgroundUpload(entry: BackgroundUploadEntry): string {
   if (entry.status === 'queued') return 'Waiting in line';
-  if (entry.status === 'waiting') return 'Waiting for signal';
+  if (entry.status === 'waiting') return entry.durable ? 'Waiting to continue' : 'Waiting for signal';
   if (entry.status === 'paused') return 'Paused';
   if (entry.status === 'attention') return 'Needs attention';
   if (entry.pausing) return 'Pausing';
@@ -189,11 +192,12 @@ export function createBackgroundUploadManager() {
 
   /** Publishes a new snapshot (useSyncExternalStore needs a new object per change). */
   function notify() {
+    const durable = durableReportTransfer.getSnapshot();
     snapshot = {
-      active: active ? toEntry(active) : null,
-      queued: queue.map(toEntry),
-      held: held.map(toEntry),
-      notices: notices.slice(),
+      active: durable.active || (active ? toEntry(active) : null),
+      queued: [...durable.queued, ...queue.map(toEntry)],
+      held: [...durable.held, ...held.map(toEntry)],
+      notices: [...notices, ...durable.notices],
     };
     for (const listener of Array.from(listeners)) {
       try { listener(); } catch { /* A faulty view must not stop the line. */ }
@@ -463,7 +467,8 @@ export function createBackgroundUploadManager() {
       return true;
     },
     /** The bar's Pause. Refused while finalizing, when the server is accepting the report. */
-    pause(jobId: string): boolean {
+    pause(jobId: string): boolean | Promise<void> {
+      if (jobId.startsWith('durable:')) return durableReportTransfer.pause(jobId);
       const job = allJobs().find((item) => item.id === jobId);
       if (!job) return false;
       if (job.status === 'queued') {
@@ -486,7 +491,8 @@ export function createBackgroundUploadManager() {
       return true;
     },
     /** Puts a paused upload back at the end of the line, as the person's own action. */
-    resume(jobId: string): boolean {
+    resume(jobId: string): boolean | Promise<void> {
+      if (jobId.startsWith('durable:')) return durableReportTransfer.resume(jobId);
       const job = held.find((item) => item.id === jobId);
       if (!job || job.status !== 'paused' || captureStore().getOwnerId() !== job.ownerId) return false;
       held = held.filter((item) => item !== job);
@@ -499,6 +505,7 @@ export function createBackgroundUploadManager() {
     /** Waiting is not scheduled; callers use explicit Resume on a held job. */
     resumeNow(): boolean { return false; },
     dismiss(noticeId: string) {
+      if (noticeId.startsWith('durable:')) { durableReportTransfer.dismiss(noticeId); return; }
       const before = notices.length;
       notices = notices.filter((notice) => notice.id !== noticeId);
       if (notices.length !== before) notify();
@@ -519,9 +526,11 @@ export function createBackgroundUploadManager() {
     },
     /** Queued, uploading or waiting for signal: the draft must not be opened, discarded or overwritten. */
     isBusy(draftId: string): boolean {
-      return active?.draftId === draftId || queue.some((job) => job.draftId === draftId);
+      return durableReportTransfer.isBusy(draftId) || active?.draftId === draftId || queue.some((job) => job.draftId === draftId);
     },
     statusFor(draftId: string): BackgroundUploadEntry | undefined {
+      const durable = durableReportTransfer.statusFor(draftId);
+      if (durable) return durable;
       const job = allJobs().find((item) => item.draftId === draftId);
       return job ? toEntry(job) : undefined;
     },
@@ -545,6 +554,12 @@ export function createBackgroundUploadManager() {
       sequence = 0;
     },
   };
+  durableReportTransfer.subscribe(notify);
+  durableReportTransfer.onAccepted(event => {
+    for (const listener of Array.from(acceptedListeners)) {
+      try { listener(event); } catch { /* A status view cannot change server acceptance. */ }
+    }
+  });
   return manager;
 }
 

@@ -25,6 +25,12 @@ it('gives no reason for a pause someone asked for', () => {
   expect(error.pauseReason).toBeUndefined();
 });
 
+it('still cancels foreground work when its lifecycle is torn down', () => {
+  const operation = createUploadOperation();
+  pauseActiveUploads(undefined, 'lifecycle');
+  expect(pauseOf(() => operation.assertActive()).code).toBe('ERR_CANCELED');
+});
+
 it('takes the reason from the pause that stopped the operation, not a later one', () => {
   const operation = createUploadOperation();
   pauseActiveUploads();

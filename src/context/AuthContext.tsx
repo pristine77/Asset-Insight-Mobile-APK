@@ -47,7 +47,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     if (OfflineCaptureStore.getOwnerId() !== owner) {
       if (OfflineCaptureStore.getOwnerId() || !owner) await CaptureBackupService.deactivate();
       assertCurrent();
-      pauseActiveUploads();
+      pauseActiveUploads(undefined, 'lifecycle');
       OfflineCaptureSync.cleanup();
       offlineQueueService.cleanup();
     }
@@ -111,7 +111,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         invalidateAuthOperations();
         setLoading(false);
         statusRequest.current = null;
-        pauseActiveUploads();
+        pauseActiveUploads(undefined, 'lifecycle');
         OfflineCaptureSync.cleanup();
         AutoSaveService.setOwner(null);
         setUser(null);
@@ -127,7 +127,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       invalidateAuthOperations();
       setLoading(false);
       statusRequest.current = null;
-      pauseActiveUploads();
+      pauseActiveUploads(undefined, 'lifecycle');
       OfflineCaptureSync.cleanup();
       AutoSaveService.setOwner(null);
       setUser(null);

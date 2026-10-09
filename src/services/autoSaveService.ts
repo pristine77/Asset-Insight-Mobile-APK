@@ -14,6 +14,7 @@ import type { OfflineCaptureMetadata, CaptureModePreference, MediaOwnership } fr
 import type { AuctioneerWorkItemSetup } from './auctioneerService';
 import type { AuctionManagementTaskPayload } from './auctionManagementService';
 import { setUploadOwner } from './uploadCancellation';
+import durableReportTransfer from './durableReportTransfer';
 import { flushBackupHandoff } from './captureBackupHandoff';
 
 const AUTO_SAVE_KEY = '@clearvalue_auto_save';
@@ -803,6 +804,7 @@ export const AutoSaveService = {
     setUploadOwner(ownerId);
     OfflineCaptureStore.setOwner(ownerId);
     LocalMediaStore.setOwner(ownerId);
+    durableReportTransfer.setOwner(ownerId);
   },
   initialize: () => OfflineCaptureStore.initialize(),
   listLegacyDrafts: () => OfflineCaptureStore.listLegacyDrafts(),

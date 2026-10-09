@@ -9,6 +9,9 @@ import auctioneerService, {
   type AuctioneerWorkItemSetup,
 } from '../../services/auctioneerService';
 import legacyService from '../../services/auctionManagementService';
+import OfflineCaptureStore from '../../services/offlineCaptureStore';
+
+let mockPanelOwner: string | undefined;
 
 jest.mock('@expo/vector-icons', () => ({ Feather: () => null }));
 jest.mock('@react-native-async-storage/async-storage', () =>
@@ -19,7 +22,7 @@ jest.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ top: 0, left: 0, right: 0, bottom: 0 }),
 }));
 jest.mock('../../context/AuthContext', () => ({
-  useAuth: () => ({ user: { username: 'Test appraiser' }, logout: jest.fn() }),
+  useAuth: () => ({ user: { _id: mockPanelOwner, username: 'Test appraiser' }, logout: jest.fn() }),
 }));
 jest.mock('../../services/auctioneerService', () => ({
   __esModule: true,
@@ -105,11 +108,25 @@ const setup: AuctioneerWorkItemSetup = {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockPanelOwner = undefined;
   jest.mocked(auctioneerService.getStatus).mockResolvedValue({ configured: true, enabled: true });
   jest.mocked(auctioneerService.getIncoming).mockResolvedValue([available]);
   jest.mocked(auctioneerService.claim).mockResolvedValue(setup);
   jest.mocked(auctioneerService.getSetup).mockResolvedValue(setup);
   jest.mocked(legacyService.getTasks).mockResolvedValue([]);
+});
+
+it('keeps pending Continue recovery inside the assigned-contract scroll list on short screens', async () => {
+  mockPanelOwner = 'owner';
+  const owner = jest.spyOn(OfflineCaptureStore, 'getOwnerId').mockReturnValue('owner');
+  const rows = jest.spyOn(OfflineCaptureStore, 'listContinuations').mockResolvedValue([{ id: 'pending', ownerId: 'owner', type: 'asset', stage: 'staged', parentSetup: { contract: { contractNo: 'pending-contract' } } }] as any);
+  try {
+    await render(<AuctioneerIncoming onOpenReport={jest.fn()} />);
+    const button = await screen.findByRole('button', { name: 'Retry next lot for pending-contract' });
+    const ancestors: string[] = [];
+    for (let parent = button.parent; parent; parent = parent.parent) ancestors.push(parent.type);
+    expect(ancestors.some(type => /ScrollView/.test(type))).toBe(true);
+  } finally { owner.mockRestore(); rows.mockRestore(); }
 });
 
 it.each(['asset', 'lotListing'] as const)(

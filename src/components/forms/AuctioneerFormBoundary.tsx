@@ -9,12 +9,15 @@ import NetInfo from '@react-native-community/netinfo';
 import OfflineCaptureStore from '../../services/offlineCaptureStore';
 import { captureContinuationDetails, type ContinuationDetails } from './continuationDetails';
 import { actionableErrorMessage } from '../../services/connectivityService';
+import durableContinuationService from '../../services/durableContinuationService';
 
 export interface AuctioneerFormControl {
   setup: AuctioneerWorkItemSetup;
   accepted: boolean;
   restoreDraft: boolean;
   continuationDetails?: ContinuationDetails;
+  draftIdToLoad?: string;
+  continueQueued: (parentDraftId: string) => Promise<void>;
   acceptAndContinue: (response: unknown, draftId?: string, details?: ContinuationDetails, acceptanceSaved?: Promise<unknown>) => Promise<void>;
 }
 
@@ -49,6 +52,9 @@ export default function AuctioneerFormBoundary(props: Props) {
   const acceptedDetailsRef = useRef<ContinuationDetails | undefined>(undefined);
   const acceptanceSavedRef = useRef<Promise<unknown> | undefined>(undefined);
   const [continuationDetails, setContinuationDetails] = useState<ContinuationDetails>();
+  const [continuationDraftId, setContinuationDraftId] = useState<string>();
+  const [formEpoch, setFormEpoch] = useState(0);
+  const [queuedContinuation, setQueuedContinuation] = useState<{ id: string; parentDraftId: string } | null>(null);
   const successorRef = useRef<{ setup: AuctioneerWorkItemSetup; owner: string } | null>(null);
   const resolutionOwnerRef = useRef<string | null>(null);
   const epochRef = useRef(0);
@@ -69,6 +75,8 @@ export default function AuctioneerFormBoundary(props: Props) {
     acceptedDetailsRef.current = undefined;
     acceptanceSavedRef.current = undefined;
     setContinuationDetails(undefined);
+    setContinuationDraftId(undefined);
+    setQueuedContinuation(null);
     busyRef.current = false;
     setBusy(false);
     setAccepted(null);
@@ -113,6 +121,40 @@ export default function AuctioneerFormBoundary(props: Props) {
   const loading = needsResolution && resolved?.inputKey !== inputKey;
   const unavailable = current && !isEditableAuctioneerSetup(current, type) && !resolved?.resumeUpload;
   const renderedEpoch = epochRef.current;
+
+  const continueQueued = async (parentDraftId: string) => {
+    if (!current || busyRef.current || renderedEpoch !== epochRef.current) return;
+    const owner = OfflineCaptureStore.getOwnerId(), epoch = epochRef.current;
+    if (!owner || owner !== resolutionOwnerRef.current) return;
+    const isCurrent = () => epoch === epochRef.current && owner === OfflineCaptureStore.getOwnerId();
+    busyRef.current = true; setBusy(true); setError('');
+    try {
+      const intent = await durableContinuationService.forParent(parentDraftId);
+      if (!isCurrent()) return;
+      if (!intent) throw new Error('The saved Continue request is unavailable. Reopen the original draft; no next lot has been opened.');
+      const pending = { id: intent.id, parentDraftId };
+      setQueuedContinuation(pending);
+      const result = await durableContinuationService.complete(intent.id);
+      if (!isCurrent()) return;
+      if ('parentNotStaged' in result) {
+        // A verified missing native row is not a queued upload. Return to the
+        // exact saved parent; the person must explicitly submit it again.
+        setContinuationDraftId(result.draftId); setRestoreDraft(true);
+        setFormEpoch(value => value + 1);
+        setQueuedContinuation(null);
+        setResolved({ inputKey, setup: result.setup });
+        return;
+      }
+      successorRef.current = { setup: result.setup, owner };
+      setContinuationDraftId(result.draftId); setContinuationDetails(undefined); setRestoreDraft(true);
+      setQueuedContinuation(null);
+      setResolved({ inputKey, setup: result.setup });
+      busyRef.current = false; setBusy(false);
+      props.onSetupChange?.(result.setup);
+    } catch (reason) {
+      if (isCurrent()) setError(actionableErrorMessage(reason) || 'The next lot could not be confirmed. Retry this Continue request; its parent upload will not be submitted again.');
+    } finally { if (isCurrent()) { busyRef.current = false; setBusy(false); } }
+  };
 
   const continueAccepted = async (response?: unknown, draftId?: string, details?: ContinuationDetails, acceptanceSaved?: Promise<unknown>) => {
     if (!current || busyRef.current || renderedEpoch !== epochRef.current) return;
@@ -183,23 +225,25 @@ export default function AuctioneerFormBoundary(props: Props) {
   };
 
   if (!visible) return null;
-  const showForm = !loading && !unavailable && !accepted;
-  const showGate = loading || Boolean(unavailable) || Boolean(accepted);
+  const showForm = !loading && !unavailable && !accepted && !queuedContinuation;
+  const showGate = loading || Boolean(unavailable) || Boolean(accepted) || Boolean(queuedContinuation);
   const resumeOriginalDraft = Boolean(unavailable && current?.canResumeUpload === true);
   const buttonStyle = [styles.button, { borderColor: colors.borderStrong, backgroundColor: colors.surface }];
   return <>
-    {showForm ? <React.Fragment key={current?.workItemId || 'ordinary'}>{props.children(current ? {
-      setup: current, accepted: Boolean(accepted), restoreDraft, continuationDetails, acceptAndContinue: continueAccepted,
+    {showForm ? <React.Fragment key={`${current?.workItemId || 'ordinary'}:${formEpoch}`}>{props.children(current ? {
+      setup: current, accepted: Boolean(accepted), restoreDraft, continuationDetails, draftIdToLoad: continuationDraftId,
+      continueQueued, acceptAndContinue: continueAccepted,
     } : undefined)}</React.Fragment> : null}
     {showGate ? <Modal visible onRequestClose={() => { if (!busy) onClose(); }}>
       <SafeAreaView style={[styles.page, { backgroundColor: colors.background }]}>
         <ScrollView testID="auctioneer-handoff-scroll" contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
           <View style={styles.card}>
-            <Text style={[styles.title, { color: colors.text }]}>{usedSuccessor ? 'Next work item already used' : resumeOriginalDraft ? 'Resume the original draft' : accepted ? 'Report accepted' : current?.reportId ? 'Report already created' : 'Auctioneer contract'}</Text>
-            <Text accessibilityLiveRegion="polite" style={[styles.message, { color: colors.textSecondary }]}>{error || (resumeOriginalDraft ? 'This upload has not been accepted yet. Close this view and reopen its original saved draft to resume the same photos and submission. A blank form cannot replace it.' : accepted ? 'Starting a fresh lot for the same contract. Your report continues processing.' : unavailable ? 'This work item is no longer an editable claim. Reopen Incoming to review its report or assignment.' : 'Validating the current claim and saved draft…')}</Text>
+            <Text style={[styles.title, { color: colors.text }]}>{queuedContinuation ? 'Opening the next lot' : usedSuccessor ? 'Next work item already used' : resumeOriginalDraft ? 'Resume the original draft' : accepted ? 'Report accepted' : current?.reportId ? 'Report already created' : 'Auctioneer contract'}</Text>
+            <Text accessibilityLiveRegion="polite" style={[styles.message, { color: colors.textSecondary }]}>{error || (queuedContinuation ? 'Checking the saved parent upload and reserving its independent next lot. Upload progress remains in the upload bar; this is not an acceptance receipt.' : resumeOriginalDraft ? 'This upload has not been accepted yet. Close this view and reopen its original saved draft to resume the same photos and submission. A blank form cannot replace it.' : accepted ? 'Starting a fresh lot for the same contract. Your report continues processing.' : unavailable ? 'This work item is no longer an editable claim. Reopen Incoming to review its report or assignment.' : 'Validating the current claim and saved draft…')}</Text>
             {busy || (loading && !error) ? <ActivityIndicator color={colors.accent} accessibilityLabel="Checking Auctioneer work item" /> : null}
             {error && loading ? <TouchableOpacity accessibilityRole="button" onPress={() => setReload((value) => value + 1)} style={buttonStyle}><Text style={{ color: colors.text }}>Retry validation</Text></TouchableOpacity> : null}
             {accepted && !busy && !usedSuccessor ? <TouchableOpacity accessibilityRole="button" onPress={() => void continueAccepted()} style={buttonStyle}><Text style={{ color: colors.text }}>Retry new lot</Text></TouchableOpacity> : null}
+            {queuedContinuation && !busy ? <TouchableOpacity accessibilityRole="button" onPress={() => void continueQueued(queuedContinuation.parentDraftId)} style={buttonStyle}><Text style={{ color: colors.text }}>Retry next lot</Text></TouchableOpacity> : null}
             {!accepted && !resumeOriginalDraft && current?.reportId && current.status !== 'abandoned' ? <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={() => void continueAccepted()} style={buttonStyle}><Text style={{ color: colors.text }}>Continue with new lot</Text></TouchableOpacity> : null}
             <TouchableOpacity accessibilityRole="button" disabled={busy} onPress={onClose} style={buttonStyle}><Text style={{ color: colors.text }}>Close</Text></TouchableOpacity>
           </View>

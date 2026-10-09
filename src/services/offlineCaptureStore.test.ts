@@ -1,5 +1,6 @@
 import { createOfflineCaptureStore, countOfflineDraft } from './offlineCaptureStore';
 import type { OfflineReportDraft } from './autoSaveService';
+import type { DurableContinuationIntent } from './durableContinuationTypes';
 
 jest.mock('@react-native-async-storage/async-storage', () => ({ multiGet: jest.fn(async () => []) }));
 jest.mock('expo-crypto', () => ({ randomUUID: () => 'capture-uuid' }));
@@ -34,6 +35,41 @@ const draft = (id = 'draft-one', count = 2): OfflineReportDraft => ({
 });
 
 describe('owner-scoped offline capture metadata', () => {
+  test('Continue journal checkpoints never alter frozen parent revision, originals or accepted visibility', async () => {
+    const { store } = fixtureStore();
+    const saved = await store.saveDraft({ ...draft(), formData: { ...draft().formData, auctioneerWorkItemId: 'work-parent' } });
+    const intent: DurableContinuationIntent = { id: 'intent', ownerId: 'owner-one', type: 'asset', parentDraftId: saved.id,
+      parentCaptureId: saved.captureId!, parentRevision: saved.localRevision!, parentClientSubmissionId: saved.formData.clientSubmissionId!, parentWorkItemId: 'work-parent',
+      parentSetup: {} as any, details: { ownerName: 'Carried detail' }, successorDraftId: 'child', successorCaptureId: 'child-capture', stage: 'prepared', createdAt: saved.createdAt, updatedAt: saved.updatedAt };
+    await store.prepareContinuation(intent);
+    const retry = await store.prepareContinuation({ ...intent, id: 'another-intent', successorDraftId: 'different-child', successorCaptureId: 'different-capture' });
+    expect(retry).toEqual(intent);
+    await store.updateContinuation(intent.id, row => ({ ...row, stage: 'staging', sessionId: 'exact-session' }));
+    await expect(store.prepareContinuation(intent)).rejects.toThrow('already staged');
+    await store.updateContinuation(intent.id, row => ({ ...row, stage: 'staged' }));
+    expect(await store.getDraft(saved.id)).toEqual(saved);
+    expect(await store.getProtectedMediaUris()).toHaveLength(2);
+    await store.recordTransferAcceptance(saved.id, saved.localRevision!, saved.captureId!, saved.formData.clientSubmissionId!, 'report');
+    expect(await store.listDrafts()).toEqual([]);
+    expect(await store.listContinuations()).toEqual([expect.objectContaining({ id: 'intent', parentRevision: saved.localRevision, sessionId: 'exact-session' })]);
+    store.setOwner('owner-two'); expect(await store.listContinuations()).toEqual([]);
+    await expect(store.updateContinuation(intent.id, row => row)).rejects.toThrow('unavailable');
+    store.setOwner('owner-one'); expect(await store.getProtectedMediaUris()).toHaveLength(2);
+    await expect(store.updateContinuation(intent.id, row => ({ ...row, successorCaptureId: 'other' }))).rejects.toThrow('identity changed');
+  });
+  test('native transfer acceptance atomically requires its frozen capture, submission and revision while retaining originals', async () => {
+    const { store } = fixtureStore();
+    const saved = await store.saveDraft(draft());
+    await expect(store.recordTransferAcceptance(saved.id, saved.localRevision!, 'other-capture', saved.formData.clientSubmissionId!, 'report')).rejects.toThrow('earlier saved capture');
+    const edited = await store.saveDraft({ ...saved, title: 'New edit' });
+    await expect(store.recordTransferAcceptance(saved.id, saved.localRevision!, saved.captureId!, saved.formData.clientSubmissionId!, 'report')).rejects.toThrow('draft changed');
+    expect((await store.listDrafts())[0].title).toBe('New edit');
+    await store.recordTransferAcceptance(edited.id, edited.localRevision!, edited.captureId!, edited.formData.clientSubmissionId!, 'report');
+    await store.recordTransferAcceptance(edited.id, edited.localRevision!, edited.captureId!, edited.formData.clientSubmissionId!, 'report');
+    expect(await store.listDrafts()).toEqual([]);
+    expect(await store.getProtectedMediaUris()).toHaveLength(2);
+    expect((await store.getDraft(edited.id))?.reportId).toBe('report');
+  });
   test('backup intent commits with the draft and stale native acknowledgements cannot discard a later save', async () => {
     const { store } = fixtureStore();
     const first = await store.saveDraft(draft('backup', 224));

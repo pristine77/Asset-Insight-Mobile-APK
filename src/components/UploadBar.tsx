@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Alert, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { useAppTheme, type AppThemeColors } from '../context/ThemeContext';
@@ -9,6 +9,7 @@ import backgroundUploadManager, {
 } from '../services/backgroundUploadManager';
 import type { OfflineDraftType } from '../services/autoSaveService';
 import { useBackgroundUploads } from './useBackgroundUploads';
+import durableReportTransfer from '../services/durableReportTransfer';
 
 /** How long a "Sent" notice stays before it dismisses itself. */
 export const SENT_NOTICE_MS = 6_000;
@@ -74,8 +75,18 @@ export default function UploadBar({ onOpenDraft }: Props) {
   // The list closes by itself once nothing waits.
   useEffect(() => { if (!queued.length) setShowQueue(false); }, [queued.length]);
 
-  const paused = held.filter((entry) => entry.status === 'paused');
-  if (!active && !paused.length && !notices.length) return null;
+  const paused = held.filter((entry) => entry.status === 'paused' || (entry.durable && entry.status === 'attention' &&
+    !notices.some(notice => notice.draftId === entry.draftId)));
+  const actOnUpload = (action: () => unknown) => {
+    void Promise.resolve().then(action).catch(error => Alert.alert('Upload needs attention',
+      error instanceof Error ? error.message : 'The upload action could not be confirmed. Your draft and originals are kept.'));
+  };
+  const openDraft = (draftId: string, type: OfflineDraftType, durable = false, noticeId?: string) => actOnUpload(async () => {
+    if (durable) await durableReportTransfer.releaseForEditing(draftId);
+    if (noticeId) backgroundUploadManager.dismiss(noticeId);
+    onOpenDraft(draftId, type);
+  });
+  if (!active && !queued.length && !paused.length && !notices.length) return null;
   const shownNotices = notices.slice(-MAX_NOTICE_ROWS);
   const olderNotices = notices.length - shownNotices.length;
 
@@ -97,8 +108,14 @@ export default function UploadBar({ onOpenDraft }: Props) {
           </Text>
           {!sent ? (
             <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Open ${notice.title}`} style={styles.button}
-              onPress={() => { backgroundUploadManager.dismiss(notice.id); onOpenDraft(notice.draftId, notice.type); }}>
+              onPress={() => openDraft(notice.draftId, notice.type, notice.id.startsWith('durable:'), notice.id)}>
               <Text style={styles.buttonText}>Open</Text>
+            </TouchableOpacity>
+          ) : null}
+          {!sent && notice.id.startsWith('durable:') ? (
+            <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Resume upload of ${notice.title}`} style={styles.button}
+              onPress={() => actOnUpload(() => backgroundUploadManager.resume(notice.jobId))}>
+              <Text style={styles.buttonText}>Resume</Text>
             </TouchableOpacity>
           ) : null}
           <TouchableOpacity accessibilityRole="button" accessibilityLabel={sent ? `Dismiss sent notice for ${notice.title}` : `Dismiss notice for ${notice.title}`}
@@ -115,14 +132,14 @@ export default function UploadBar({ onOpenDraft }: Props) {
       <View style={styles.row}>
         <Feather name="pause-circle" size={18} color={colors.textSecondary} />
         <Text style={styles.text} numberOfLines={2}>
-          Paused: {entry.title} · {entry.completedFiles} of {entry.totalFiles} sent
+          {entry.status === 'attention' ? 'Needs attention' : 'Paused'}: {entry.title} · {entry.completedFiles} of {entry.totalFiles} sent
         </Text>
         <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Resume upload of ${entry.title}`} style={styles.button}
-          onPress={() => backgroundUploadManager.resume(entry.id)}>
+          onPress={() => actOnUpload(() => backgroundUploadManager.resume(entry.id))}>
           <Text style={styles.buttonText}>Resume</Text>
         </TouchableOpacity>
         <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Open ${entry.title}`} style={styles.button}
-          onPress={() => onOpenDraft(entry.draftId, entry.type)}>
+          onPress={() => openDraft(entry.draftId, entry.type, entry.durable)}>
           <Text style={styles.buttonText}>Open</Text>
         </TouchableOpacity>
       </View>
@@ -135,7 +152,7 @@ export default function UploadBar({ onOpenDraft }: Props) {
       <Feather name="clock" size={16} color={colors.textSecondary} />
       <Text style={styles.text} numberOfLines={1}>In line: {entry.title} · {entry.totalFiles} files</Text>
       <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Pause upload of ${entry.title}`} style={styles.button}
-        onPress={() => backgroundUploadManager.pause(entry.id)}>
+        onPress={() => actOnUpload(() => backgroundUploadManager.pause(entry.id))}>
         <Text style={styles.buttonText}>Pause</Text>
       </TouchableOpacity>
     </View>
@@ -146,7 +163,7 @@ export default function UploadBar({ onOpenDraft }: Props) {
     const finalizing = entry.stage === 'finalizing' || entry.stage === 'complete';
     const counts = `${entry.completedFiles} of ${entry.totalFiles}`;
     const text = waiting
-      ? `Waiting for signal · ${counts} sent`
+      ? `${entry.durable ? 'Waiting to continue' : 'Waiting for signal'} · ${counts} sent`
       : entry.pausing
         ? `Pausing ${entry.title}…`
         : finalizing
@@ -160,8 +177,9 @@ export default function UploadBar({ onOpenDraft }: Props) {
           <View style={styles.textBlock}>
             <Text style={styles.textLine} numberOfLines={2} accessibilityLiveRegion="polite">{text}</Text>
             {waiting ? <Text style={styles.secondary} numberOfLines={1}>{entry.title}</Text> : null}
+            <Text style={styles.secondary}>{entry.durable ? 'Saved upload · Android continues the transfer' : 'Keep the app open while this upload runs'}</Text>
           </View>
-          {waiting ? (
+          {waiting && !entry.durable ? (
             <TouchableOpacity accessibilityRole="button" accessibilityLabel="Resume upload now" style={styles.button}
               onPress={() => backgroundUploadManager.resumeNow()}>
               <Text style={styles.buttonText}>Resume now</Text>
@@ -169,7 +187,7 @@ export default function UploadBar({ onOpenDraft }: Props) {
           ) : null}
           {entry.canPause ? (
             <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Pause upload of ${entry.title}`} style={styles.button}
-              onPress={() => backgroundUploadManager.pause(entry.id)}>
+              onPress={() => actOnUpload(() => backgroundUploadManager.pause(entry.id))}>
               <Text style={styles.buttonText}>Pause</Text>
             </TouchableOpacity>
           ) : null}
@@ -211,6 +229,7 @@ export default function UploadBar({ onOpenDraft }: Props) {
           <Text style={[styles.secondary, styles.more]}>+{paused.length - MAX_PAUSED_ROWS} more paused · open Drafts to see them</Text>
         ) : null}
         {active ? renderActive(active) : null}
+        {!active && queued.length ? <ScrollView style={styles.queueList} nestedScrollEnabled>{queued.map(renderQueued)}</ScrollView> : null}
       </View>
     </View>
   );

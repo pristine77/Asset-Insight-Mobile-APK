@@ -8,6 +8,7 @@ import {
   uploadReportFilesDirectToR2,
   type DirectUploadFile,
   type DirectUploadProgressCallback,
+  type ReportTransferHandoff,
 } from "./directR2UploadService";
 
 // Types matching web and server
@@ -223,8 +224,8 @@ class AssetService {
     details: AssetCreateDetails,
     lots: MixedLot[],
     onUploadProgress?: DirectUploadProgressCallback,
-    options?: { operation?: UploadOperation }
-  ): Promise<{ jobId: string; message: string; reportId?: string }> {
+    options?: { operation?: UploadOperation; handoff?: ReportTransferHandoff }
+  ): Promise<{ jobId: string; message: string; reportId?: string; backgroundStaged?: boolean }> {
     const operation = createUploadOperation(options?.operation);
     // Send an explicit choice even to older APIs whose missing-field default
     // was true. Never mutate the saved draft supplied by the caller.
@@ -291,13 +292,14 @@ class AssetService {
         files,
         onProgress: onUploadProgress,
         operation,
+        handoff: options?.handoff,
       });
       operation.assertActive();
       return response;
     } catch (error: any) {
       operation.assertActive();
       const status = Number(error?.response?.status || 0);
-      if (![404, 405, 501].includes(status)) throw error;
+      if (options?.handoff || ![404, 405, 501].includes(status)) throw error;
       console.warn("[AssetService] Direct upload is unsupported; using legacy multipart upload.");
     }
 

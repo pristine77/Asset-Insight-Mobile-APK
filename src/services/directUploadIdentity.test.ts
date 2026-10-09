@@ -31,6 +31,27 @@ beforeEach(() => {
 afterAll(() => Object.defineProperty(Platform, 'OS', { value: originalPlatform }));
 
 describe.each(['/asset', '/lot-listing'] as const)('%s submission manifest identity', (endpoint) => {
+  it('hands the exact prepared session to durable transport without uploading or claiming acceptance', async () => {
+    const handoff = jest.fn(async () => undefined);
+    const result = await uploadReportFilesDirectToR2({ endpoint, details, files: [{ ...file, size: 321 }], handoff });
+    expect(result).toMatchObject({ backgroundStaged: true, jobId: 'same-job' });
+    expect(result.reportId).toBeUndefined();
+    expect(handoff).toHaveBeenCalledWith(expect.objectContaining({ endpoint, details, session: expect.objectContaining({ sessionId: 'same-session' }),
+      files: [expect.objectContaining({ fileId: 'images-0', uri: file.uri, size: 321 })] }), expect.any(Object));
+    expect(api.post).toHaveBeenCalledTimes(1);
+    expect(fs.createUploadTask).not.toHaveBeenCalled();
+  });
+  it('reads the durable saved file size before freezing the manifest instead of trusting a temporary rendition size', async () => {
+    const handoff = Object.assign(jest.fn(async () => undefined), {
+      prepareFiles: jest.fn(async (files: DirectUploadFile[]) => files.map(item => ({ ...item, uri: 'file:///saved/edited.jpg', size: undefined }))),
+    });
+    fs.getInfoAsync.mockResolvedValue({ exists: true, size: 456 });
+    await uploadReportFilesDirectToR2({ endpoint, details, files: [{ ...file, size: 999 }], handoff });
+    expect(fs.getInfoAsync).toHaveBeenCalledWith('file:///saved/edited.jpg', { size: true });
+    expect(jest.mocked(api.post).mock.calls[0][1]).toMatchObject({ files: [{ size: 456 }] });
+    expect(handoff).toHaveBeenCalledWith(expect.objectContaining({ files: [expect.objectContaining({ uri: 'file:///saved/edited.jpg', size: 456 })] }), expect.any(Object));
+    expect(fs.createUploadTask).not.toHaveBeenCalled();
+  });
   it('preserves the submission and media when the server reports an accepted report is unavailable', async () => {
     const receipt = { accepted: true, reportAvailable: false, canCreateSeparate: true, reportId: 'removed-report', jobId: 'same-submission' };
     const error = Object.assign(new Error('Earlier report unavailable'), { response: { status: 409, data: { code: 'UPLOAD_SESSION_REPORT_UNAVAILABLE', data: receipt } } });

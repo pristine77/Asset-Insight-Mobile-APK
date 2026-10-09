@@ -26,6 +26,7 @@ import backgroundUploadManager, {
   type BackgroundUploadRequest,
 } from '../../services/backgroundUploadManager';
 import type { AuctionManagementTaskPayload } from '../../services/auctionManagementService';
+import durableReportTransfer from '../../services/durableReportTransfer';
 
 // Each test mounts a full report form, some twice; the first mount in the file
 // is slow on a cold module cache.
@@ -159,6 +160,64 @@ describe.each(['asset', 'lotListing'] as const)('%s Submit on the Dashboard', (t
     return { closed, view };
   }
   const snapshot = () => backgroundUploadManager.getSnapshot();
+
+  it('closes once only after native durable staging, keeps originals and does not record server acceptance', async () => {
+    jest.spyOn(durableReportTransfer, 'available').mockReturnValue(true);
+    const handoff = jest.fn(async () => undefined);
+    jest.spyOn(durableReportTransfer, 'handoff').mockReturnValue(handoff);
+    let stage!: (value: any) => void;
+    jest.mocked(upload).mockReturnValueOnce(new Promise(resolve => { stage = resolve; }));
+    const { closed } = await mount();
+    await fireEvent.press(screen.getByRole('button', { name: submitLabel }));
+    await fireEvent.press(screen.getByRole('button', { name: submitLabel }));
+    await waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+    expect(closed).not.toHaveBeenCalled();
+    expect(jest.mocked(upload).mock.calls[0][3]?.handoff).toBe(handoff);
+    expect(jest.mocked(upload).mock.calls[0][0].client_submission_id).toBe('submission-parent');
+    await act(async () => { stage({ backgroundStaged: true, jobId: 'submission-parent', message: 'Saved upload' }); });
+    await waitFor(() => expect(closed).toHaveBeenCalledTimes(1));
+    expect(jest.mocked(OfflineCaptureStore.setSubmissionState).mock.calls.some(([, state]) => state === 'accepted')).toBe(false);
+    expect(AutoSaveService.deleteDraft).not.toHaveBeenCalled();
+    expect(AutoSaveService.cleanupOrphanedMedia).not.toHaveBeenCalled();
+  });
+
+  it('retains the editor after a durable staging failure and does not start the JS queue', async () => {
+    jest.spyOn(durableReportTransfer, 'available').mockReturnValue(true);
+    jest.spyOn(durableReportTransfer, 'handoff').mockReturnValue(jest.fn(async () => undefined));
+    jest.mocked(upload).mockRejectedValueOnce(new Error('Native durable storage failed'));
+    const { closed } = await mount();
+    await fireEvent.press(screen.getByRole('button', { name: submitLabel }));
+    await waitFor(() => expect(Alert.alert).toHaveBeenCalled());
+    expect(closed).not.toHaveBeenCalled();
+    expect(snapshot().active).toBeNull();
+    expect(screen.getByTestId('mock-photo-count').props.children).toBe(2);
+  });
+
+  it('retains the existing in-app upload path for cloud-only sources', async () => {
+    jest.spyOn(durableReportTransfer, 'available').mockReturnValue(true);
+    const saved = ordinaryDraft(type);
+    saved.lots[0].mainImages[0].uri = 'https://storage.invalid/saved-photo.jpg';
+    jest.mocked(upload).mockReturnValueOnce(new Promise(() => undefined));
+    const { closed } = await mount(true, saved);
+    await fireEvent.press(screen.getByRole('button', { name: submitLabel }));
+    await waitFor(() => expect(closed).toHaveBeenCalledTimes(1));
+    expect(jest.mocked(upload).mock.calls[0][3]?.handoff).toBeUndefined();
+    expect(snapshot().active?.draftId).toBe('local-parent');
+  });
+
+  it('ignores a late staged response after the account changes', async () => {
+    jest.spyOn(durableReportTransfer, 'available').mockReturnValue(true);
+    jest.spyOn(durableReportTransfer, 'handoff').mockReturnValue(jest.fn(async () => undefined));
+    let stage!: (value: any) => void;
+    jest.mocked(upload).mockReturnValueOnce(new Promise(resolve => { stage = resolve; }));
+    const { closed } = await mount();
+    await fireEvent.press(screen.getByRole('button', { name: submitLabel }));
+    await waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+    mockOwner = 'another-owner'; setUploadOwner(mockOwner);
+    await act(async () => { stage({ backgroundStaged: true, jobId: 'submission-parent', message: 'Saved upload' }); });
+    expect(closed).not.toHaveBeenCalled();
+    expect(jest.mocked(OfflineCaptureStore.setSubmissionState).mock.calls.some(([, state]) => state === 'accepted')).toBe(false);
+  });
 
   it('saves, hands the same upload to the background line and closes the form at once', async () => {
     // The upload the form itself would send, for comparison. It never
@@ -329,12 +388,14 @@ describe.each(['asset', 'lotListing'] as const)('%s Incoming work on the Dashboa
     return { closed, changed };
   }
 
-  it('Create Lot & Continue still waits in the form for the server to accept the report', async () => {
+  it('Create Lot & Continue on an unsupported binary waits for server acceptance', async () => {
+    jest.spyOn(durableReportTransfer, 'available').mockReturnValue(false);
     const { closed, changed } = await mountIncoming();
     let accept!: (value: any) => void;
     jest.mocked(upload).mockReturnValueOnce(new Promise((resolve) => { accept = resolve; }));
     await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
     await waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+    expect(jest.mocked(upload).mock.calls[0][3]?.handoff).toBeUndefined();
     expect(backgroundUploadManager.getSnapshot().active).toBeNull();
     expect(auctioneerService.continueWorkItem).not.toHaveBeenCalled();
     expect(changed).not.toHaveBeenCalled();
@@ -344,6 +405,21 @@ describe.each(['asset', 'lotListing'] as const)('%s Incoming work on the Dashboa
     await waitFor(() => expect(auctioneerService.continueWorkItem).toHaveBeenCalledWith('work-parent', 'report-parent'));
     expect(changed).toHaveBeenCalledTimes(1);
     expect(backgroundUploadManager.getSnapshot()).toMatchObject({ active: null, queued: [], held: [], notices: [] });
+  });
+
+  it('Create Lot & Close preserves assigned identities in a native durable handoff', async () => {
+    jest.spyOn(durableReportTransfer, 'available').mockReturnValue(true);
+    const handoff = jest.fn(async () => undefined);
+    jest.spyOn(durableReportTransfer, 'handoff').mockReturnValue(handoff);
+    jest.mocked(upload).mockResolvedValueOnce({ backgroundStaged: true, jobId: 'submission-parent', message: 'Saved upload' });
+    const { closed, changed } = await mountIncoming();
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Close' }));
+    await waitFor(() => expect(closed).toHaveBeenCalledTimes(1));
+    expect(jest.mocked(upload).mock.calls[0][0]).toMatchObject({ auctioneer_work_item_id: 'work-parent', client_submission_id: 'submission-parent',
+      mixed_lots: [expect.objectContaining({ source_key: 'upstream-key', source_lot_id: 'upstream-lot', source_submission_id: 'upstream-submission' })] });
+    expect(jest.mocked(upload).mock.calls[0][3]?.handoff).toBe(handoff);
+    expect(changed).not.toHaveBeenCalled();
+    expect(auctioneerService.continueWorkItem).not.toHaveBeenCalled();
   });
 
   it('Create Lot & Close of Incoming work also stays in the form until acceptance', async () => {

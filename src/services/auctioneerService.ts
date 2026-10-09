@@ -1,4 +1,5 @@
 import api from './api';
+import type { UploadContinuationReservation } from './durableContinuationTypes';
 
 export type AuctioneerReportType = 'asset' | 'lotListing';
 export type AuctioneerWorkItemStatus = 'available' | 'claimed' | 'report_created' | 'sent' | 'abandoned';
@@ -89,7 +90,7 @@ export function validateAuctioneerSuccessor(previous: AuctioneerWorkItemSetup, n
       next.contract.contractNo !== previous.contract.contractNo ||
       (Boolean(previous.contract.eventId) && next.contract.eventId !== previous.contract.eventId) ||
       next.kind !== 'unknown' || next.lots.length !== 0) {
-    throw new Error('The next work item is not a fresh lot. The accepted report is safe; reload Incoming to check its status.');
+    throw new Error('The next work item is not a fresh lot. Reload Incoming to check its status; no replacement lot was opened.');
   }
 }
 
@@ -130,6 +131,16 @@ class AuctioneerService {
     if (!id(workItemId) || !id(reportId)) throw new Error('A server-accepted report is required before starting a new lot.');
     const response = await api.post(`/auctioneer/work-items/${encodeURIComponent(workItemId)}/continue`, { reportId });
     return parseAuctioneerSetup(response.data?.data);
+  }
+
+  async continueUpload(workItemId: string, sessionId: string): Promise<{ reservation: UploadContinuationReservation; setup: AuctioneerWorkItemSetup }> {
+    const response = await api.post(`/auctioneer/work-items/${encodeURIComponent(workItemId)}/continue-upload`, { sessionId }, { timeout: 30_000 });
+    const data = response.data?.data;
+    if (!record(data) || !record(data.reservation) || data.reservation.status !== 'reserved' ||
+        !['id', 'ownerId', 'parentWorkItemId', 'parentSessionId', 'parentClientSubmissionId', 'parentCaptureId', 'successorWorkItemId'].every(key => id((data.reservation as Record<string, unknown>)[key]))) {
+      throw new Error('The next-lot reservation could not be verified. Retry this same Continue request from Drafts.');
+    }
+    return { reservation: data.reservation as UploadContinuationReservation, setup: parseAuctioneerSetup(data.setup) };
   }
 }
 

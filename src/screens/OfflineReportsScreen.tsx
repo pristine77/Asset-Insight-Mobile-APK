@@ -20,6 +20,7 @@ import OfflineQueueService, { OfflineQueueJob } from '../services/offlineQueueSe
 import OfflineCaptureStore from '../services/offlineCaptureStore';
 import OfflineCaptureList from '../components/OfflineCaptureList';
 import CaptureBackupPanel from '../components/CaptureBackupPanel';
+import UploadContinuationPanel from '../components/UploadContinuationPanel';
 import { useBackgroundUploads } from '../components/useBackgroundUploads';
 import backgroundUploadManager, { describeBackgroundUpload } from '../services/backgroundUploadManager';
 import reportDraftService, { isVerifiedCloudBackupOfLocal, ReportDraft } from '../services/reportDraftService';
@@ -632,7 +633,8 @@ const OfflineReportsScreen = ({
   const submitLocalDraft = useCallback((draft: OfflineReportDraft) => {
     // Every draft uses the canonical form's complete settings, validation, and
     // same-ID upload flow. Opening this screen never submits or clears a draft.
-    if (backgroundUploadManager.isBusy(draft.id)) {
+    const transfer = backgroundUploadManager.statusFor(draft.id);
+    if (backgroundUploadManager.isBusy(draft.id) && !(transfer?.durable && ['paused', 'attention'].includes(transfer.status))) {
       Alert.alert('Uploading in the background', 'This draft is uploading in the background. Pause it from the upload bar to edit it, or continue when the upload finishes.');
       return;
     }
@@ -1106,6 +1108,7 @@ const OfflineReportsScreen = ({
         ) : null}
 
         <CaptureBackupPanel />
+        <UploadContinuationPanel onOpen={onContinueDraft} />
         <OfflineCaptureList onOpen={onContinueDraft} />
         {loading ? (
           <View style={styles.loadingState}>

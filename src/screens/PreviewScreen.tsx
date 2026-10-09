@@ -51,8 +51,8 @@ import {
 } from "../utils/previewPhotoDeletion";
 import {
   applyPrimarySerialEdit,
-  isPrimarySerialField,
 } from "../utils/previewSerialNumber";
+import { applyPreviewSpecEdit, previewSpecFieldKey } from "../utils/previewSpecEdits";
 import { getPreviewLotPhotoEntries } from "../utils/previewLotPhotos";
 import FarmlandValuationSummary from "../components/FarmlandValuationSummary";
 import { realEstateSubmissionPath, shouldResubmitRealEstate } from "../utils/realEstateSubmission";
@@ -332,6 +332,7 @@ interface LotListingLot {
   details?: string | null;
   damage_analysis?: string | null;
   condition_report_specs?: Record<string, string>;
+  condition_report_specs_reviewed?: boolean;
   condition_report_specs_deleted?: string[];
   condition_report_specs_custom_order?: string[];
   lotted_by?: string | null;
@@ -366,6 +367,7 @@ interface AssetLot {
   details?: string;
   damage_analysis?: string | null;
   condition_report_specs?: Record<string, string>;
+  condition_report_specs_reviewed?: boolean;
   condition_report_specs_deleted?: string[];
   condition_report_specs_custom_order?: string[];
   estimated_value?: string;
@@ -740,117 +742,19 @@ const PreviewScreen = ({
     return map;
   }, [categorySpecs]);
 
-  const updateLotSpec = (index: number, fieldName: string, value: string) => {
+  const changeLotSpec = (index: number, fieldName: string, value: string, options: { deleted?: boolean; added?: boolean } = {}) => {
     setPreviewData((prev: any) => {
       const newLots = [...(prev?.lots || [])];
-      const lot = { ...(newLots[index] || {}) };
-      const existing = lot.condition_report_specs || {};
-      const specs: Record<string, string> = Array.isArray(existing)
-        ? Object.fromEntries(
-            existing
-              .map((entry: any) => [String(entry?.field || "").trim(), String(entry?.value || "").trim()])
-              .filter((entry: string[]) => entry[0])
-          )
-        : { ...existing };
-      const deletedSpecs = Array.isArray(lot.condition_report_specs_deleted)
-        ? lot.condition_report_specs_deleted
-            .map((field: any) => String(field || "").trim())
-            .filter(Boolean)
-        : [];
-      const fieldKey = normalizeSpecKey(fieldName);
-      if (isPrimarySerialField(fieldName)) {
-        newLots[index] = applyPrimarySerialEdit(lot, value);
-        return { ...prev, lots: newLots };
-      }
-      specs[fieldName] = value;
-      lot.condition_report_specs_deleted = deletedSpecs.filter(
-        (field: string) => normalizeSpecKey(field) !== fieldKey
-      );
-      lot.condition_report_specs = specs;
-      newLots[index] = lot;
+      const lot = newLots[index] || {};
+      const categoryFields = categorySpecs.find(spec => normalizeSpecKey(spec.childCategory) === normalizeSpecKey(lot.categories))?.fields || [];
+      newLots[index] = applyPreviewSpecEdit(lot, fieldName, value, categoryFields, options);
       return { ...prev, lots: newLots };
     });
     setHasChanges(true);
   };
-
-  const deleteLotSpec = (index: number, fieldName: string) => {
-    setPreviewData((prev: any) => {
-      const newLots = [...(prev?.lots || [])];
-      const lot = { ...(newLots[index] || {}) };
-      const existing = lot.condition_report_specs || {};
-      const specs: Record<string, string> = Array.isArray(existing)
-        ? Object.fromEntries(
-            existing
-              .map((entry: any) => [String(entry?.field || "").trim(), String(entry?.value || "").trim()])
-              .filter((entry: string[]) => entry[0])
-          )
-        : { ...existing };
-      const deletedSpecs = Array.isArray(lot.condition_report_specs_deleted)
-        ? lot.condition_report_specs_deleted
-            .map((field: any) => String(field || "").trim())
-            .filter(Boolean)
-        : [];
-      const fieldKey = normalizeSpecKey(fieldName);
-      if (isPrimarySerialField(fieldName)) {
-        newLots[index] = applyPrimarySerialEdit(lot, "");
-        return { ...prev, lots: newLots };
-      }
-      const existingKey = Object.keys(specs).find(
-        (field) => normalizeSpecKey(field) === fieldKey
-      );
-      if (existingKey) delete specs[existingKey];
-      if (!deletedSpecs.some((field: string) => normalizeSpecKey(field) === fieldKey)) {
-        deletedSpecs.push(fieldName);
-      }
-      lot.condition_report_specs = specs;
-      lot.condition_report_specs_deleted = deletedSpecs;
-      newLots[index] = lot;
-      return { ...prev, lots: newLots };
-    });
-    setHasChanges(true);
-  };
-
-  const addLotSpec = (index: number, fieldName: string, value: string) => {
-    setPreviewData((prev: any) => {
-      const newLots = [...(prev?.lots || [])];
-      const lot = { ...(newLots[index] || {}) };
-      const existing = lot.condition_report_specs || {};
-      const specs: Record<string, string> = Array.isArray(existing)
-        ? Object.fromEntries(
-            existing
-              .map((entry: any) => [String(entry?.field || "").trim(), String(entry?.value || "").trim()])
-              .filter((entry: string[]) => entry[0])
-          )
-        : { ...existing };
-      const field = String(fieldName || "").trim();
-      const fieldKey = normalizeSpecKey(field);
-      const existingKey = Object.keys(specs).find(
-        (candidate) => normalizeSpecKey(candidate) === fieldKey
-      );
-      specs[existingKey || field] = value;
-      const deletedSpecs = Array.isArray(lot.condition_report_specs_deleted)
-        ? lot.condition_report_specs_deleted
-            .map((item: any) => String(item || "").trim())
-            .filter(Boolean)
-        : [];
-      const customOrder = Array.isArray(lot.condition_report_specs_custom_order)
-        ? lot.condition_report_specs_custom_order
-            .map((item: any) => String(item || "").trim())
-            .filter(Boolean)
-        : [];
-      if (!customOrder.some((item: string) => normalizeSpecKey(item) === fieldKey)) {
-        customOrder.push(existingKey || field);
-      }
-      lot.condition_report_specs = specs;
-      lot.condition_report_specs_deleted = deletedSpecs.filter(
-        (item: string) => normalizeSpecKey(item) !== fieldKey
-      );
-      lot.condition_report_specs_custom_order = customOrder;
-      newLots[index] = lot;
-      return { ...prev, lots: newLots };
-    });
-    setHasChanges(true);
-  };
+  const updateLotSpec = (index: number, fieldName: string, value: string) => changeLotSpec(index, fieldName, value);
+  const deleteLotSpec = (index: number, fieldName: string) => changeLotSpec(index, fieldName, '', { deleted: true });
+  const addLotSpec = (index: number, fieldName: string, value: string) => changeLotSpec(index, fieldName, value, { added: true });
 
   const deleteLotImage = (
     lotIndex: number,
@@ -1316,7 +1220,7 @@ const PreviewScreen = ({
     </View>
   );
 
-  const getSpecRecord = (value: unknown): Record<string, string> => {
+  const getSpecRecord = (value: unknown, reviewed = false): Record<string, string> => {
     const isUsefulSpecValue = (raw: unknown) => {
       const text = String(raw ?? "").trim();
       if (normalizeVisiblePresenceValue(text)) return true;
@@ -1336,7 +1240,7 @@ const PreviewScreen = ({
           }))
           .filter((entry: { field: string; text: string; raw: unknown }) =>
             entry.field &&
-            (entry.raw === "" ||
+            (reviewed || entry.raw === "" ||
               (typeof entry.raw === "string" && !entry.text.trim()) ||
               isUsefulSpecValue(entry.text))
           )
@@ -1353,7 +1257,7 @@ const PreviewScreen = ({
         }))
         .filter((entry: { field: string; text: string; raw: unknown }) =>
           entry.field &&
-          (entry.raw === "" ||
+          (reviewed || entry.raw === "" ||
             (typeof entry.raw === "string" && !entry.text.trim()) ||
             isUsefulSpecValue(entry.text))
         )
@@ -1361,12 +1265,12 @@ const PreviewScreen = ({
     );
   };
 
-  const getSpecValue = (record: Record<string, string>, fieldName: string) => {
+  const getSpecValue = (record: Record<string, string>, fieldName: string, categoryFields: string[] = []) => {
     if (record[fieldName] !== undefined) {
       return normalizeVisiblePresenceValue(record[fieldName]) || record[fieldName];
     }
-    const key = normalizeSpecKey(fieldName);
-    const existingKey = Object.keys(record).find((candidate) => normalizeSpecKey(candidate) === key);
+    const key = previewSpecFieldKey(fieldName, categoryFields);
+    const existingKey = Object.keys(record).find((candidate) => previewSpecFieldKey(candidate, categoryFields) === key);
     return existingKey
       ? normalizeVisiblePresenceValue(record[existingKey]) || record[existingKey]
       : "";
@@ -1377,11 +1281,11 @@ const PreviewScreen = ({
     index: number,
     fieldName: string
   ) => {
-    const specRecord = getSpecRecord(lot.condition_report_specs);
+    const specRecord = getSpecRecord(lot.condition_report_specs, lot.condition_report_specs_reviewed === true);
     setSpecFieldEditor({
       lotIndex: index,
       fieldName,
-      value: getSpecValue(specRecord, fieldName),
+      value: getSpecValue(specRecord, fieldName, specsByCategory.get(normalizeSpecKey(lot.categories))?.fields || []),
       lotLabel: getLotDisplayNumber(lot, index),
       lotTitle: String(lot.title || lot.description || "").trim(),
     });
@@ -1487,7 +1391,7 @@ const PreviewScreen = ({
         return;
       }
       const lot = previewData?.lots?.[specFieldEditor.lotIndex] || {};
-      const specRecord = getSpecRecord(lot.condition_report_specs);
+      const specRecord = getSpecRecord(lot.condition_report_specs, lot.condition_report_specs_reviewed === true);
       const existingField = Object.keys(specRecord).find(
         (candidate) => normalizeSpecKey(candidate) === normalizeSpecKey(fieldName)
       );
@@ -1535,24 +1439,26 @@ const PreviewScreen = ({
 
   const renderAuctioneerSpecs = (lot: AssetLot | LotListingLot, index: number) => {
     const categorySpec = specsByCategory.get(normalizeSpecKey(lot.categories));
-    const specRecord = getSpecRecord(lot.condition_report_specs);
+    const reviewed = lot.condition_report_specs_reviewed === true;
+    const specRecord = getSpecRecord(lot.condition_report_specs, reviewed);
     const categoryFields = (categorySpec?.fields || []).filter((field) => !isDamageSpecField(field));
     const deletedSpecKeys = new Set(
       (Array.isArray((lot as any).condition_report_specs_deleted)
         ? (lot as any).condition_report_specs_deleted
         : []
       )
-        .map((field: unknown) => normalizeSpecKey(field))
+        .map((field: unknown) => previewSpecFieldKey(field, categoryFields))
         .filter(Boolean)
     );
     const extraFields = Object.keys(specRecord).filter(
       (field) =>
         !isDamageSpecField(field) &&
-        !deletedSpecKeys.has(normalizeSpecKey(field)) &&
-        !categoryFields.some((knownField) => normalizeSpecKey(knownField) === normalizeSpecKey(field))
+        !deletedSpecKeys.has(previewSpecFieldKey(field, categoryFields)) &&
+        !categoryFields.some((knownField) => previewSpecFieldKey(knownField, categoryFields) === previewSpecFieldKey(field, categoryFields))
     );
     const fields = [
-      ...categoryFields.filter((field) => !deletedSpecKeys.has(normalizeSpecKey(field))),
+      ...categoryFields.filter((field) => !deletedSpecKeys.has(previewSpecFieldKey(field, categoryFields)) &&
+        (!reviewed || Object.keys(specRecord).some(key => previewSpecFieldKey(key, categoryFields) === previewSpecFieldKey(field, categoryFields)))),
       ...extraFields,
     ];
     const categoryChipText = categorySpec
@@ -1687,7 +1593,7 @@ const PreviewScreen = ({
                     </View>
                     <TextInput
                       style={styles.input}
-                      value={getSpecValue(specRecord, fieldName)}
+                      value={getSpecValue(specRecord, fieldName, categoryFields)}
                       accessibilityLabel={`Lot ${index + 1}, ${fieldName}`}
                       onPressIn={() => handleSpecFieldPress(lot, index, fieldName)}
                       onChangeText={(text) => updateLotSpec(index, fieldName, text)}

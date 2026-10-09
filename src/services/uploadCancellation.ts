@@ -2,16 +2,17 @@ let epoch = 0;
 let uploadOwner: string | null = null;
 const cancels = new Set<() => void>();
 const ownerListeners = new Set<(ownerId: string | null) => void>();
-const pauseListeners = new Set<() => void>();
+type UploadPauseSource = 'lifecycle';
+const pauseListeners = new Set<(reason?: UploadPauseReason, source?: UploadPauseSource) => void>();
 /** Global Offline/connection/account pauses also revoke queued upload authority. */
-export function onUploadsPaused(listener: () => void): () => void {
+export function onUploadsPaused(listener: (reason?: UploadPauseReason, source?: UploadPauseSource) => void): () => void {
   pauseListeners.add(listener);
   return () => { pauseListeners.delete(listener); };
 }
 /** Bind with local draft ownership, before starting any account's uploads. */
 export function setUploadOwner(ownerId: string | null) {
   if (uploadOwner === ownerId) return;
-  pauseActiveUploads();
+  pauseActiveUploads(undefined, 'lifecycle');
   uploadOwner = ownerId;
   for (const listener of Array.from(ownerListeners)) {
     try { listener(ownerId); } catch { /* One faulty listener must not keep another account's work alive. */ }
@@ -186,13 +187,13 @@ export function pauseUploadOperation(operation: UploadOperation | null | undefin
  * connection, Offline mode and sign-out; a person's Pause uses
  * pauseUploadOperation() instead.
  */
-export function pauseActiveUploads(reason?: UploadPauseReason) {
+export function pauseActiveUploads(reason?: UploadPauseReason, source?: UploadPauseSource) {
   epoch++;
   if (reason) pauseReasons.set(epoch, reason);
   pauseReasons.delete(epoch - PAUSE_REASONS_KEPT);
   // Hold queued jobs before a cancelled active operation can settle/start another.
   for (const listener of Array.from(pauseListeners)) {
-    try { listener(); } catch { /* A faulty view must not prevent cancellation. */ }
+    try { listener(reason, source); } catch { /* A faulty view must not prevent cancellation. */ }
   }
   for (const cancel of cancels) { try { cancel(); } catch { /* Every task is fenced by generation too. */ } }
   cancels.clear();

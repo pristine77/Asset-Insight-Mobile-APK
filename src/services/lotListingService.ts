@@ -8,6 +8,7 @@ import {
   uploadReportFilesDirectToR2,
   type DirectUploadFile,
   type DirectUploadProgressCallback,
+  type ReportTransferHandoff,
 } from "./directR2UploadService";
 import type { ReportWorkflowStage } from './assetService';
 
@@ -157,8 +158,8 @@ class LotListingService {
     details: LotListingDetails,
     lots: LotListingLot[],
     onUploadProgress?: DirectUploadProgressCallback,
-    options?: { operation?: UploadOperation }
-  ): Promise<{ jobId: string; message: string; reportId?: string; status?: string; phase?: string }> {
+    options?: { operation?: UploadOperation; handoff?: ReportTransferHandoff }
+  ): Promise<{ jobId: string; message: string; reportId?: string; status?: string; phase?: string; backgroundStaged?: boolean }> {
     const operation = createUploadOperation(options?.operation);
     const mixedLots = lots.map((lot, index) => ({
       ...(details.auctioneer_work_item_id ? {
@@ -231,13 +232,14 @@ class LotListingService {
         files,
         onProgress: onUploadProgress,
         operation,
+        handoff: options?.handoff,
       });
       operation.assertActive();
       return response;
     } catch (error: any) {
       operation.assertActive();
       const status = Number(error?.response?.status || 0);
-      if (![404, 405, 501].includes(status)) throw error;
+      if (options?.handoff || ![404, 405, 501].includes(status)) throw error;
       console.warn("[LotListingService] Direct upload is unsupported; using legacy multipart upload.");
     }
 

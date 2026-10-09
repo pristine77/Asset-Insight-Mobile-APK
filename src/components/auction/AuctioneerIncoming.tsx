@@ -1,4 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import UploadContinuationPanel from '../UploadContinuationPanel';
+import durableContinuationService from '../../services/durableContinuationService';
+import OfflineCaptureStore from '../../services/offlineCaptureStore';
 import {
   ActivityIndicator,
   FlatList,
@@ -33,6 +36,7 @@ export default function AuctioneerIncoming({ refreshVersion = 0, onOpenReport }:
   const [error, setError] = useState('');
   const [opening, setOpening] = useState<string | null>(null);
   const [setup, setSetup] = useState<AuctioneerWorkItemSetup | null>(null);
+  const [draftId, setDraftId] = useState<string>();
   const readRevision = useRef(0);
   const mounted = useRef(true);
   const claimLock = useRef(false);
@@ -80,15 +84,20 @@ export default function AuctioneerIncoming({ refreshVersion = 0, onOpenReport }:
     async (item: AuctioneerIncomingItem, reportType: AuctioneerReportType) => {
       if (claimLock.current || (item.status !== 'available' && !item.claimedByMe)) return;
       claimLock.current = true;
+      const owner = OfflineCaptureStore.getOwnerId();
       setOpening(item.cycleKey);
       setError('');
       try {
         const next = item.workItemId
           ? await auctioneerService.getSetup(item.workItemId)
           : await auctioneerService.claim(item.cycleKey, reportType);
-        if (!mounted.current) return;
+        if (!mounted.current || OfflineCaptureStore.getOwnerId() !== owner) return;
         if (next.reportId) onOpenReport(next.reportId, next.reportType);
-        else setSetup(next); // The form boundary rechecks claimed/unused state.
+        else {
+          const savedDraft = owner ? await durableContinuationService.successorDraft(next.workItemId) : undefined;
+          if (!mounted.current || OfflineCaptureStore.getOwnerId() !== owner) return;
+          setDraftId(savedDraft); setSetup(next); // The boundary rechecks claimed/unused state.
+        }
       } catch (cause) {
         if (mounted.current)
           setError(
@@ -106,6 +115,7 @@ export default function AuctioneerIncoming({ refreshVersion = 0, onOpenReport }:
 
   const close = useCallback(() => {
     setSetup(null);
+    setDraftId(undefined);
     void load(true);
   }, [load]);
   const nextForm = useCallback(
@@ -208,6 +218,7 @@ export default function AuctioneerIncoming({ refreshVersion = 0, onOpenReport }:
                 </TouchableOpacity>
               </View>
             )}
+            <UploadContinuationPanel onOpen={(id, _type, next) => { setDraftId(id); setSetup(next); }} />
           </View>
         }
         ListEmptyComponent={
@@ -231,6 +242,7 @@ export default function AuctioneerIncoming({ refreshVersion = 0, onOpenReport }:
           onClose={close}
           onSuccess={close}
           auctioneer={setup}
+          draftIdToLoad={draftId}
           onAuctioneerSetupChange={nextForm}
         />
       )}
@@ -240,6 +252,7 @@ export default function AuctioneerIncoming({ refreshVersion = 0, onOpenReport }:
           onClose={close}
           onSuccess={close}
           auctioneer={setup}
+          draftIdToLoad={draftId}
           onAuctioneerSetupChange={nextForm}
         />
       )}

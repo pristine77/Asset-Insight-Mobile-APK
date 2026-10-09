@@ -13,6 +13,8 @@ import OfflineCaptureStore from '../../services/offlineCaptureStore';
 import reportDraftService from '../../services/reportDraftService';
 import { prepareOfflineSubmission } from '../../services/offlineSubmissionService';
 import { pauseActiveUploads, setUploadOwner } from '../../services/uploadCancellation';
+import durableReportTransfer from '../../services/durableReportTransfer';
+import durableContinuationService from '../../services/durableContinuationService';
 
 let mockOwner: string | null = 'owner';
 jest.mock('expo-crypto', () => ({ randomUUID: () => require('node:crypto').randomUUID() }));
@@ -696,6 +698,91 @@ describe.each(['asset', 'lotListing'] as const)('%s incoming create-and-continue
     await waitFor(() => expect(screen.getByTestId('mock-photo-count').props.children).toBe(1));
     return { current, changed, closed, view, upload: type === 'asset' ? assetService.createAssetReport : lotListingService.createLotListing };
   }
+
+  async function mountDurable() {
+    jest.spyOn(durableReportTransfer, 'available').mockReturnValue(true);
+    const handoff = jest.fn(async () => undefined);
+    jest.spyOn(durableContinuationService, 'handoff').mockReturnValue(handoff);
+    jest.spyOn(durableContinuationService, 'forParent').mockResolvedValue({ id: 'continue-request', stage: 'staged' } as any);
+    const complete = jest.spyOn(durableContinuationService, 'complete');
+    const mounted = await mount(undefined, { clientName: 'Carried client', bankPhotosEnabled: false, watermarkImages: false }, true);
+    const child = { ...draft(type), id: 'saved-child', captureId: 'child-capture', lots: [], formData: {
+      ...draft(type).formData, auctioneerWorkItemId: 'work-next', clientSubmissionId: 'submission-next',
+      clientName: 'Carried client', bankPhotosEnabled: false, watermarkImages: false,
+    } };
+    jest.mocked(AutoSaveService.getDraft).mockImplementation(async id => (id === 'saved-child' ? child : draft(type)) as any);
+    jest.mocked(AutoSaveService.saveDraft).mockImplementation(async input => ({ ...input, ownerId: 'owner', id: input.id || 'unexpected-new-draft' }) as any);
+    jest.mocked(mounted.upload).mockResolvedValue({ backgroundStaged: true, jobId: 'submission-parent', message: 'Saved upload' });
+    return { ...mounted, complete, handoff, child, next: { draftId: child.id, setup: successor(mounted.current) } };
+  }
+
+  it('opens the persisted empty next draft before upload acceptance and preserves it through setup acknowledgement', async () => {
+    const { complete, upload, changed, closed, handoff, next } = await mountDurable();
+    let reserve!: (value: any) => void;
+    complete.mockReturnValueOnce(new Promise(resolve => { reserve = resolve; }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(complete).toHaveBeenCalledWith('continue-request'));
+    expect(screen.queryByTestId('mock-photo-count')).toBeNull();
+    expect(screen.getByText('Opening the next lot')).toBeTruthy();
+    expect(screen.queryByText('Report accepted')).toBeNull();
+    expect(jest.mocked(upload).mock.calls[0][3]?.handoff).toBe(handoff);
+    expect(changed).not.toHaveBeenCalled();
+    await act(async () => { reserve(next); });
+    await waitFor(() => expect(changed).toHaveBeenCalledWith(next.setup));
+    expect(AutoSaveService.getDraft).toHaveBeenCalledWith('saved-child');
+    expect(screen.getByLabelText(type === 'asset' ? 'Contract number' : 'Contract number, required').props.value).toBe('93530.3-A');
+    if (type === 'asset') {
+      expect(screen.getByLabelText('Client name, required').props.value).toBe('Carried client');
+      await fireEvent.press(screen.getByRole('tab', { name: 'Images' }));
+    } else {
+      expect(screen.getByRole('switch', { name: 'Include all lot photos in the condition report' }).props.accessibilityState.checked).toBe(false);
+    }
+    expect(screen.getByTestId('mock-photo-count').props.children).toBe(0);
+    expect(screen.getByTestId('mock-lot-count').props.children).toBe(0);
+    expect(auctioneerService.continueWorkItem).not.toHaveBeenCalled();
+    expect(OfflineCaptureStore.setSubmissionState).not.toHaveBeenCalledWith('local-parent', 'accepted', expect.anything());
+    expect(AutoSaveService.removeDraftRecordOnly).not.toHaveBeenCalled();
+    expect(closed).not.toHaveBeenCalled();
+    await fireEvent.press(screen.getByRole('button', { name: 'Add fresh test photo' }));
+    complete.mockRejectedValueOnce(new Error('Next reservation deferred'));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(upload).toHaveBeenCalledTimes(2));
+    const [details, lots] = jest.mocked(upload).mock.calls[1];
+    expect(details).toMatchObject({ auctioneer_work_item_id: 'work-next', client_submission_id: 'submission-next' });
+    expect(lots[0].files.map(file => file.uri)).toEqual(['file:///fresh-photo.jpg']);
+    expect(jest.mocked(AutoSaveService.saveDraft).mock.calls.at(-1)![0].id).toBe('saved-child');
+  });
+
+  it('retries a lost durable reservation without uploading the parent twice', async () => {
+    const { complete, upload, changed, next } = await mountDurable();
+    complete.mockRejectedValueOnce(new Error('Reservation response lost')).mockResolvedValueOnce(next);
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry next lot' })).toBeTruthy());
+    expect(screen.queryByText('Report accepted')).toBeNull();
+    await fireEvent.press(screen.getByRole('button', { name: 'Retry next lot' }));
+    await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+    expect(upload).toHaveBeenCalledTimes(1); expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns to the saved parent without submitting when durable storage confirms no enqueue', async () => {
+    const { complete, upload, changed, current } = await mountDurable();
+    complete.mockResolvedValueOnce({ parentNotStaged: true, draftId: 'local-parent', setup: current });
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByTestId('mock-photo-count').props.children).toBe(1));
+    expect(upload).toHaveBeenCalledTimes(1); expect(changed).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Create Lot & Continue' }).props.accessibilityState?.disabled).not.toBe(true);
+  });
+
+  it('does not open a next draft after owner change during durable reservation', async () => {
+    const { complete, changed, next } = await mountDurable();
+    let reserve!: (value: any) => void; complete.mockReturnValueOnce(new Promise(resolve => { reserve = resolve; }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Create Lot & Continue' }));
+    await waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    mockOwner = 'other-owner'; setUploadOwner(mockOwner);
+    await act(async () => { reserve(next); });
+    expect(changed).not.toHaveBeenCalled(); expect(AutoSaveService.getDraft).not.toHaveBeenCalledWith('saved-child');
+  });
 
   it('passes the source structure lock through the real form camera boundary', async () => {
     await mount();

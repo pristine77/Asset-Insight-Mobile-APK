@@ -1,11 +1,12 @@
 import { StatusBar } from 'expo-status-bar';
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View,
   ActivityIndicator,
   TouchableOpacity,
   StyleSheet,
   Modal,
+  Alert,
 } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -36,6 +37,8 @@ import NotificationCenterModal from './src/components/NotificationCenterModal';
 import PreviewReminderNotification from './src/components/PreviewReminderNotification';
 import UploadBar from './src/components/UploadBar';
 import { claimDraftForEditing } from './src/components/backgroundUploadDraftGuard';
+import durableReportTransfer from './src/services/durableReportTransfer';
+import OfflineCaptureStore from './src/services/offlineCaptureStore';
 import { previewReminderDetails } from './src/utils/previewReminderNotification';
 import type { NotificationItem } from './src/services/notificationService';
 import offlineQueueService from './src/services/offlineQueueService';
@@ -282,17 +285,29 @@ function MainApp() {
     setOfflineDraftToLoad(null);
   }, []);
 
+  const openingOfflineDraft = useRef(false);
   const handleContinueOfflineDraft = useCallback((draftId: string, type: OfflineDraftType) => {
     // Every way into a saved draft passes here (Drafts, Offline captures, the
     // upload bar). A draft uploading in the background stays closed until it
     // is paused or finished; a paused one is handed back to its form.
-    if (!claimDraftForEditing(draftId)) return;
-    setCrmMode('listing');
-    setDrawerOpen(false);
-    setPreviewTarget(null);
-    setSavedInputToLoad(null);
-    setOfflineDraftToLoad({ id: draftId, type });
-    setActiveScreen('dashboard');
+    if (openingOfflineDraft.current) return;
+    const owner = OfflineCaptureStore.getOwnerId();
+    openingOfflineDraft.current = true;
+    void (async () => {
+      await durableReportTransfer.ready();
+      const transfer = durableReportTransfer.statusFor(draftId);
+      if (transfer && ['paused', 'attention'].includes(transfer.status)) await durableReportTransfer.releaseForEditing(draftId);
+      if (owner !== OfflineCaptureStore.getOwnerId()) return;
+      if (!claimDraftForEditing(draftId)) return;
+      setCrmMode('listing');
+      setDrawerOpen(false);
+      setPreviewTarget(null);
+      setSavedInputToLoad(null);
+      setOfflineDraftToLoad({ id: draftId, type });
+      setActiveScreen('dashboard');
+    })().catch(error => {
+      if (owner === OfflineCaptureStore.getOwnerId()) Alert.alert('Upload needs attention', error instanceof Error ? error.message : 'Reopen this draft to check the upload.');
+    }).finally(() => { openingOfflineDraft.current = false; });
   }, []);
 
   const renderScreen = () => {

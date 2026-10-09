@@ -603,7 +603,7 @@ export const OfflineQueueService = {
 
   cleanup(): void {
     cancelDisconnectPause();
-    pauseActiveUploads();
+    pauseActiveUploads(undefined, 'lifecycle');
     networkSub?.();
     networkSub = null;
     didInit = false;

@@ -208,6 +208,70 @@ const save = async () => {
   await act(async () => { await confirmGeneration().onPress?.(); });
 };
 
+it.each(['Asset', 'LotListing'] as const)('submits %s spec edits, blanks and deletion authority without changing originals', async reportType => {
+  saved = fixture(1);
+  Object.assign(saved.lots[0], { categories: 'Equipment', condition_report_specs_reviewed: true,
+    condition_report_specs: { Length: '10 ft', Width: '5 ft', Height: '6 ft', Notes: 'Scratches visible on left side' },
+    condition_report_specs_manual_overrides: { Length: 'old length', Width: 'old width', Height: 'old height' },
+    hidden_condition_report_specs: { Length: true, Colour: true },
+  });
+  const original = structuredClone(saved.lots[0]);
+  jest.mocked(api.get).mockImplementation(async url => String(url).includes('category-specs')
+    ? { data: { data: { specs: [{ childCategory: 'Equipment', parentCategory: 'Assets', fields: ['Overall Length', 'Overall Width', 'Overall Height'] }] } } }
+    : wrapPreview(saved));
+  await render(<PreviewScreen reportId="spec-authority" reportType={reportType} mode="pending" onBack={onBack} />);
+  await screen.findByLabelText('Lot 1, Overall Length');
+  await fireEvent.changeText(screen.getByLabelText('Lot 1, Overall Length'), '12 ft');
+  await fireEvent.press(screen.getByRole('button', { name: 'Remove Overall Width' }));
+  await fireEvent.changeText(screen.getByLabelText('Lot 1, Overall Height'), '');
+  await save();
+  const edited = saved.lots[0] as any;
+  expect(edited.condition_report_specs).toEqual({ 'Overall Length': '12 ft', 'Overall Height': '', Notes: 'Scratches visible on left side' });
+  expect(edited.condition_report_specs_manual_overrides).toEqual({ 'Overall Length': '12 ft', 'Overall Width': '', 'Overall Height': '' });
+  expect(edited.condition_report_specs_deleted).toEqual(['Overall Width']);
+  expect(edited.hidden_condition_report_specs).toEqual({ Colour: true });
+  expect(edited.image_urls).toEqual(original.image_urls); expect(edited.lot_id).toBe(original.lot_id);
+  expect(edited.description).toBe(original.description);
+});
+
+it.each(['Asset', 'LotListing'] as const)('reopens an explicitly empty reviewed %s without regenerated category placeholders', async reportType => {
+  saved = fixture(1);
+  Object.assign(saved.lots[0], { categories: 'Equipment', condition_report_specs_reviewed: true, condition_report_specs: {} });
+  jest.mocked(api.get).mockImplementation(async url => String(url).includes('category-specs')
+    ? { data: { data: { specs: [{ childCategory: 'Equipment', parentCategory: 'Assets', fields: ['Overall Length'] }] } } }
+    : wrapPreview(saved));
+  await render(<PreviewScreen reportId="spec-empty" reportType={reportType} mode="pending" onBack={onBack} />);
+  await screen.findByDisplayValue('93530');
+  expect(screen.queryByLabelText('Lot 1, Overall Length')).toBeNull();
+  expect(screen.getByRole('button', { name: 'Add condition report field to lot 1' })).toBeTruthy();
+  await save();
+  expect(saved.lots[0].condition_report_specs).toEqual({});
+});
+
+it.each(['Asset', 'LotListing'] as const)('deletes the last %s spec, reopens empty, and explicitly re-adds it without an old override', async reportType => {
+  saved = fixture(1);
+  Object.assign(saved.lots[0], { condition_report_specs_reviewed: true, condition_report_specs: { Notes: 'Old note' }, condition_report_specs_manual_overrides: { Notes: 'Older note' } });
+  const originals = structuredClone(saved.lots[0].image_urls);
+  const view = await render(<PreviewScreen reportId="spec-reentry" reportType={reportType} mode="pending" onBack={onBack} />);
+  await screen.findByLabelText('Lot 1, Notes');
+  await fireEvent.press(screen.getByRole('button', { name: 'Remove Notes' }));
+  await save();
+  expect(saved.lots[0].condition_report_specs).toEqual({});
+  await view.unmount();
+  await render(<PreviewScreen reportId="spec-reentry" reportType={reportType} mode="pending" onBack={onBack} />);
+  await screen.findByDisplayValue('93530');
+  expect(screen.queryByLabelText('Lot 1, Notes')).toBeNull();
+  await fireEvent.press(screen.getByRole('button', { name: 'Add condition report field to lot 1' }));
+  await fireEvent.changeText(screen.getByLabelText('Condition report field name'), 'Notes');
+  await fireEvent.changeText(screen.getByLabelText('Condition report field value'), 'New reviewed note');
+  await fireEvent.press(screen.getByRole('button', { name: 'Save condition report field' }));
+  await save();
+  expect(saved.lots[0].condition_report_specs).toEqual({ Notes: 'New reviewed note' });
+  expect((saved.lots[0] as any).condition_report_specs_manual_overrides).toEqual({ Notes: 'New reviewed note' });
+  expect((saved.lots[0] as any).condition_report_specs_deleted).toEqual([]);
+  expect(saved.lots[0].image_urls).toEqual(originals);
+});
+
 it('applies all three groups only to lots4/8/9 in a100-lot preview and saves/reopens the same values and media', async () => {
   const view = await open();
   const original = structuredClone(saved);

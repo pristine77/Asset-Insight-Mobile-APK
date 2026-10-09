@@ -2,13 +2,14 @@
 
 Source code for the Asset Insight Expo and React Native mobile application.
 
-## Latest source synchronization — 6 October 2026
+## Latest source synchronization — 9 October 2026
 
-Synchronized source revision `0be47f1`, retaining Pristine77's newer camera,
-landscape, device-approval and logo behavior from the shared Front-End repository.
-Includes combined Asset/Lot preview save-and-generation, preview loading feedback,
-app-version activity, account privacy links and explicit interrupted-upload Resume.
-Photo sizing remains 3000 px standard / 6000 px high resolution.
+Synchronized source revision `dc73c68`, including explicit durable Android report
+submission, queued Incoming Create Lot & Continue and reviewed specification edits.
+Pristine77's Bank and logo defaults, bounded decoding, immutable asynchronous
+camera snapshots, fixed-lot locks, native CameraX routing and September controls
+are preserved. Photo sizing remains 3000 px standard / 6000 px high resolution,
+with 720p/30fps video. Private capture backup remains disabled.
 
 OpenAI credits, provider usage logging, usage multipliers/calculations and Salvage
 provider-cost tracking are excluded. Existing report layouts are retained.
@@ -19,10 +20,16 @@ to match the current application. Their previous source remains in Git history.
 Verification and exclusion checks use an isolated staging copy; production and
 physical-device behavior are not exercised by source synchronization.
 
-Final checks: all 99 Jest suites / 1,079 tests and TypeScript passed. The same
-merged application source also passed Android/iOS Hermes exports, source parity
-and accounting/credential-path scans. Runtime layouts and provider integration
-still require normal release validation before deployment.
+Final checks: both native exports passed all 115 Jest suites / 1,430 tests and
+TypeScript. Android/iOS Hermes exports passed from the Front-End native copy;
+source maps match the exported application. Report-transfer, camera, application
+and instrumentation Kotlin compiled offline. An initial concurrent run timed out
+two existing 100-lot tests; unchanged focused and full reruns passed without
+changing timeouts. No emulator, physical device, live provider, signing or store
+release was exercised. Backend endpoints must precede a new native binary;
+runtime layouts, OEM endurance and provider integration still require release
+validation. Application changes match the paired Front-End export, while this
+repository's synchronization summary is maintained separately.
 
 ## Included
 

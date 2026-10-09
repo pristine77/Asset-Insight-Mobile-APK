@@ -11,6 +11,22 @@ const fixture = () => ({
 });
 beforeEach(() => jest.clearAllMocks());
 
+it('reserves a queued continuation with normal protected auth and no transfer-grant rotation or secret header', async () => {
+  const next = { ...fixture(), workItemId: 'next', clientSubmissionId: 'submission-next', kind: 'unknown', lots: [] };
+  const reservation = { id: 'reservation', status: 'reserved', ownerId: 'owner', parentWorkItemId: 'parent/1',
+    parentSessionId: 'session', parentClientSubmissionId: 'submission-parent', parentCaptureId: 'capture', successorWorkItemId: 'next' };
+  jest.mocked(api.post).mockResolvedValue({ data: { success: true, data: { reservation, setup: next } } });
+  const result = await auctioneerService.continueUpload('parent/1', 'session');
+  expect(result.reservation).toEqual(reservation);
+  expect(api.post).toHaveBeenCalledWith('/auctioneer/work-items/parent%2F1/continue-upload', { sessionId: 'session' }, { timeout: 30_000 });
+  expect(api.post).toHaveBeenCalledTimes(1);
+});
+
+it.each([{}, { status: 'accepted' }, { id: 'reservation', status: 'reserved', ownerId: 'owner' }])('rejects incomplete queued continuation receipts %#', async reservation => {
+  jest.mocked(api.post).mockResolvedValue({ data: { data: { reservation, setup: fixture() } } });
+  await expect(auctioneerService.continueUpload('parent', 'session')).rejects.toThrow('could not be verified');
+});
+
 it('accepts optional/null display metadata and preserves explicit used-report state', () => {
   const parsed = parseAuctioneerSetup({ ...fixture(), contract: { ...fixture().contract, customerName: null }, status: 'report_created', reportId: 'report' });
   expect(parsed.contract).toMatchObject({ customerName: '', eventTitle: '', location: '' });

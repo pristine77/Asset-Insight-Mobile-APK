@@ -22,6 +22,8 @@ import useDeviceDraftSave from './useDeviceDraftSave';
 import DraftStorageStatus from './DraftStorageStatus';
 import OfflineCaptureStore from '../../services/offlineCaptureStore';
 import { prepareOfflineSubmission } from '../../services/offlineSubmissionService';
+import durableReportTransfer from '../../services/durableReportTransfer';
+import durableContinuationService from '../../services/durableContinuationService';
 import { assertReportUploadAccepted, isExistingReportUploadReceipt } from '../../services/reportUploadReceipt';
 import { showUploadManifestRecovery, uploadConflictSource } from './uploadManifestRecovery';
 import { createUploadOperation, pauseUploadOperation, type UploadOperation } from '../../services/uploadCancellation';
@@ -1131,20 +1133,25 @@ const AssetFormSheet = ({
       (sum, lot) => sum + lot.files.length + lot.extraFiles.length + (lot.videoFile ? 1 : 0),
       0
     );
-    // Background hand-off (2026-10-02, services/backgroundUploadManager.ts):
+    // Legacy in-app hand-off (services/backgroundUploadManager.ts):
     // an ordinary Submit or Resume from the Dashboard is saved, checked and
     // handed to the upload line, and the form closes. Incoming work keeps
     // waiting here for acceptance (its next lot depends on it), and so do the
     // explicit separate/replace choices. A draft whose
     // last background attempt needs a decision runs here once, where the
-    // prompts can appear; this attempt uses up that mark.
+    // prompts can appear; this attempt uses up that mark. Supported Android
+    // device-file submissions use the durable scheduler below. Continue reserves
+    // its independent next form after that durable handoff.
     const plannedDraftId = currentDraftId || draftIdentityRef.current;
     // Never save over, or send a second time, a draft the line is sending.
     if (backgroundUploadManager.isBusy(plannedDraftId)) {
       Alert.alert(ALREADY_UPLOADING_TITLE, ALREADY_UPLOADING_MESSAGE);
       return;
     }
-    let background = backgroundUploads && !auctioneer && !options.nextLot && !options.forceNew
+    const durable = durableReportTransfer.available() && lots.every(lot =>
+      [...lot.files, ...lot.extraFiles].every(file => /^(file|content):\/\//.test(getPhotoUploadUri(file))) &&
+      (!lot.videoFile || /^(file|content):\/\//.test(lot.videoFile.uri)));
+    let background = !durable && backgroundUploads && !auctioneer && !options.nextLot && !options.forceNew
       && !options.replaceSubmissionId && !options.newSubmissionFromId;
     if (backgroundUploads && backgroundUploadManager.prefersForeground(plannedDraftId)) {
       background = false;
@@ -1363,7 +1370,7 @@ const AssetFormSheet = ({
       if (options.nextLot && connectivity.status === 'offline') {
         setSubmitting(false);
         setProgressPhase('idle');
-        Alert.alert('Connection required', 'Keep this lot open and retry when online. A new lot starts only after the server accepts this report.');
+        Alert.alert('Connection required', durable ? 'Keep this lot open and retry when online. The saved upload and its next lot need a short server reservation.' : 'Keep this lot open and retry when online. A new lot starts only after the server accepts this report.');
         return;
       }
       if (connectivity.status === 'offline') {
@@ -1377,8 +1384,15 @@ const AssetFormSheet = ({
         if (!operation.isActive() || recoveryScopeRef.current !== attemptRecoveryScope || OfflineCaptureStore.getOwnerId() !== attemptOwner) return;
         setUploadProgress(progress);
         if (detail) setUploadStatus(detail);
-      }, { operation });
+      }, { operation, ...(durable ? { handoff: options.nextLot && auctioneer
+        ? durableContinuationService.handoff(localDraft, contractNo.trim() || clientName.trim() || 'Asset report', auctioneer)
+        : durableReportTransfer.handoff(localDraft, contractNo.trim() || clientName.trim() || 'Asset report') } : {}) });
       operation.assertActive();
+      if (acceptedResponse.backgroundStaged) {
+        if (options.nextLot && auctioneerControl) { await auctioneerControl.continueQueued(localDraft.id); return; }
+        setSubmitting(false); setProgressPhase('idle');
+        resetForm(); onClose(); return;
+      }
       assertReportUploadAccepted(acceptedResponse);
       uploadAccepted = true;
       uploadAcceptedRef.current = true;
@@ -1423,6 +1437,16 @@ const AssetFormSheet = ({
         setSubmitting(false);
         setProgressPhase('idle');
         return;
+      }
+      if (durable && options.nextLot && auctioneerControl && draftSaved) {
+        try {
+          const intent = await durableContinuationService.forParent(attemptDraftId);
+          if (intent && intent.stage !== 'prepared') { await auctioneerControl.continueQueued(attemptDraftId); return; }
+        } catch {
+          setSubmitting(false); setProgressPhase('error');
+          Alert.alert('Continue needs checking', 'The saved upload status could not be read. Keep its originals and retry this Continue request from Drafts; do not submit another copy.');
+          return;
+        }
       }
       if (uploadAccepted) {
         setSubmitting(false);
@@ -3180,6 +3204,6 @@ export default function AssetFormWithAuctioneer(props: AssetFormSheetProps) {
     draftIdToLoad={sessionDraftId} onClose={props.onClose} onSetupChange={props.onAuctioneerSetupChange}>
     {(control) => <AssetFormSheet {...props} auctioneerControl={control}
       savedInputData={control ? undefined : props.savedInputData}
-      draftIdToLoad={control && !control.restoreDraft ? undefined : sessionDraftId} />}
+      draftIdToLoad={control?.draftIdToLoad || (control && !control.restoreDraft ? undefined : sessionDraftId)} />}
   </AuctioneerFormBoundary>;
 }
